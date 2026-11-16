@@ -144,8 +144,14 @@ export class SessionStore {
   /** Événements rejetés parce que leur application a levé une exception. */
   failed = $state(0);
 
-  /** Fils des sous-agents (non réactifs : bonus du panneau, J7). */
+  /**
+   * Fils des sous-agents, par `tool_use_id` de l'appel Agent. Non réactifs
+   * (les lignes sont mutées sur place) : `threadsRev` avance à chaque lot
+   * qui touche un fil, pour que la colonne des agents (J9, bonus) relise.
+   */
   readonly threads = new Map<string, Row[]>();
+  /** Révision des fils des sous-agents (+1 par lot qui en modifie un). */
+  threadsRev = $state(0);
   /** Notices Info (auto-allow…) : hors du fil, gardées pour les diagnostics. */
   readonly infos: Notice[] = [];
   /** `tool_use_id` → index dans `rows` (outil ou appel Agent). */
@@ -195,12 +201,14 @@ export class SessionStore {
    */
   apply(events: CoreEvent[]): void {
     const deltaTs: number[] = [];
+    let threadTouched = false;
     this.#next = null;
     try {
       for (const ev of events) {
         if (this.lastSeq >= 0 && ev.seq !== this.lastSeq + 1) this.gaps++;
         this.lastSeq = ev.seq;
         if (ev.kind === "text_delta" && ev.thread === "main") deltaTs.push(ev.t);
+        if ("thread" in ev && ev.thread !== "main") threadTouched = true;
         try {
           this.#reduce(ev);
         } catch (err) {
@@ -213,6 +221,7 @@ export class SessionStore {
         this.rows = this.#next;
         this.#next = null;
       }
+      if (threadTouched) this.threadsRev++;
     }
     this.onApplied?.({ deltaTs, count: events.length });
   }
@@ -287,8 +296,10 @@ export class SessionStore {
         this.status = ev.state;
         break;
       case "user_message": {
-        // `Replay` = ré-émission d'un message déjà affiché à l'envoi.
-        if (ev.origin === "Replay") break;
+        // `Replay` = ré-émission d'un message déjà affiché à l'envoi. Dans le
+        // fil d'un sous-agent, c'est sa consigne (jamais affichée ailleurs) :
+        // on la garde pour le fil déroulé de la colonne des agents (J9).
+        if (ev.origin === "Replay" && ev.thread === "main") break;
         // Nouveau tour : la durée de réflexion repart de zéro.
         if (ev.origin === "Typed" && ev.thread === "main") this.thinkingMs = 0;
         const row: Row =
