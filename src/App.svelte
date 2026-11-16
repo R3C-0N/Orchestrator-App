@@ -8,7 +8,11 @@
   // place de la saisie tant qu'une question attend.
   // J10 : palette (`Palette.svelte`) ouverte par `/` en début de saisie ou
   // Ctrl+K, remplie par `ready.commands` et complétée par `init`.
+  // Colonne des agents (J9, décision 4) à droite : `.split` = `.left`
+  // (conversation, saisie, ligne d'état) + `AgentColumn` ; elle reste
+  // visible en vue détaillée (Ctrl+O).
   import { onMount } from "svelte";
+  import AgentColumn from "./lib/components/agents/AgentColumn.svelte";
   import Conversation from "./lib/components/Conversation.svelte";
   import { entriesFrom, filterEntries, nameColumn } from "./lib/components/Palette.svelte";
   import Prompt from "./lib/components/Prompt.svelte";
@@ -45,6 +49,8 @@
   let card: QuestionCard | undefined = $state();
   /** Vue détaillée (Ctrl+O, jalon J5) : un appel par ligne, sorties complètes. */
   let verbose = $state(false);
+  /** Agents dépliés dans la colonne (fil de l'agent, bonus de J9). */
+  let agentsOpen: string[] = $state([]);
 
   let session: SessionKey | null = $state(null);
   let cwd = $state("");
@@ -584,39 +590,44 @@
   {#if startError}
     <div class="banner error">{startError}</div>
   {/if}
-  <Conversation {store} {verbose} bind:this={conversation} />
-  <!-- Vue détaillée (Ctrl+O) : la barre « Showing detailed transcript » de la
-       conversation remplace la saisie et la ligne d'état, comme le TUI (03b). -->
-  {#if store.question}
-    <!-- La carte prend la place de la saisie et de la ligne d'état (`07`). -->
-    <QuestionCard
-      bind:this={card}
-      question={store.question}
-      onanswer={answer}
-      onskip={skipQuestion}
-      onchat={chatAboutQuestion}
-    />
-  {:else if !verbose}
-    <Prompt
-      bind:this={prompt}
-      bind:draft
-      bind:pickerOpen
-      disabled={!ready || store.status === "Exited"}
-      {placeholder}
-      hint={keys.hint ?? notice}
-      {history}
-      models={store.meta.models}
-      currentModel={store.meta.model}
-      onsubmit={submit}
-      onslash={() => openPalette("slash")}
-      onpick={(m) => void applyModel(m)}
-      oninputchange={() => keys.disarm()}
-      palette={paletteOpen ? { entries: paletteItems, sel: paletteSel, nameWidth: paletteNameWidth } : null}
-      onpalettemove={movePalette}
-      onpalettechoose={choosePalette}
-    />
-    <StatusLine {store} />
-  {/if}
+  <div class="split">
+    <div class="left">
+      <Conversation {store} {verbose} bind:this={conversation} />
+      <!-- Vue détaillée (Ctrl+O) : la barre « Showing detailed transcript » de la
+           conversation remplace la saisie et la ligne d'état, comme le TUI (03b). -->
+      {#if store.question}
+        <!-- La carte prend la place de la saisie et de la ligne d'état (`07`). -->
+        <QuestionCard
+          bind:this={card}
+          question={store.question}
+          onanswer={answer}
+          onskip={skipQuestion}
+          onchat={chatAboutQuestion}
+        />
+      {:else if !verbose}
+        <Prompt
+          bind:this={prompt}
+          bind:draft
+          bind:pickerOpen
+          disabled={!ready || store.status === "Exited"}
+          {placeholder}
+          hint={keys.hint ?? notice}
+          {history}
+          models={store.meta.models}
+          currentModel={store.meta.model}
+          onsubmit={submit}
+          onslash={() => openPalette("slash")}
+          onpick={(m) => void applyModel(m)}
+          oninputchange={() => keys.disarm()}
+          palette={paletteOpen ? { entries: paletteItems, sel: paletteSel, nameWidth: paletteNameWidth } : null}
+          onpalettemove={movePalette}
+          onpalettechoose={choosePalette}
+        />
+        <StatusLine {store} />
+      {/if}
+    </div>
+    <AgentColumn {store} width="48ch" bind:open={agentsOpen} />
+  </div>
   <footer>
     <span>{cwd}</span>
     <span>{store.status} · {store.rows.length} lignes</span>
@@ -630,6 +641,17 @@
     flex-direction: column;
     height: 100%;
     background: #0c0c0c;
+  }
+  .split {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+  }
+  .left {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
   }
   .banner {
     padding: 0 1ch;

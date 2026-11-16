@@ -93,20 +93,31 @@ test("rendu de la capture 10 et comparaison côte à côte", async ({ page, brow
   expect(await color(`${PALETTE} .row:not(.sel) .name`)).toBe("rgb(153, 153, 153)");
   expect(await color(`${PALETTE} .row:not(.sel) .desc`)).toBe("rgb(153, 153, 153)");
   // Descriptions alignées en colonne ; la longue repliée sur 2 lignes puis tronquée.
-  const descs = await page.locator(`${PALETTE} .desc`).evaluateAll((els) =>
-    els.map((e) => {
-      const r = e.getBoundingClientRect();
-      const lh = parseFloat(getComputedStyle(e).lineHeight);
-      return { x: Math.round(r.left), lines: Math.round(r.height / lh), clipped: e.scrollHeight > e.clientHeight + 1 };
-    }),
-  );
+  const measure = () =>
+    page.locator(`${PALETTE} .desc`).evaluateAll((els) =>
+      els.map((e) => {
+        const r = e.getBoundingClientRect();
+        const lh = parseFloat(getComputedStyle(e).lineHeight);
+        return { x: Math.round(r.left), lines: Math.round(r.height / lh), clipped: e.scrollHeight > e.clientHeight + 1 };
+      }),
+    );
+  // Fenêtre de la capture, colonne des agents à droite : la saisie est plus
+  // étroite que les 120 colonnes du TUI, la colonne des noms cède (45 %).
+  let descs = await measure();
   expect(new Set(descs.map((d) => d.x)).size).toBe(1);
   expect(descs[2]).toEqual({ x: descs[0].x, lines: 2, clipped: true });
-  expect(descs[0].lines).toBe(1);
-  // Colonne de la description : 4 + 46 = 50 (capture 10), en largeur de cellule.
+  // Saisie d'au moins 120 colonnes : description en colonne 4 + 46 = 50
+  // (capture 10), /loop sur une ligne, la longue repliée puis tronquée.
+  await page.setViewportSize({ width: 1700, height: 813 });
+  await page.waitForTimeout(100);
+  descs = await measure();
   const ch = await page.locator(`${PALETTE} .cur`).first().evaluate((e) => e.getBoundingClientRect().width / 4);
   const left = await page.locator(PALETTE).evaluate((e) => e.getBoundingClientRect().left);
   expect(Math.round((descs[0].x - left) / ch)).toBe(50);
+  expect(descs[0].lines).toBe(1);
+  expect(descs[2]).toEqual({ x: descs[0].x, lines: 2, clipped: true });
+  await page.setViewportSize({ width: 1136, height: 813 });
+  await page.waitForTimeout(100);
 
   mkdirSync(OUT_DIR, { recursive: true });
   const app = `${OUT_DIR}/10-app.png`;
