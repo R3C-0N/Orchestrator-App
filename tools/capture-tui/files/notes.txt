@@ -1,0 +1,7 @@
+Notes de démonstration
+======================
+
+- Le prototype pilote Claude Code en stream-json.
+- Le rendu reprend le style du terminal.
+- Les diffs sont calculés depuis old_string et new_string.
+- Les sous-agents ont chacun leur couleur.

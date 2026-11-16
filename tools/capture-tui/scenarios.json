@@ -1,0 +1,559 @@
+{
+  "cols": 120,
+  "rows": 40,
+  "wtProfile": "Invite de commandes",
+  "colorScheme": "Campbell",
+  "model": "haiku",
+  "theme": "dark",
+  "tui": "fullscreen",
+  "allow": [
+    "Read",
+    "Edit",
+    "Write",
+    "Bash",
+    "Glob",
+    "Grep",
+    "Agent",
+    "Task"
+  ],
+  "scenarios": [
+    {
+      "name": "01-accueil",
+      "steps": [
+        {
+          "do": "waitText",
+          "pattern": "shift.tab to cycle",
+          "timeoutMs": 45000
+        },
+        {
+          "do": "wait",
+          "ms": 2500
+        },
+        {
+          "do": "capture",
+          "id": "01",
+          "name": "accueil"
+        }
+      ]
+    },
+    {
+      "name": "02-markdown",
+      "prompt": "Sans utiliser d'outil, reponds en markdown : un titre ##, un sous-titre ###, une liste a puces de 3 elements avec un mot en **gras**, un mot en *italique* et du `code en ligne`, une liste numerotee de 2 elements, puis un bloc de code python de 8 lignes.",
+      "steps": [
+        {
+          "do": "waitStop",
+          "count": 1,
+          "timeoutMs": 120000
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "02",
+          "name": "markdown-code"
+        }
+      ]
+    },
+    {
+      "name": "03-outils",
+      "files": [
+        "notes.txt"
+      ],
+      "prompt": "Lis notes.txt avec l'outil Read, puis lance la commande Bash `seq 1 40 | tee nombres.txt`. Ne commente pas, reponds juste ok.",
+      "steps": [
+        {
+          "do": "waitStop",
+          "count": 1,
+          "timeoutMs": 120000
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "03",
+          "name": "outils-tronque"
+        },
+        {
+          "do": "keys",
+          "send": "^o"
+        },
+        {
+          "do": "wait",
+          "ms": 2000
+        },
+        {
+          "do": "capture",
+          "id": "03b",
+          "name": "outils-detail-ctrl-o"
+        },
+        {
+          "do": "keys",
+          "send": "^o"
+        }
+      ]
+    },
+    {
+      "name": "04-edit",
+      "files": [
+        "config.py"
+      ],
+      "prompt": "Dans config.py, avec un seul appel de l'outil Edit, remplace les deux lignes TIMEOUT = 30 et RETRIES = 3 par les trois lignes TIMEOUT = 60, RETRIES = 5 et BACKOFF = 1.5. Puis reponds juste ok.",
+      "steps": [
+        {
+          "do": "waitStop",
+          "count": 1,
+          "timeoutMs": 120000
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "04",
+          "name": "edit-diff"
+        }
+      ]
+    },
+    {
+      "name": "05-agents",
+      "prompt": "Lance en parallele, dans un seul message, deux sous-agents avec l'outil Agent : agent-bleu et agent-rouge. Chacun doit executer la commande Bash `ping -n 30 127.0.0.1` puis repondre fini. Quand les deux ont fini, resume en une ligne.",
+      "steps": [
+        {
+          "do": "waitText",
+          "pattern": "background agents? launched|agents? launched",
+          "timeoutMs": 120000
+        },
+        {
+          "do": "wait",
+          "ms": 5000
+        },
+        {
+          "do": "capture",
+          "id": "05",
+          "name": "agents-en-cours"
+        },
+        {
+          "do": "waitStop",
+          "count": 2,
+          "timeoutMs": 300000
+        },
+        {
+          "do": "wait",
+          "ms": 2000
+        },
+        {
+          "do": "capture",
+          "id": "06",
+          "name": "agents-termines"
+        }
+      ]
+    },
+    {
+      "name": "07-question",
+      "prompt": "Utilise l'outil AskUserQuestion pour me demander quel langage je prefere, avec 3 options : Rust, TypeScript, Python.",
+      "steps": [
+        {
+          "do": "waitText",
+          "pattern": "Enter to|Esc to cancel|to navigate",
+          "timeoutMs": 90000
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "07",
+          "name": "question"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        }
+      ]
+    },
+    {
+      "name": "08-interruption",
+      "prompt": "Lance la commande Bash `ping -n 90 127.0.0.1`, puis dis termine.",
+      "steps": [
+        {
+          "do": "waitText",
+          "pattern": "\\$ ping|shell command",
+          "timeoutMs": 90000
+        },
+        {
+          "do": "wait",
+          "ms": 4000
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "waitText",
+          "pattern": "Interrupted",
+          "timeoutMs": 20000
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "08",
+          "name": "interruption"
+        }
+      ]
+    },
+    {
+      "name": "09-erreurs",
+      "prompt": "Fais ces trois actions l'une apres l'autre, sans rien corriger ni relire : 1) avec l'outil Edit, dans config.py, remplace la ligne INEXISTANT = 0 par X = 1 ; 2) lance en Bash `mkdir dossier-absent/sous-dossier` ; 3) lance en Bash `exit 3`. Puis reponds juste fait.",
+      "steps": [
+        {
+          "do": "waitStop",
+          "count": 1,
+          "timeoutMs": 120000
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "09",
+          "name": "erreurs"
+        },
+        {
+          "do": "keys",
+          "send": "^o"
+        },
+        {
+          "do": "wait",
+          "ms": 2000
+        },
+        {
+          "do": "capture",
+          "id": "09b",
+          "name": "erreurs-detail-ctrl-o"
+        },
+        {
+          "do": "keys",
+          "send": "^o"
+        }
+      ],
+      "files": [
+        "config.py"
+      ]
+    },
+    {
+      "name": "10-slash",
+      "steps": [
+        {
+          "do": "waitText",
+          "pattern": "shift.tab to cycle",
+          "timeoutMs": 45000
+        },
+        {
+          "do": "wait",
+          "ms": 2500
+        },
+        {
+          "do": "keys",
+          "send": "/"
+        },
+        {
+          "do": "wait",
+          "ms": 2000
+        },
+        {
+          "do": "capture",
+          "id": "10",
+          "name": "menu-slash"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        }
+      ]
+    },
+    {
+      "name": "ctrlc",
+      "extra": true,
+      "steps": [
+        {
+          "do": "waitText",
+          "pattern": "shift.tab to cycle",
+          "timeoutMs": 45000
+        },
+        {
+          "do": "wait",
+          "ms": 2500
+        },
+        {
+          "do": "type",
+          "text": "bonjour le monde"
+        },
+        {
+          "do": "wait",
+          "ms": 600
+        },
+        {
+          "do": "capture",
+          "id": "c1",
+          "name": "saisie-avant-ctrlc"
+        },
+        {
+          "do": "keys",
+          "send": "^c"
+        },
+        {
+          "do": "wait",
+          "ms": 800
+        },
+        {
+          "do": "capture",
+          "id": "c2",
+          "name": "ctrlc-saisie-non-vide"
+        },
+        {
+          "do": "keys",
+          "send": "^c"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "capture",
+          "id": "c3",
+          "name": "ctrlc-saisie-vide-repos"
+        },
+        {
+          "do": "wait",
+          "ms": 4000
+        },
+        {
+          "do": "type",
+          "text": "Lance la commande Bash `ping -n 90 127.0.0.1`, puis dis termine."
+        },
+        {
+          "do": "keys",
+          "send": "{ENTER}"
+        },
+        {
+          "do": "waitText",
+          "pattern": "\\$ ping|shell command",
+          "timeoutMs": 90000
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "type",
+          "text": "brouillon"
+        },
+        {
+          "do": "wait",
+          "ms": 400
+        },
+        {
+          "do": "keys",
+          "send": "^c"
+        },
+        {
+          "do": "wait",
+          "ms": 800
+        },
+        {
+          "do": "capture",
+          "id": "c4",
+          "name": "ctrlc-saisie-non-vide-pendant-tour"
+        },
+        {
+          "do": "keys",
+          "send": "^c"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "c5",
+          "name": "ctrlc-saisie-vide-pendant-tour"
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "capture",
+          "id": "c6",
+          "name": "ctrlc-apres"
+        }
+      ]
+    },
+    {
+      "name": "echap",
+      "extra": true,
+      "prompt": "Reponds juste ok.",
+      "steps": [
+        {
+          "do": "waitStop",
+          "count": 1,
+          "timeoutMs": 90000
+        },
+        {
+          "do": "wait",
+          "ms": 1000
+        },
+        {
+          "do": "type",
+          "text": "texte en cours"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 600
+        },
+        {
+          "do": "capture",
+          "id": "e1",
+          "name": "echap-saisie-non-vide"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 600
+        },
+        {
+          "do": "capture",
+          "id": "e2",
+          "name": "echap-echap-saisie-non-vide"
+        },
+        {
+          "do": "wait",
+          "ms": 2500
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 300
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1000
+        },
+        {
+          "do": "capture",
+          "id": "e3",
+          "name": "echap-echap-saisie-vide"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 800
+        },
+        {
+          "do": "capture",
+          "id": "e4",
+          "name": "echap-apres"
+        }
+      ]
+    },
+    {
+      "name": "ctrlc-tour",
+      "extra": true,
+      "prompt": "Lance la commande Bash `ping -n 90 127.0.0.1`, puis dis termine.",
+      "steps": [
+        {
+          "do": "waitText",
+          "pattern": "\\$ ping|shell command",
+          "timeoutMs": 90000
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "capture",
+          "id": "k1",
+          "name": "tour-en-cours-saisie-vide"
+        },
+        {
+          "do": "keys",
+          "send": "^c"
+        },
+        {
+          "do": "wait",
+          "ms": 6000
+        },
+        {
+          "do": "capture",
+          "id": "k2",
+          "name": "ctrlc-saisie-vide-pendant-tour"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 200
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1200
+        },
+        {
+          "do": "capture",
+          "id": "k3",
+          "name": "echap-echap-saisie-vide-apres-tour"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 800
+        },
+        {
+          "do": "capture",
+          "id": "k4",
+          "name": "echap-apres"
+        }
+      ]
+    }
+  ]
+}
