@@ -11,6 +11,10 @@
     "allow-interrupt",
     "allow-set-model",
     "allow-answer-question",
-    "allow-skip-question"
+    "allow-skip-question",
+    "allow-list-projects",
+    "allow-list-sessions",
+    "allow-load-history",
+    "allow-stop-session"
   ]
 }

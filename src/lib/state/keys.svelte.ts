@@ -39,7 +39,15 @@ export type KeyContext = {
   draft: string;
   /** Horodatage de l'appui (ms, `performance.now()`). */
   now: number;
+  /**
+   * Sélecteur de projet ou de session ouvert (J11) : ses touches (↑↓,
+   * Entrée, Échap, Espace) lui appartiennent, le gestionnaire les laisse passer.
+   */
+  selector?: boolean;
 };
+
+/** Touches gérées par les sélecteurs de projet et de session (J11). */
+const SELECTOR_KEYS = new Set(["ArrowUp", "ArrowDown", "Enter", "Escape", " "]);
 
 export type KeyAction =
   /** Laisser faire le navigateur (copie native, frappe normale). */
@@ -95,6 +103,8 @@ export function decide(k: KeyInput, ctx: KeyContext, armedAt: number | null): Ke
   // Échap maintenu : seul le premier appui compte (sinon la répétition
   // automatique ferait un double Échap et effacerait la saisie).
   if (k.key === "Escape" && k.repeat) return { type: "pass" };
+  // Sélecteur ouvert : ses touches, sans modificateur, lui reviennent.
+  if (ctx.selector && SELECTOR_KEYS.has(k.key) && !k.ctrl && !k.alt && !k.meta) return { type: "pass" };
   const onlyCtrl = k.ctrl && !k.alt && !k.shift && !k.meta;
   const plain = !k.ctrl && !k.alt && !k.shift && !k.meta;
 

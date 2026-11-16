@@ -11,12 +11,17 @@
   // Colonne des agents (J9, décision 4) à droite : `.split` = `.left`
   // (conversation, saisie, ligne d'état) + `AgentColumn` ; elle reste
   // visible en vue détaillée (Ctrl+O).
+  // J11 (décision 11) : lancée sans dossier en argument, l'app montre le
+  // sélecteur des projets, puis celui des sessions du projet choisi
+  // (nouvelle session ou reprise avec tout l'historique).
   import { onMount } from "svelte";
   import AgentColumn from "./lib/components/agents/AgentColumn.svelte";
   import Conversation from "./lib/components/Conversation.svelte";
   import { entriesFrom, filterEntries, nameColumn } from "./lib/components/Palette.svelte";
+  import ProjectPicker from "./lib/components/ProjectPicker.svelte";
   import Prompt from "./lib/components/Prompt.svelte";
   import QuestionCard from "./lib/components/QuestionCard.svelte";
+  import SessionPicker from "./lib/components/SessionPicker.svelte";
   import StatusLine from "./lib/components/StatusLine.svelte";
   import {
     answerQuestion,
@@ -27,6 +32,7 @@
     setModel,
     skipQuestion as skipQuestionCmd,
     startSession,
+    stopSession,
     type Answer,
     type CoreEvent,
     type SessionKey,
@@ -36,13 +42,58 @@
   import type { MockCore } from "./lib/core/mock";
   import { Keys, keyInput, type KeyAction, type Overlay } from "./lib/state/keys.svelte";
   import { SessionStore } from "./lib/state/session.svelte";
+  import { resumeSession } from "./lib/state/sessions.svelte";
 
   // Mode simulé : `?mock=…`, ou d'office hors de Tauri. `mock.ts` n'est
   // chargé qu'à ce moment (import dynamique, hors du bundle principal).
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   const mockMode = new URLSearchParams(location.search).has("mock") || !inTauri;
 
-  const store = new SessionStore();
+  /**
+   * Magasin de la session affichée. Une reprise en crée un neuf (plan 1.5) :
+   * `$state.raw`, la réaffectation est suivie, le magasin n'est pas proxifié.
+   */
+  let store: SessionStore = $state.raw(newStore());
+
+  /**
+   * Magasin neuf : ses lots passent d'abord par `noteInit` (noms de `init`
+   * pour la palette), puis la mesure de latence est branchée dessus.
+   */
+  function newStore(): SessionStore {
+    const s = new SessionStore();
+    const push = s.push;
+    s.push = (batch) => {
+      noteInit(batch);
+      push(batch);
+    };
+    s.onApplied = ({ deltaTs }) => {
+      if (deltaTs.length === 0) return;
+      paintQueue.push(deltaTs);
+      afterPaint.port2.postMessage(0);
+    };
+    return s;
+  }
+
+  /** Écran : sélecteur de projet, de session, ou la session (`start`). */
+  let phase: "start" | "projects" | "sessions" = $state("start");
+  /** Dossier choisi dans le sélecteur des projets. */
+  let projectPath: string | null = $state(null);
+  /** `LaunchInfo.launch_error` : argument donné mais inutilisable. */
+  let launchError: string | null = $state(null);
+  const selectorOpen = $derived(phase !== "start");
+  /**
+   * Historique repris tronqué (notice Info `history_truncated` du cœur,
+   * rangée dans `infos`) : ligne grise discrète en tête de la conversation.
+   */
+  let historyCut: string | null = $state(null);
+
+  /** Texte de la ligne « début omis » d'après les compteurs de `load_history`. */
+  function historyCutText(h: { omitted_lines: number; dropped_events: number } | null): string | null {
+    if (!h) return null;
+    if (h.omitted_lines > 0) return `Début de l'historique omis (${h.omitted_lines} lignes)`;
+    if (h.dropped_events > 0) return `Début de l'historique omis (${h.dropped_events} événements)`;
+    return null;
+  }
   let mock: MockCore | null = null;
   let conversation: Conversation | undefined = $state();
   let prompt: Prompt | undefined = $state();
@@ -170,14 +221,13 @@
     prompt?.focusEnd();
   }
 
-  /** Lot du cœur : retient les noms de `init` pour la palette, puis le magasin. */
-  function ingest(batch: CoreEvent[]): void {
+  /** Retient les noms de `init` (skills, commandes) pour la palette. */
+  function noteInit(batch: CoreEvent[]): void {
     for (const ev of batch) {
       if (ev.kind !== "init") continue;
       const add = [...ev.skills, ...ev.slash_commands].filter((n) => !initNames.includes(n));
       if (add.length > 0) initNames = [...initNames, ...new Set(add)];
     }
-    store.push(batch);
   }
   /** Message passager à droite au-dessus de la saisie (« Set model to … »). */
   let notice: string | null = $state(null);
@@ -326,7 +376,11 @@
       interrupting: interruptAsked || store.status === "Interrupting",
       draft,
       now: performance.now(),
+      selector: selectorOpen,
     });
+    // Sélecteur de projet ou de session : ses touches lui reviennent, et
+    // aucun raccourci de la saisie (palette, modèle) ne s'applique.
+    if (selectorOpen && action.type !== "copy" && action.type !== "toggleVerbose") return;
     if (action.type === "pass") {
       // Carte de question : la frappe est à elle (chiffres, champ libre).
       if (store.question) {
@@ -426,11 +480,6 @@
     if (latencies.length > 5000) latencies.splice(0, latencies.length - 5000);
   };
   const paintQueue: number[][] = [];
-  store.onApplied = ({ deltaTs }) => {
-    if (deltaTs.length === 0) return;
-    paintQueue.push(deltaTs);
-    afterPaint.port2.postMessage(0);
-  };
 
   function pct(xs: number[], p: number): number {
     const s = [...xs].sort((a, b) => a - b);
@@ -501,7 +550,7 @@
         if (e.kind === "status" && e.state === "Requesting" && init) out.push(make({ ...init, kind: "init", model }));
       }
       for (const e of out) (e as { seq: number }).seq = seq++;
-      ingest(out);
+      store.push(out);
     };
 
     return {
@@ -570,15 +619,57 @@
     (async () => {
       try {
         const info = await getLaunchInfo();
-        cwd = info.cwd;
-        const started = await startSession(info.cwd, ingest);
-        // Un `exited` arrivé pendant le démarrage ne doit pas être écrasé.
-        if (store.status !== "Exited") session = started.session;
+        launchError = info.launch_error;
+        if (info.cwd_from_args) await startNew(info.cwd);
+        else phase = "projects";
       } catch (err) {
         startError = describeError(err);
       }
     })();
   });
+
+  // --- Projets et sessions (J11) -------------------------------------------------
+
+  /** Nouvelle session dans `path`. */
+  async function startNew(path: string): Promise<void> {
+    phase = "start";
+    cwd = path;
+    historyCut = null;
+    const s = store;
+    try {
+      const started = await startSession(path, s.push);
+      // Un `exited` arrivé pendant le démarrage ne doit pas être écrasé.
+      if (s === store && s.status !== "Exited") session = started.session;
+    } catch (err) {
+      startError = describeError(err);
+    }
+  }
+
+  /**
+   * Reprise de la session `id` du projet choisi : magasin neuf, puis
+   * `stop_session`, `start_session --resume`, `load_history`
+   * (`resumeSession`). Un historique illisible donne le bandeau
+   * `history_unavailable`, et la session continue.
+   */
+  async function resume(path: string, id: string): Promise<void> {
+    phase = "start";
+    cwd = path;
+    const s = newStore();
+    store = s;
+    draft = "";
+    agentsOpen = [];
+    const current = session;
+    session = null;
+    historyCut = null;
+    try {
+      const { started, history } = await resumeSession({ startSession, stopSession }, { current, cwd: path, sessionId: id, store: s });
+      if (s !== store) return;
+      historyCut = historyCutText(history);
+      if (s.status !== "Exited") session = started.session;
+    } catch (err) {
+      startError = describeError(err);
+    }
+  }
 </script>
 
 <svelte:window onkeydown={onWindowKey} />
@@ -590,40 +681,63 @@
   {#if startError}
     <div class="banner error">{startError}</div>
   {/if}
+  {#if launchError}
+    <div class="banner" data-testid="launch-error">{launchError}</div>
+  {/if}
   <div class="split">
     <div class="left">
-      <Conversation {store} {verbose} bind:this={conversation} />
-      <!-- Vue détaillée (Ctrl+O) : la barre « Showing detailed transcript » de la
-           conversation remplace la saisie et la ligne d'état, comme le TUI (03b). -->
-      {#if store.question}
-        <!-- La carte prend la place de la saisie et de la ligne d'état (`07`). -->
-        <QuestionCard
-          bind:this={card}
-          question={store.question}
-          onanswer={answer}
-          onskip={skipQuestion}
-          onchat={chatAboutQuestion}
+      {#if phase === "projects"}
+        <ProjectPicker
+          onpick={(path) => {
+            projectPath = path;
+            phase = "sessions";
+          }}
         />
-      {:else if !verbose}
-        <Prompt
-          bind:this={prompt}
-          bind:draft
-          bind:pickerOpen
-          disabled={!ready || store.status === "Exited"}
-          {placeholder}
-          hint={keys.hint ?? notice}
-          {history}
-          models={store.meta.models}
-          currentModel={store.meta.model}
-          onsubmit={submit}
-          onslash={() => openPalette("slash")}
-          onpick={(m) => void applyModel(m)}
-          oninputchange={() => keys.disarm()}
-          palette={paletteOpen ? { entries: paletteItems, sel: paletteSel, nameWidth: paletteNameWidth } : null}
-          onpalettemove={movePalette}
-          onpalettechoose={choosePalette}
+      {:else if phase === "sessions" && projectPath}
+        {@const path = projectPath}
+        <SessionPicker
+          cwd={path}
+          onnew={() => void startNew(path)}
+          onpick={(id) => void resume(path, id)}
+          oncancel={() => (phase = "projects")}
         />
-        <StatusLine {store} />
+      {:else}
+        {#if historyCut}
+          <div class="history-cut term" data-testid="history-cut">{`  ⎿  ${historyCut}`}</div>
+        {/if}
+        <Conversation {store} {verbose} bind:this={conversation} />
+        <!-- Vue détaillée (Ctrl+O) : la barre « Showing detailed transcript » de la
+             conversation remplace la saisie et la ligne d'état, comme le TUI (03b). -->
+        {#if store.question}
+          <!-- La carte prend la place de la saisie et de la ligne d'état (`07`). -->
+          <QuestionCard
+            bind:this={card}
+            question={store.question}
+            onanswer={answer}
+            onskip={skipQuestion}
+            onchat={chatAboutQuestion}
+          />
+        {:else if !verbose}
+          <Prompt
+            bind:this={prompt}
+            bind:draft
+            bind:pickerOpen
+            disabled={!ready || store.status === "Exited"}
+            {placeholder}
+            hint={keys.hint ?? notice}
+            {history}
+            models={store.meta.models}
+            currentModel={store.meta.model}
+            onsubmit={submit}
+            onslash={() => openPalette("slash")}
+            onpick={(m) => void applyModel(m)}
+            oninputchange={() => keys.disarm()}
+            palette={paletteOpen ? { entries: paletteItems, sel: paletteSel, nameWidth: paletteNameWidth } : null}
+            onpalettemove={movePalette}
+            onpalettechoose={choosePalette}
+          />
+          <StatusLine {store} />
+        {/if}
       {/if}
     </div>
     <AgentColumn {store} width="48ch" bind:open={agentsOpen} />
@@ -652,6 +766,13 @@
     min-width: 0;
     display: flex;
     flex-direction: column;
+  }
+  .history-cut {
+    flex: none;
+    color: var(--t-dim);
+    white-space: pre;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .banner {
     padding: 0 1ch;

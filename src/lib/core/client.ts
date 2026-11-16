@@ -8,6 +8,7 @@ import type { CoreError } from "./bindings/CoreError";
 import type { CoreEvent } from "./bindings/CoreEvent";
 import type { Diagnostics } from "./bindings/Diagnostics";
 import type { ExitInfo } from "./bindings/ExitInfo";
+import type { HistoryLoaded } from "./bindings/HistoryLoaded";
 import type { InterruptAck } from "./bindings/InterruptAck";
 import type { LaunchInfo } from "./bindings/LaunchInfo";
 import type { SessionKey } from "./bindings/SessionKey";
@@ -21,6 +22,7 @@ export type {
   CoreEvent,
   Diagnostics,
   ExitInfo,
+  HistoryLoaded,
   InterruptAck,
   LaunchInfo,
   SessionKey,
@@ -76,8 +78,9 @@ export const skipQuestion = (session: SessionKey, request_id: string, reason: Sk
 
 export const listSessions = (cwd: string) => invoke<SessionSummary[]>("list_sessions", { cwd });
 
+/** Historique relu dans le transcript (J11) : `CoreEvent` déjà réduits et compteurs. */
 export const loadHistory = (session: SessionKey, session_id: string) =>
-  invoke<void>("load_history", { session, session_id });
+  invoke<HistoryLoaded>("load_history", { session, session_id });
 
 export const stopSession = (session: SessionKey) => invoke<ExitInfo>("stop_session", { session });
 
