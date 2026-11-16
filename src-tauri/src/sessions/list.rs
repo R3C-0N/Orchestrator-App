@@ -150,6 +150,12 @@ pub fn read_project_cwd(dir: &Path) -> Option<String> {
         .find_map(|t| cwd_from_head(&t.path, &name))
 }
 
+/// Chemin réseau (UNC, `\\serveur\partage` ou `//serveur/partage`) : son
+/// existence n'est pas testée, `is_dir` pouvant attendre le délai du réseau.
+pub fn is_network_path(p: &str) -> bool {
+    p.starts_with(r"\\") || p.starts_with("//")
+}
+
 /// Projets récents de `root` (`~/.claude/projects`), du plus récent au plus
 /// ancien. Un dossier sans transcript est ignoré. `root` absent : liste vide.
 pub fn list_projects(root: &Path) -> Vec<ProjectSummary> {
@@ -168,11 +174,20 @@ pub fn list_projects(root: &Path) -> Vec<ProjectSummary> {
                 .iter()
                 .take(CWD_TRIES)
                 .find_map(|t| cwd_from_head(&t.path, &encoded));
-            let exists = path.as_deref().is_some_and(|p| Path::new(p).is_dir());
+            // Un chemin réseau (`\\serveur\…`, `\\?\UNC\…`) peut bloquer
+            // longtemps : il n'est pas testé, il reste sélectionnable et
+            // `exists_checked` vaut faux.
+            let checked = path.as_deref().is_some_and(|p| !is_network_path(p));
+            let exists = match path.as_deref() {
+                Some(p) if checked => Path::new(p).is_dir(),
+                Some(_) => true,
+                None => false,
+            };
             Some(ProjectSummary {
                 encoded,
                 path,
                 exists,
+                exists_checked: checked,
                 last_used,
                 session_count: files.len() as u32,
             })
@@ -196,10 +211,12 @@ struct TailInfo {
 }
 
 impl TailInfo {
+    /// Tout est connu : la lecture peut s'arrêter. Un `custom-title`
+    /// (`/rename`) passe avant `ai-title`, et le CLI l'écrit juste **avant**
+    /// lui : tant que seul `ai-title` est connu, la lecture continue jusqu'à
+    /// [`TAIL_BYTES`].
     fn complete(&self) -> bool {
-        (self.custom_title.is_some() || self.ai_title.is_some())
-            && self.last_prompt.is_some()
-            && self.entrypoint.is_some()
+        self.custom_title.is_some() && self.last_prompt.is_some() && self.entrypoint.is_some()
     }
 }
 
@@ -211,34 +228,58 @@ fn has(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Lit la fin du transcript **à rebours** : la ligne la plus proche de la fin
-/// l'emporte, et la lecture s'arrête dès que titre, dernier prompt et
-/// `entrypoint` sont connus (en général dans les 16 derniers ko).
+/// Lit la fin du transcript **à rebours**, par blocs (16 ko, puis 16 et
+/// 32 ko de plus, 64 ko en tout) : la ligne la plus proche de la fin
+/// l'emporte. Chaque octet n'est lu qu'une fois ; une ligne à cheval sur
+/// deux blocs est recollée (`pending`), donc un caractère multi-octets coupé
+/// par la frontière d'un bloc reste entier. Arrêt dès que tout est connu
+/// ([`TailInfo::complete`]).
 fn tail_info(t: &TranscriptFile) -> TailInfo {
     let mut info = TailInfo::default();
-    let mut span = TAIL_STEP.min(t.size);
-    loop {
-        let from = t.size - span;
-        let Some(buf) = read_range(&t.path, from, span) else {
+    let limit = TAIL_BYTES.min(t.size);
+    let mut read = 0u64;
+    let mut step = TAIL_STEP;
+    // Début (incomplet) de la ligne coupée par le bloc précédent.
+    let mut pending: Vec<u8> = Vec::new();
+    // Une seule ouverture par fichier (chaque ouverture coûte, antivirus
+    // compris).
+    let Ok(mut f) = File::open(&t.path) else {
+        return info;
+    };
+    while read < limit {
+        let len = step.min(limit - read);
+        let from = t.size - read - len;
+        let mut buf = vec![0u8; len as usize];
+        if f.seek(SeekFrom::Start(from)).is_err() || f.read_exact(&mut buf).is_err() {
             return info;
-        };
-        info = TailInfo::default();
-        let mut lines: Vec<&[u8]> = buf.split(|b| *b == b'\n').collect();
-        if from > 0 && !lines.is_empty() {
-            // Ligne coupée au début de l'extrait.
-            lines.remove(0);
         }
-        for line in lines.into_iter().rev() {
-            scan_tail_line(line, &mut info);
-            if info.complete() {
-                return info;
+        buf.extend_from_slice(&pending);
+        read += len;
+        // Lignes de la plus récente à la plus ancienne (boucle simple : ce
+        // parcours touche chaque octet, il doit rester bon marché).
+        let mut end = buf.len();
+        let mut i = buf.len();
+        while i > 0 {
+            i -= 1;
+            if buf[i] == b'\n' {
+                scan_tail_line(&buf[i + 1..end], &mut info);
+                if info.complete() {
+                    return info;
+                }
+                end = i;
             }
         }
-        if span >= TAIL_BYTES.min(t.size) {
-            return info;
+        // Le premier morceau est coupé, sauf au début du fichier.
+        if from == 0 {
+            scan_tail_line(&buf[..end], &mut info);
+            pending.clear();
+        } else {
+            buf.truncate(end);
+            pending = buf;
         }
-        span = (span * 2).min(TAIL_BYTES).min(t.size);
+        step = read.max(TAIL_STEP);
     }
+    info
 }
 
 /// Une ligne de la fin, lue de la plus récente à la plus ancienne : seule la

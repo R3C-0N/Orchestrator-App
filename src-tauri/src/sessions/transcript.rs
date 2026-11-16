@@ -48,6 +48,56 @@ use crate::state::reducer::{Action, Reducer, INTERRUPTED_TEXT};
 /// Plafond d'une ligne de transcript (même valeur que le lecteur du flux).
 pub const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Plafonds de l'historique relu (relecture J11, B2) : la réponse de
+/// `load_history` part en une fois vers la webview, elle doit rester
+/// raisonnable même pour un transcript de plusieurs centaines de Mo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryLimits {
+    /// Octets lus depuis la **fin** du transcript (en commençant à une limite
+    /// de ligne) ; le début est omis, avec une notice Info
+    /// `history_truncated`.
+    pub max_bytes: u64,
+    /// Longueur maximale d'une chaîne (contenu de `tool_result`, `meta`,
+    /// entrée d'outil, texte) : au-delà, « … [tronqué] ».
+    pub max_item_bytes: usize,
+    /// Taille maximale estimée des événements sérialisés : au-delà, les plus
+    /// anciens sont retirés, en coupant au début d'un message utilisateur.
+    pub max_output_bytes: usize,
+}
+
+impl Default for HistoryLimits {
+    fn default() -> Self {
+        HistoryLimits {
+            max_bytes: 20 * 1024 * 1024,
+            max_item_bytes: 64 * 1024,
+            max_output_bytes: 25 * 1024 * 1024,
+        }
+    }
+}
+
+/// Mention ajoutée à une chaîne raccourcie.
+pub const CLIPPED_MARK: &str = "… [tronqué]";
+
+/// Raccourcit à `max` octets (sur une frontière de caractère) toute chaîne
+/// plus longue de `v`, récursivement. Renvoie le nombre de chaînes
+/// raccourcies.
+pub fn clip_strings(v: &mut Value, max: usize) -> u32 {
+    match v {
+        Value::String(s) if s.len() > max => {
+            let mut end = max;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            s.push_str(CLIPPED_MARK);
+            1
+        }
+        Value::Array(a) => a.iter_mut().map(|x| clip_strings(x, max)).sum(),
+        Value::Object(o) => o.values_mut().map(|x| clip_strings(x, max)).sum(),
+        _ => 0,
+    }
+}
+
 /// Types de lignes connus et sans rien à afficher (plan 1.8 et constaté sur
 /// le CLI 2.1.325). Tout autre type est compté comme inconnu.
 const KNOWN_SILENT: &[&str] = &[
@@ -151,14 +201,25 @@ pub fn read_subagents(dir: &Path) -> (Vec<SubagentMeta>, u32) {
 }
 
 /// Relit l'historique de la session `session_id` du dossier de projet
-/// `project_dir`. Erreurs : fichier absent ou illisible (`Io`), id qui n'est
-/// pas un UUID (`InvalidArgument`), aucune ligne JSON valide dans un fichier
-/// non vide (`TranscriptFormat`). Dans ces cas l'interface reprend la session
-/// sans historique affiché, avec un avertissement.
+/// `project_dir`, avec les plafonds par défaut ([`HistoryLimits`]).
+/// Erreurs : fichier absent ou illisible (`Io`), id qui n'est pas un UUID
+/// (`InvalidArgument`), aucune ligne JSON valide dans un fichier non vide
+/// (`TranscriptFormat`). Dans ces cas l'interface reprend la session sans
+/// historique affiché, avec un avertissement.
 pub fn load_history(
     project_dir: &Path,
     session_id: &str,
     session: &SessionKey,
+) -> Result<HistoryLoaded, CoreError> {
+    load_history_with(project_dir, session_id, session, &HistoryLimits::default())
+}
+
+/// Comme [`load_history`], avec des plafonds choisis (tests).
+pub fn load_history_with(
+    project_dir: &Path,
+    session_id: &str,
+    session: &SessionKey,
+    limits: &HistoryLimits,
 ) -> Result<HistoryLoaded, CoreError> {
     if !super::paths::is_session_id(session_id) {
         return Err(CoreError::InvalidArgument(format!(
@@ -166,10 +227,10 @@ pub fn load_history(
         )));
     }
     let path = transcript_path(project_dir, session_id);
-    let bytes =
-        std::fs::read(&path).map_err(|e| CoreError::Io(format!("{} : {e}", path.display())))?;
+    let io = |e: std::io::Error| CoreError::Io(format!("{} : {e}", path.display()));
+    let (bytes, omitted) = read_window(&path, limits.max_bytes).map_err(io)?;
     let (metas, threads) = read_subagents(&subagents_dir(project_dir, session_id));
-    let mut h = history_from_bytes(&bytes, &metas, session);
+    let mut h = history_from_bytes_with(&bytes, &metas, session, limits, omitted);
     h.session_id = session_id.to_string();
     h.subagent_threads = threads;
     if !bytes.iter().all(u8::is_ascii_whitespace) && h.lines == h.bad + u32::from(h.truncated) {
@@ -182,15 +243,87 @@ pub fn load_history(
     Ok(h)
 }
 
+/// Début du transcript non relu.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Omitted {
+    pub lines: u32,
+    pub bytes: u64,
+}
+
+/// Lit au plus `max` octets à la fin du fichier, en commençant au début
+/// d'une ligne. Le début omis est parcouru par blocs de 1 Mo pour en compter
+/// les lignes (sans le garder en mémoire).
+pub fn read_window(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, Omitted)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let size = f.metadata()?.len();
+    if size <= max {
+        let mut buf = Vec::with_capacity(size as usize);
+        f.read_to_end(&mut buf)?;
+        return Ok((buf, Omitted::default()));
+    }
+    let from = size - max;
+    // Lignes complètes du début omis, et dernier octet avant la fenêtre.
+    let mut newlines = 0u64;
+    let mut last = b'\n';
+    let mut chunk = vec![0u8; 1024 * 1024];
+    let mut left = from;
+    while left > 0 {
+        let n = (chunk.len() as u64).min(left) as usize;
+        f.read_exact(&mut chunk[..n])?;
+        newlines += chunk[..n].iter().filter(|b| **b == b'\n').count() as u64;
+        last = chunk[n - 1];
+        left -= n as u64;
+    }
+    f.seek(SeekFrom::Start(from))?;
+    let mut buf = Vec::with_capacity(max as usize);
+    f.read_to_end(&mut buf)?;
+    let mut omitted = Omitted {
+        lines: newlines as u32,
+        bytes: from,
+    };
+    if last != b'\n' {
+        // La fenêtre commence au milieu d'une ligne : elle est omise aussi.
+        let cut = buf
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(buf.len(), |i| i + 1);
+        buf.drain(..cut);
+        omitted.lines += 1;
+        omitted.bytes += cut as u64;
+    }
+    Ok((buf, omitted))
+}
+
 /// Cœur pur du lecteur (testé sans fichier) : octets du transcript ->
 /// `CoreEvent` numérotés à partir de 0, horodatés avec le `timestamp` des
-/// lignes.
+/// lignes. Plafonds par défaut, rien d'omis.
 pub fn history_from_bytes(
     bytes: &[u8],
     metas: &[SubagentMeta],
     session: &SessionKey,
 ) -> HistoryLoaded {
-    let mut r = HistoryReader::new(metas);
+    history_from_bytes_with(
+        bytes,
+        metas,
+        session,
+        &HistoryLimits::default(),
+        Omitted::default(),
+    )
+}
+
+/// Comme [`history_from_bytes`], avec des plafonds et le début omis par
+/// [`read_window`].
+pub fn history_from_bytes_with(
+    bytes: &[u8],
+    metas: &[SubagentMeta],
+    session: &SessionKey,
+    limits: &HistoryLimits,
+    omitted: Omitted,
+) -> HistoryLoaded {
+    let mut r = HistoryReader::new(metas, *limits);
+    r.stats.omitted_lines = omitted.lines;
+    r.stats.omitted_bytes = omitted.bytes;
     let ends_with_newline = bytes.last().is_some_and(|b| *b == b'\n');
     let mut parts: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
     if ends_with_newline {
@@ -207,6 +340,7 @@ pub fn history_from_bytes(
 struct HistoryReader<'a> {
     reducer: Reducer,
     metas: &'a [SubagentMeta],
+    limits: HistoryLimits,
     /// Métas déjà appliquées (par `tool_use_id`).
     metas_used: HashSet<String>,
     /// Appels Agent rencontrés : `tool_use_id`.
@@ -219,12 +353,13 @@ struct HistoryReader<'a> {
 }
 
 impl<'a> HistoryReader<'a> {
-    fn new(metas: &'a [SubagentMeta]) -> Self {
+    fn new(metas: &'a [SubagentMeta], limits: HistoryLimits) -> Self {
         let mut reducer = Reducer::new();
         reducer.history = true;
         HistoryReader {
             reducer,
             metas,
+            limits,
             metas_used: HashSet::new(),
             agent_calls: HashSet::new(),
             backgrounded: HashSet::new(),
@@ -287,7 +422,7 @@ impl<'a> HistoryReader<'a> {
         match kind {
             "user" | "assistant" | "system" if sidechain => self.stats.sidechain += 1,
             "user" => self.on_user(v),
-            "assistant" => self.on_assistant(&v),
+            "assistant" => self.on_assistant(v),
             "system" => self.on_system(&v),
             k if KNOWN_SILENT.contains(&k) => self.stats.ignored += 1,
             _ => {
@@ -297,8 +432,11 @@ impl<'a> HistoryReader<'a> {
         }
     }
 
-    fn on_assistant(&mut self, v: &Value) {
+    fn on_assistant(&mut self, mut v: Value) {
         self.stats.used += 1;
+        // Entrées d'outils volumineuses (`Write.content`…) : bornées aussi.
+        self.stats.clipped += clip_strings(&mut v, self.limits.max_item_bytes);
+        let v = &v;
         self.feed(v);
         let calls: Vec<String> = v
             .pointer("/message/content")
@@ -397,7 +535,17 @@ impl<'a> HistoryReader<'a> {
             self.stats.ignored += 1;
             return;
         }
-        let human = v.pointer("/origin/kind").and_then(Value::as_str) == Some("human");
+        let kind = v.pointer("/origin/kind").and_then(Value::as_str);
+        let human = kind == Some("human");
+        // Origine connue et ni tapée ni notification de tâche (`peer` :
+        // rapport d'un sous-agent ou d'une autre session) : jamais affichée
+        // comme un message de l'utilisateur. Choix prudent : masquée et
+        // comptée (constaté : toutes ont aussi `isMeta: true`).
+        if kind.is_some_and(|k| k != "human" && k != "task-notification") {
+            self.stats.ignored += 1;
+            return;
+        }
+        self.stats.clipped += clip_strings(&mut v, self.limits.max_item_bytes);
         let Some(content) = v.pointer("/message/content").cloned() else {
             self.stats.ignored += 1;
             return;
@@ -529,6 +677,48 @@ impl<'a> HistoryReader<'a> {
                 t,
             ));
         }
+        // Plafond de la réponse : les plus anciens événements partent, en
+        // coupant au début d'un message utilisateur.
+        let sizes: Vec<usize> = self.events.iter().map(|(b, _)| json_len(b)).collect();
+        let mut total: usize = sizes.iter().sum();
+        let mut cut = 0;
+        while total > self.limits.max_output_bytes && cut < sizes.len() {
+            total -= sizes[cut];
+            cut += 1;
+        }
+        if cut > 0 {
+            while cut < self.events.len()
+                && !matches!(self.events[cut].0, EventBody::UserMessage { .. })
+            {
+                cut += 1;
+            }
+            self.events.drain(..cut);
+            stats.dropped_events = cut as u32;
+        }
+        if stats.omitted_lines > 0 || stats.dropped_events > 0 {
+            let t0 = self.events.first().map_or(t, |e| e.1);
+            self.events.insert(
+                0,
+                (
+                    EventBody::Notice {
+                        level: NoticeLevel::Info,
+                        code: "history_truncated".into(),
+                        message: format!(
+                            "Historique : début omis ({} ligne(s), {:.1} Mo non relus ; {} événement(s) retiré(s)).",
+                            stats.omitted_lines,
+                            stats.omitted_bytes as f64 / (1024.0 * 1024.0),
+                            stats.dropped_events
+                        ),
+                        detail: Some(json!({
+                            "omitted_lines": stats.omitted_lines,
+                            "omitted_bytes": stats.omitted_bytes,
+                            "dropped_events": stats.dropped_events,
+                        })),
+                    },
+                    t0,
+                ),
+            );
+        }
         stats.events = self
             .events
             .into_iter()
@@ -544,6 +734,23 @@ impl<'a> HistoryReader<'a> {
     }
 }
 
+/// Taille de la sérialisation JSON, sans l'allouer.
+fn json_len<T: serde::Serialize>(v: &T) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    let _ = serde_json::to_writer(&mut c, v);
+    c.0
+}
+
 enum UserText {
     Show(String),
     TaskNotification(Value),
@@ -551,16 +758,23 @@ enum UserText {
 }
 
 /// Que faire du texte d'un message `user` du transcript.
+///
+/// Un message **tapé** (`origin.kind = "human"`) qui cite une balise du CLI
+/// reste un message tapé : seule une commande `/x` (texte qui **commence**
+/// par `<command-`, forme constatée pour les commandes tapées) est
+/// convertie ; jamais une `<task-notification>`.
 fn classify_text(s: &str, human: bool) -> UserText {
     let t = s.trim_start();
-    if t.contains("<task-notification>") {
+    if !human && t.contains("<task-notification>") {
         return match task_notification(t) {
             Some(n) => UserText::TaskNotification(n),
             None => UserText::Hide,
         };
     }
-    if let Some(cmd) = command_text(t) {
-        return UserText::Show(cmd);
+    if !human || t.starts_with("<command-") {
+        if let Some(cmd) = command_text(t) {
+            return UserText::Show(cmd);
+        }
     }
     if t.starts_with("[Request interrupted by user") {
         return UserText::Show(INTERRUPTED_TEXT.to_string());

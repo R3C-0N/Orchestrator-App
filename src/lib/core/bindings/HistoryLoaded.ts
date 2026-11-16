@@ -45,4 +45,20 @@ truncated: boolean,
 /**
  * Fils de sous-agents `subagents/agent-*.jsonl` présents (non relus).
  */
-subagent_threads: number, };
+subagent_threads: number, 
+/**
+ * Début du transcript non relu (seuls les 20 derniers Mo le sont) :
+ * lignes et octets omis. Notice Info `history_truncated` en tête
+ * d'`events` quand ils sont non nuls.
+ */
+omitted_lines: number, omitted_bytes: number, 
+/**
+ * Chaînes raccourcies à 64 ko (« … [tronqué] ») : contenus de
+ * `tool_result`, `meta` (`toolUseResult`), entrées d'outils, textes.
+ */
+clipped: number, 
+/**
+ * Événements les plus anciens retirés pour garder la réponse sous son
+ * plafond (coupure au début d'un message utilisateur).
+ */
+dropped_events: number, };

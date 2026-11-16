@@ -182,9 +182,13 @@ export function applyHistory(store: SessionStore, h: HistoryLoaded): void {
   const lastSeq = store.lastSeq;
   const gaps = store.gaps;
   store.lastSeq = -1;
-  store.apply(h.events as CoreEvent[]);
-  store.lastSeq = lastSeq;
-  store.gaps = gaps;
+  try {
+    store.apply(h.events as CoreEvent[]);
+  } finally {
+    // Rétablis même si l'application lève une exception.
+    store.lastSeq = lastSeq;
+    store.gaps = gaps;
+  }
 }
 
 export type ResumeDeps = {

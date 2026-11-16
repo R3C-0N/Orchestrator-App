@@ -101,5 +101,14 @@ mod tests {
         assert!(!is_session_id("..\\..\\x"));
         assert!(!is_session_id("mon-nom"));
         assert!(!is_session_id("11111111222243338444555555555555"));
+        // Formes non canoniques que `uuid::Uuid::parse_str` accepte : refusées
+        // (le fichier du CLI porte la forme canonique, spec 4.6).
+        assert!(!is_session_id("{11111111-2222-4333-8444-555555555555}"));
+        assert!(!is_session_id(
+            "urn:uuid:11111111-2222-4333-8444-555555555555"
+        ));
+        assert!(!is_session_id(" 11111111-2222-4333-8444-555555555555"));
+        assert!(!is_session_id("11111111-2222-4333-8444-55555555555g"));
+        assert!(!is_session_id(""));
     }
 }

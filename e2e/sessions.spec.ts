@@ -24,9 +24,10 @@ async function open(page: Page) {
 
 
 const PROJECTS = [
-  { encoded: "C--Users--user--Code-demo", path: "C:\\Users\\<user>\\Code\\demo", exists: true, last_used: Date.now() - 60_000, session_count: 4 },
-  { encoded: "D--disparu-a-b", path: "D:\\disparu\\a-b", exists: false, last_used: Date.now() - 3_600_000, session_count: 1 },
-  { encoded: "C--Users--user--Code-autre", path: "C:\\Users\\<user>\\Code\\autre", exists: true, last_used: Date.now() - 86_400_000 * 3, session_count: 1 },
+  { encoded: "C--Users--user--Code-demo", path: "C:\\Users\\<user>\\Code\\demo", exists: true, exists_checked: true, last_used: Date.now() - 60_000, session_count: 4 },
+  { encoded: "D--disparu-a-b", path: "D:\\disparu\\a-b", exists: false, exists_checked: true, last_used: Date.now() - 3_600_000, session_count: 1 },
+  { encoded: "C--Users--user--Code-autre", path: "C:\\Users\\<user>\\Code\\autre", exists: true, exists_checked: true, last_used: Date.now() - 86_400_000 * 3, session_count: 1 },
+  { encoded: "--serveur-partage-projet", path: "\\\\serveur\\partage\\projet", exists: true, exists_checked: false, last_used: Date.now() - 86_400_000 * 5, session_count: 2 },
 ];
 
 function sessions(n: number) {
@@ -45,7 +46,10 @@ test.describe("sélecteur de projets", () => {
     await open(page);
     await page.evaluate((p) => (window as unknown as { __sessions: Harness }).__sessions.mountProjects(p), PROJECTS);
     const rows = page.getByTestId("project-row");
-    await expect(rows).toHaveCount(3);
+    await expect(rows).toHaveCount(4);
+    // Chemin réseau : existence non testée, choisissable, « non vérifié ».
+    await expect(rows.nth(3)).toContainText("non vérifié");
+    await expect(rows.nth(3)).toHaveAttribute("aria-disabled", "false");
     await expect(rows.nth(0)).toContainText("C:\\Users\\<user>\\Code\\demo");
     await expect(rows.nth(0)).toContainText("4 sessions");
     await expect(rows.nth(1)).toHaveAttribute("aria-disabled", "true");
@@ -63,6 +67,11 @@ test.describe("sélecteur de projets", () => {
     // Clic sur un dossier disparu : rien.
     await rows.nth(1).click({ force: true });
     expect(await page.evaluate(() => (window as unknown as { __sessions: Harness }).__sessions.picked.length)).toBe(1);
+    // Le chemin réseau s'ouvre.
+    await rows.nth(3).click();
+    expect(await page.evaluate(() => (window as unknown as { __sessions: Harness }).__sessions.picked.at(-1))).toBe(
+      "\\\\serveur\\partage\\projet",
+    );
 
     // Filtre, puis Échap annule.
     await page.getByLabel("Filtrer les projets").fill("autre");
@@ -151,6 +160,7 @@ test.describe("reprise", () => {
       { seq: 2, t: 12, session: "k-1", kind: "turn_result", subtype: "success", is_error: false, terminal_reason: null, duration_ms: 3000, cost_usd: 0, num_turns: 0, context_used: null, context_window: null, permission_denials: [], result: null },
     ],
     lines: 3, used: 3, ignored: 0, unknown: 0, unknown_elements: 0, bad: 0, sidechain: 0, truncated: false, subagent_threads: 0,
+    omitted_lines: 0, omitted_bytes: 0, clipped: 0, dropped_events: 0,
   };
 
   test("stop, start --resume, load_history : historique affiché sans trou de seq", async ({ page }) => {

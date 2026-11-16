@@ -114,8 +114,13 @@ pub struct ProjectSummary {
     /// Vrai chemin, lu dans le champ `cwd` du transcript le plus récent ;
     /// `None` si aucun transcript n'en contient.
     pub path: Option<String>,
-    /// `path` existe encore (sinon : grisé dans le sélecteur).
+    /// `path` existe encore (sinon : grisé dans le sélecteur). Vrai sans
+    /// vérification pour un chemin réseau (voir `exists_checked`).
     pub exists: bool,
+    /// Faux si l'existence n'a pas été testée : chemin réseau
+    /// (`\\serveur\…`), dont le test peut bloquer longtemps. Le sélecteur
+    /// l'affiche « non vérifié » et le laisse choisir.
+    pub exists_checked: bool,
     /// Date (ms depuis l'epoch) du transcript le plus récent.
     #[ts(type = "number")]
     pub last_used: u64,
@@ -151,6 +156,18 @@ pub struct HistoryLoaded {
     pub truncated: bool,
     /// Fils de sous-agents `subagents/agent-*.jsonl` présents (non relus).
     pub subagent_threads: u32,
+    /// Début du transcript non relu (seuls les 20 derniers Mo le sont) :
+    /// lignes et octets omis. Notice Info `history_truncated` en tête
+    /// d'`events` quand ils sont non nuls.
+    pub omitted_lines: u32,
+    #[ts(type = "number")]
+    pub omitted_bytes: u64,
+    /// Chaînes raccourcies à 64 ko (« … [tronqué] ») : contenus de
+    /// `tool_result`, `meta` (`toolUseResult`), entrées d'outils, textes.
+    pub clipped: u32,
+    /// Événements les plus anciens retirés pour garder la réponse sous son
+    /// plafond (coupure au début d'un message utilisateur).
+    pub dropped_events: u32,
 }
 
 /// Erreurs des commandes, sérialisées `{ kind, message? }`.

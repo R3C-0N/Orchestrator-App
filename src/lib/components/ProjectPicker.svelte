@@ -3,8 +3,9 @@
   // lancée sans dossier en argument (`LaunchInfo.cwd_from_args` faux). Liste
   // les sous-dossiers de `~/.claude/projects` avec leur vrai chemin (`cwd` du
   // transcript le plus récent), du plus récent au plus ancien ; un dossier
-  // disparu est grisé et ne peut pas être choisi. Style terminal : liste
-  // `❯`, sans cadre ni carte (décision 3).
+  // disparu est grisé et ne peut pas être choisi ; un chemin réseau n'est pas
+  // testé (`exists_checked` faux) : il reste choisissable, « non vérifié ».
+  // Style terminal : liste `❯`, sans cadre ni carte (décision 3).
   //
   // Clavier : saisie = filtre, ↑/↓, Entrée ouvre, Échap annule (si `oncancel`).
   import { onMount } from "svelte";
@@ -104,7 +105,7 @@
         <span class="mark">{sel ? "❯" : " "}</span>
         <span class="path">{projectLabel(p)}</span>
         <span class="info"
-          >{#if !enabled}{p.path ? "introuvable · " : "chemin inconnu · "}{/if}{relativeTime(p.last_used)} · {p.session_count}
+          >{#if !enabled}{p.path ? "introuvable · " : "chemin inconnu · "}{:else if !p.exists_checked}non vérifié (réseau) · {/if}{relativeTime(p.last_used)} · {p.session_count}
           session{p.session_count > 1 ? "s" : ""}</span
         >
       </li>

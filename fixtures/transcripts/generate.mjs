@@ -90,6 +90,20 @@ const sdk = [
 ];
 fs.writeFileSync(path.join(dir, `${S4}.jsonl`), sdk.map((o) => JSON.stringify(o)).join("\n") + "\n");
 
+// Renommée par `/rename` : le CLI écrit `custom-title` juste avant `ai-title`,
+// puis la conversation continue (plus de 16 ko) avant le dernier `last-prompt`.
+const S6 = "0b8f3c2e-1111-4a6b-9c1d-000000000006";
+const filler = (i) => ({ parentUuid: null, isSidechain: false, attachment: { type: "synthetic_padding", text: "x".repeat(4000) }, type: "attachment", uuid: uid(), timestamp: ts(), ...common(S6), n: i });
+const renamed = [
+  user(S6, "Première demande.", { origin: { kind: "human" } }),
+  { type: "custom-title", customTitle: "Titre choisi par /rename", sessionId: S6 },
+  { type: "ai-title", aiTitle: "Titre proposé par le modèle", sessionId: S6 },
+  ...Array.from({ length: 6 }, (_, i) => filler(i)),
+  user(S6, "Dernière demande.", { origin: { kind: "human" } }),
+  { type: "last-prompt", lastPrompt: "Dernière demande.", leafUuid: uid(), sessionId: S6 },
+];
+fs.writeFileSync(path.join(dir, `${S6}.jsonl`), renamed.map((o) => JSON.stringify(o)).join("\n") + "\n");
+
 // Projet disparu, nom ambigu (`a-b` et `a\b` s'encodent pareil) : le vrai chemin vient de `cwd`.
 const GONE = "D:\\disparu\\a-b";
 const gdir = path.join(OUT, "projects", GONE.replace(/[^A-Za-z0-9]/g, "-"));

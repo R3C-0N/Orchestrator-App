@@ -15,9 +15,16 @@ encoded: string,
  */
 path: string | null, 
 /**
- * `path` existe encore (sinon : grisé dans le sélecteur).
+ * `path` existe encore (sinon : grisé dans le sélecteur). Vrai sans
+ * vérification pour un chemin réseau (voir `exists_checked`).
  */
 exists: boolean, 
+/**
+ * Faux si l'existence n'a pas été testée : chemin réseau
+ * (`\\serveur\…`), dont le test peut bloquer longtemps. Le sélecteur
+ * l'affiche « non vérifié » et le laisse choisir.
+ */
+exists_checked: boolean, 
 /**
  * Date (ms depuis l'epoch) du transcript le plus récent.
  */

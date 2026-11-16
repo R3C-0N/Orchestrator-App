@@ -8,11 +8,14 @@
 use std::path::PathBuf;
 
 use orchestrator_lib::api::events::{
-    AgentEvent, AgentStatus, BlockDoneKind, EventBody, NoticeLevel, UserOrigin,
+    AgentEvent, AgentStatus, BlockDoneKind, EventBody, NoticeLevel, ResultPart, UserOrigin,
 };
 use orchestrator_lib::api::types::{CoreError, HistoryLoaded, SessionKey};
 use orchestrator_lib::sessions::paths::find_project_dir;
-use orchestrator_lib::sessions::transcript::{history_from_bytes, load_history, read_subagents};
+use orchestrator_lib::sessions::transcript::{
+    history_from_bytes, history_from_bytes_with, load_history, load_history_with, read_subagents,
+    HistoryLimits, Omitted, CLIPPED_MARK,
+};
 
 const CWD: &str = r"C:\Users\<user>\Code\demo";
 const FULL: &str = "0b8f3c2e-1111-4a6b-9c1d-000000000001";
@@ -298,9 +301,42 @@ fn transcripts_reader_never_panics_on_garbage() {
         b"\xff\xfe{\"type\":\"user\"}\n",
         b"{\"type\":\"user\",\"timestamp\":\"9999-99-99T99:99:99Z\",\"message\":{\"content\":\"ok\"}}",
     ];
-    for s in samples {
+    // (lignes, utilisées, ignorées, illisibles, tronqué, événements)
+    let expected: &[(u32, u32, u32, u32, bool, usize)] = &[
+        (0, 0, 0, 0, false, 0),
+        (0, 0, 0, 0, false, 0),
+        // 4 lignes qui ne sont pas des objets : illisibles, une notice.
+        (4, 0, 0, 4, false, 1),
+        // `user` sans contenu exploitable : ignorés.
+        (3, 0, 3, 0, false, 0),
+        // `tool_use` sans id ni nom : un `block_done`, pas d'agent.
+        (1, 1, 0, 0, false, 1),
+        // Durée illisible : fin de tour à 0 ms.
+        (1, 1, 0, 0, false, 1),
+        // Notification sans identifiant : masquée.
+        (1, 0, 1, 0, false, 0),
+        // `tool_result` sans id, accusé asynchrone sans agent : un résultat.
+        (1, 1, 0, 0, false, 1),
+        // Octets invalides devant le JSON : illisible, une notice.
+        (1, 0, 0, 1, false, 1),
+        // Dernière ligne sans fin de ligne mais complète, date absurde : lue.
+        (1, 1, 0, 0, false, 1),
+    ];
+    for (s, want) in samples.iter().zip(expected) {
         let h = history_from_bytes(s, &[], &key());
-        assert!(h.lines >= h.bad);
+        let got = (
+            h.lines,
+            h.used,
+            h.ignored,
+            h.bad,
+            h.truncated,
+            h.events.len(),
+        );
+        assert_eq!(got, *want, "{:?}", String::from_utf8_lossy(s));
+        assert_eq!(h.lines, h.used + h.ignored + h.bad + h.sidechain);
+        for (i, e) in h.events.iter().enumerate() {
+            assert_eq!(e.seq, i as u64);
+        }
     }
 }
 
@@ -340,4 +376,276 @@ fn transcripts_local_sweep_never_fails() {
         "{files} transcripts, {lines} lignes, {events} événements, {bad} illisibles, {unknown} de type inconnu, {errors} erreurs, {:?}",
         t0.elapsed()
     );
+}
+
+fn user_line(text: &str, origin: Option<&str>) -> String {
+    let mut v = serde_json::json!({
+        "type": "user", "isSidechain": false, "uuid": "u",
+        "timestamp": "2026-11-16T09:00:00Z",
+        "message": {"role": "user", "content": text},
+    });
+    if let Some(o) = origin {
+        v["origin"] = serde_json::json!({ "kind": o });
+    }
+    v.to_string()
+}
+
+#[test]
+fn transcripts_typed_text_citing_cli_tags_stays_typed() {
+    let cited = "Que fait <task-notification><task-id>a1</task-id><tool-use-id>t1</tool-use-id></task-notification> ?";
+    let mid = "Explique <command-name>/model</command-name> stp";
+    let text = format!(
+        "{}\n{}\n{}\n",
+        user_line(cited, Some("human")),
+        user_line(mid, Some("human")),
+        user_line(
+            "<command-name>/model</command-name>\n<command-args>haiku</command-args>",
+            Some("human")
+        ),
+    );
+    let h = history_from_bytes(text.as_bytes(), &[], &key());
+    assert_eq!(
+        users(&h),
+        vec![
+            (cited.to_string(), UserOrigin::History),
+            (mid.to_string(), UserOrigin::History),
+            ("/model haiku".to_string(), UserOrigin::History),
+        ]
+    );
+    assert!(!bodies(&h).iter().any(|b| matches!(b, EventBody::Agent(_))));
+}
+
+#[test]
+fn transcripts_peer_messages_are_never_shown_as_typed() {
+    // Rapport d'un sous-agent (`origin.kind = "peer"`), même sans `isMeta`.
+    let text = format!(
+        "{}\n{}\n",
+        user_line("Rapport du sous-agent : fini", Some("peer")),
+        user_line("Message tapé", None),
+    );
+    let h = history_from_bytes(text.as_bytes(), &[], &key());
+    assert_eq!(
+        users(&h),
+        vec![("Message tapé".to_string(), UserOrigin::History)]
+    );
+    assert_eq!(h.ignored, 1);
+}
+
+#[test]
+fn transcripts_window_keeps_the_end_and_reports_what_is_omitted() {
+    let path = project().join(format!("{FULL}.jsonl"));
+    let bytes = std::fs::read(&path).unwrap();
+    let total_lines = bytes
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.iter().all(u8::is_ascii_whitespace))
+        .count() as u32;
+    let limits = HistoryLimits {
+        max_bytes: bytes.len() as u64 / 2,
+        ..HistoryLimits::default()
+    };
+    let h = load_history_with(&project(), FULL, &key(), &limits).unwrap();
+    assert!(h.omitted_lines > 0);
+    assert_eq!(h.omitted_lines + h.lines, total_lines);
+    let half = bytes.len() as u64 / 2;
+    assert!(h.omitted_bytes >= half && h.omitted_bytes < half + 4096);
+    match &h.events[0].body {
+        EventBody::Notice {
+            level,
+            code,
+            detail,
+            ..
+        } => {
+            assert_eq!(*level, NoticeLevel::Info);
+            assert_eq!(code, "history_truncated");
+            let d = detail.as_ref().unwrap();
+            assert_eq!(d["omitted_lines"], h.omitted_lines);
+            assert_eq!(d["omitted_bytes"], h.omitted_bytes);
+        }
+        other => panic!("notice attendue en tête, vu {other:?}"),
+    }
+    // La fin est intacte.
+    assert_eq!(texts(&h).last().map(String::as_str), Some("Je commence"));
+    // Plafond non atteint : rien d'omis, pas de notice.
+    let full = load(FULL).unwrap();
+    assert_eq!((full.omitted_lines, full.omitted_bytes), (0, 0));
+    assert!(!bodies(&full)
+        .iter()
+        .any(|b| matches!(b, EventBody::Notice { code, .. } if code == "history_truncated")));
+}
+
+#[test]
+fn transcripts_large_tool_results_and_meta_are_clipped() {
+    let big = "é".repeat(150_000); // 300 000 octets
+    let lines = [
+        serde_json::json!({"type": "assistant", "timestamp": "2026-11-16T09:00:00Z",
+            "message": {"id": "m1", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Write", "input": {"file_path": "a", "content": big}}]}}),
+        serde_json::json!({"type": "user", "timestamp": "2026-11-16T09:00:01Z",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": big}]},
+            "toolUseResult": {"type": "create", "filePath": "a", "originalFile": big, "content": big}}),
+    ]
+    .iter()
+    .map(|v| v.to_string() + "\n")
+    .collect::<String>();
+    let h = history_from_bytes(lines.as_bytes(), &[], &key());
+    assert_eq!(h.clipped, 4);
+    let max = HistoryLimits::default().max_item_bytes;
+    let (content, meta) = h
+        .events
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::ToolResult { content, meta, .. } => Some((content.clone(), meta.clone())),
+            _ => None,
+        })
+        .unwrap();
+    let ResultPart::Text { text } = &content[0] else {
+        panic!("texte attendu")
+    };
+    assert!(text.ends_with(CLIPPED_MARK) && text.len() <= max + CLIPPED_MARK.len());
+    let meta = meta.unwrap();
+    let orig = meta["originalFile"].as_str().unwrap();
+    assert!(orig.ends_with(CLIPPED_MARK) && orig.len() <= max + CLIPPED_MARK.len());
+}
+
+#[test]
+fn transcripts_output_budget_drops_oldest_events_at_a_user_message() {
+    let mut text = String::new();
+    for i in 0..50 {
+        text.push_str(&user_line(
+            &format!("question {i} {}", "q".repeat(1000)),
+            None,
+        ));
+        text.push('\n');
+        text.push_str(
+            &serde_json::json!({"type": "assistant", "timestamp": "2026-11-16T09:00:00Z",
+                "message": {"id": format!("m{i}"), "role": "assistant",
+                "content": [{"type": "text", "text": "r".repeat(1000)}]}})
+            .to_string(),
+        );
+        text.push('\n');
+    }
+    let limits = HistoryLimits {
+        max_output_bytes: 20_000,
+        ..HistoryLimits::default()
+    };
+    let h = history_from_bytes_with(text.as_bytes(), &[], &key(), &limits, Omitted::default());
+    assert!(h.dropped_events > 0);
+    assert!(matches!(&h.events[0].body,
+        EventBody::Notice { code, .. } if code == "history_truncated"));
+    assert!(matches!(&h.events[1].body, EventBody::UserMessage { .. }));
+    let size: usize = h
+        .events
+        .iter()
+        .map(|e| serde_json::to_vec(e).unwrap().len())
+        .sum();
+    assert!(size < 25_000, "{size}");
+    assert_eq!(texts(&h).last().unwrap(), &"r".repeat(1000));
+}
+
+/// Transcript synthétique de 200 Mo, écrit dans un dossier temporaire (jamais
+/// commité) : la réponse sérialisée reste sous 30 Mo.
+#[test]
+fn transcripts_200mb_history_serializes_under_30mb() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("orch-j11-200mb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let id = "0b8f3c2e-1111-4a6b-9c1d-0000000000aa";
+    let path = dir.join(format!("{id}.jsonl"));
+    // ~290 ko de sortie (texte JSON déjà échappé), et une ligne géante
+    // comme la plus longue constatée (962 000 caractères).
+    let out = "ligne de sortie de commande\\n".repeat(10_000);
+    let long_line = "x".repeat(962_000);
+    {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let mut i = 0u64;
+        let mut written = 0u64;
+        while written < 200 * 1024 * 1024 {
+            let lines = [
+                format!(
+                    r#"{{"type":"user","timestamp":"2026-11-16T09:00:00Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"tour {i}"}}}}"#
+                ),
+                format!(
+                    r#"{{"type":"assistant","timestamp":"2026-11-16T09:00:01Z","message":{{"id":"m{i}","role":"assistant","content":[{{"type":"tool_use","id":"t{i}","name":"Bash","input":{{"command":"echo {i}"}}}}]}}}}"#
+                ),
+                format!(
+                    r#"{{"type":"user","timestamp":"2026-11-16T09:00:02Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t{i}","content":"{out}"}}]}},"toolUseResult":{{"stdout":"{out}","stderr":"","originalFile":"{long_line}"}}}}"#
+                ),
+                format!(
+                    r#"{{"type":"assistant","timestamp":"2026-11-16T09:00:03Z","message":{{"id":"n{i}","role":"assistant","content":[{{"type":"text","text":"Fini {i}."}}]}}}}"#
+                ),
+            ];
+            for l in lines {
+                f.write_all(l.as_bytes()).unwrap();
+                f.write_all(b"\n").unwrap();
+                written += l.len() as u64 + 1;
+            }
+            i += 1;
+        }
+    }
+    let size = std::fs::metadata(&path).unwrap().len();
+    let t0 = std::time::Instant::now();
+    let h = load_history(&dir, id, &key()).unwrap();
+    let elapsed = t0.elapsed();
+    let json = serde_json::to_vec(&h).unwrap();
+    eprintln!(
+        "200 Mo : fichier {} o, {} événements, {} lignes omises ({} o), {} chaînes raccourcies, JSON {} o, {:?}",
+        size,
+        h.events.len(),
+        h.omitted_lines,
+        h.omitted_bytes,
+        h.clipped,
+        json.len(),
+        elapsed
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(size >= 200 * 1024 * 1024);
+    assert!(json.len() < 30 * 1024 * 1024, "{} octets", json.len());
+    assert!(h.omitted_bytes >= size - HistoryLimits::default().max_bytes);
+    assert_eq!(h.bad, 0);
+    assert!(matches!(&h.events[0].body,
+        EventBody::Notice { code, .. } if code == "history_truncated"));
+}
+
+/// Plus gros vrai transcript de la machine (lecture seule ; n'affiche que des
+/// tailles et des durées).
+#[test]
+#[ignore = "lit ~/.claude/projects"]
+fn transcripts_largest_local_transcript_timing() {
+    use orchestrator_lib::sessions::paths::{is_session_id, projects_root};
+    let Some(root) = projects_root() else { return };
+    let mut best: Option<(u64, PathBuf, String)> = None;
+    for dir in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        for f in std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = f.file_name().to_string_lossy().to_string();
+            let Some(id) = name.strip_suffix(".jsonl").filter(|i| is_session_id(i)) else {
+                continue;
+            };
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            if best.as_ref().is_none_or(|b| len > b.0) {
+                best = Some((len, dir.path(), id.to_string()));
+            }
+        }
+    }
+    let Some((len, dir, id)) = best else { return };
+    let t0 = std::time::Instant::now();
+    let h = load_history(&dir, &id, &key()).unwrap();
+    let elapsed = t0.elapsed();
+    let json = serde_json::to_vec(&h).unwrap();
+    eprintln!(
+        "plus gros transcript : {len} o ; load_history {elapsed:?} ; {} événements ; {} lignes relues, {} omises ({} o) ; {} chaînes raccourcies ; {} événements retirés ; JSON {} o",
+        h.events.len(),
+        h.lines,
+        h.omitted_lines,
+        h.omitted_bytes,
+        h.clipped,
+        h.dropped_events,
+        json.len()
+    );
+    assert!(json.len() < 30 * 1024 * 1024);
 }
