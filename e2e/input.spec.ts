@@ -43,6 +43,27 @@ function report(name: string, data: unknown) {
   console.log(`MESURE ${name} ${JSON.stringify(data)}`);
 }
 
+
+/** Nombre de fins de tour dans le fil. */
+const turnCount = (page: Page) =>
+  page.evaluate(() => (window as unknown as W).__orch.store.rows.filter((r: { kind: string }) => r.kind === "turn").length);
+
+/**
+ * Fin du tour lancé après `before` fins de tour : une fin de tour de plus,
+ * puis `Idle`. Attendre seulement `Idle` juste après Entrée pouvait réussir
+ * avant même le début du tour (statut encore au repos) ; Ctrl+C tombait
+ * alors pendant le tour et interrompait au lieu d'effacer.
+ */
+const turnDone = (page: Page, before: number) =>
+  page.waitForFunction(
+    (before) => {
+      const st = (window as unknown as W).__orch.store;
+      return st.rows.filter((r: { kind: string }) => r.kind === "turn").length > before && st.status === "Idle";
+    },
+    before,
+    { timeout: 10_000 },
+  );
+
 test.describe("rendu de la saisie (01)", () => {
   test("❯ entre deux règles ─, texte d'invite avant le premier message", async ({ page }) => {
     await open(page, 0);
@@ -82,9 +103,10 @@ test.describe("envoi, saut de ligne, historique", () => {
   test("↑ / ↓ parcourent l'historique et rendent le brouillon", async ({ page }) => {
     await open(page);
     for (const m of ["premier", "second"]) {
+      const turns = await turnCount(page);
       await page.keyboard.type(m);
       await page.keyboard.press("Enter");
-      await page.waitForFunction(() => (window as unknown as W).__orch.store.status === "Idle", null, { timeout: 10_000 });
+      await turnDone(page, turns);
     }
     await page.keyboard.type("brouillon");
     await page.keyboard.press("ArrowUp");
@@ -269,9 +291,10 @@ test.describe("Échap (décision 13)", () => {
 
   test("effacement par Ctrl+C pendant l'historique : ↓ ne rend pas l'ancien brouillon", async ({ page }) => {
     await open(page);
+    const turns = await turnCount(page);
     await page.keyboard.type("envoyé");
     await page.keyboard.press("Enter");
-    await page.waitForFunction(() => (window as unknown as W).__orch.store.status === "Idle", null, { timeout: 10_000 });
+    await turnDone(page, turns);
     await page.keyboard.type("brouillon");
     await page.keyboard.press("ArrowUp");
     expect(await draft(page)).toBe("envoyé");
