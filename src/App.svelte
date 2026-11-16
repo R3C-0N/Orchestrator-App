@@ -4,19 +4,26 @@
   // simulé (`?mock=…`, ou d'office hors de Tauri : `npm run dev:mock`).
   // J7 : saisie (`Prompt.svelte`), raccourcis globaux (`state/keys.svelte.ts`),
   // interruption et changement de modèle.
+  // J8 : carte de question `AskUserQuestion` (`QuestionCard.svelte`), à la
+  // place de la saisie tant qu'une question attend.
   import { onMount } from "svelte";
   import Conversation from "./lib/components/Conversation.svelte";
   import Prompt from "./lib/components/Prompt.svelte";
+  import QuestionCard from "./lib/components/QuestionCard.svelte";
   import StatusLine from "./lib/components/StatusLine.svelte";
   import {
+    answerQuestion,
     describeError,
     getLaunchInfo,
     interrupt,
     sendMessage,
     setModel,
+    skipQuestion as skipQuestionCmd,
     startSession,
+    type Answer,
     type CoreEvent,
     type SessionKey,
+    type SkipReason,
   } from "./lib/core/client";
   import type { ModelInfo } from "./lib/core/bindings/ModelInfo";
   import type { MockCore } from "./lib/core/mock";
@@ -32,6 +39,7 @@
   let mock: MockCore | null = null;
   let conversation: Conversation | undefined = $state();
   let prompt: Prompt | undefined = $state();
+  let card: QuestionCard | undefined = $state();
   /** Vue détaillée (Ctrl+O, jalon J5) : un appel par ligne, sorties complètes. */
   let verbose = $state(false);
 
@@ -47,6 +55,8 @@
     send(text: string): Promise<void>;
     interrupt(): Promise<void>;
     setModel(model: string): Promise<string>;
+    answer(requestId: string, answers: Record<string, Answer>): Promise<void>;
+    skip(requestId: string, reason: SkipReason): Promise<void>;
   };
 
   const tauriBackend: Backend = {
@@ -59,6 +69,12 @@
     setModel: async (model) => {
       if (!session) throw new Error("session non démarrée");
       return setModel(session, model);
+    },
+    answer: async (requestId, answers) => {
+      if (session) await answerQuestion(session, requestId, answers, null);
+    },
+    skip: async (requestId, reason) => {
+      if (session) await skipQuestionCmd(session, requestId, reason);
     },
   };
   let backend: Backend = tauriBackend;
@@ -107,9 +123,53 @@
     // J10 : ouvrir `Palette.svelte` ici (`paletteOpen = true`).
   }
 
-  /** Point d'accroche de la carte de question (J8) : Échap sur une carte ignorable. */
+  // --- Carte de question (J8) -------------------------------------------------
+
+  /**
+   * Envoi d'une réponse ou d'un « ignorer ». La carte reste affichée jusqu'à
+   * `question_closed` (émis par le cœur après l'écriture sur stdin) ; en cas
+   * d'erreur, bandeau et carte de nouveau utilisable.
+   */
+  async function replyQuestion(kind: "answer" | "skip", send: (id: string) => Promise<void>): Promise<void> {
+    const q = store.question;
+    if (!q) return;
+    try {
+      await send(q.requestId);
+    } catch (err) {
+      store.addBanner("Error", kind === "answer" ? "answer_question" : "skip_question", describeError(err));
+      // Même question : la carte repart de zéro (nouvel objet, même requête).
+      if (store.question?.requestId === q.requestId) store.question = { ...q };
+    }
+  }
+
+  function answer(answers: Record<string, Answer>): void {
+    void replyQuestion("answer", (id) => backend.answer(id, answers));
+  }
+
+  /**
+   * « Ignorer » (Échap, ou « Cancel » de la relecture) : `skip_question` avec
+   * la raison `skipped` (`t10`), seulement si la carte est ignorable
+   * (`can_skip` = capacité `ask_user_question_unanswered_v1` dans
+   * `init.capabilities`) ; sinon rien (décision 13).
+   */
   function skipQuestion(): void {
-    // J8 : `skip_question(session, request_id, "Skipped")`.
+    if (!store.question?.canSkip) return;
+    void replyQuestion("skip", (id) => backend.skip(id, "skipped"));
+  }
+
+  /**
+   * « Chat about this ». Le TUI rend la main à la saisie pour en parler.
+   * La raison prévue par `sdk.d.ts` (`replied_in_chat`) n'existe pas dans
+   * `SkipReason` du cœur (`skipped` | `dismissed`) : choix prudent en
+   * attendant, `skip_question` avec `dismissed` (la carte est fermée sans
+   * réponse, Claude reçoit « The user did not answer the questions. » et
+   * rien n'est inventé à sa place), puis focus dans la saisie. Sans la
+   * capacité, l'entrée est grisée et inactive (aucune requête que le cœur
+   * refuserait).
+   */
+  function chatAboutQuestion(): void {
+    if (!store.question?.canSkip) return;
+    void replyQuestion("skip", (id) => backend.skip(id, "dismissed"));
   }
 
   async function doInterrupt(): Promise<void> {
@@ -145,9 +205,10 @@
         skipQuestion();
         break;
       case "openPalette":
-        openPalette("ctrlK");
+        if (!store.question) openPalette("ctrlK");
         break;
       case "openModelPicker":
+        if (store.question) break;
         pickerOpen = true;
         prompt?.focus();
         break;
@@ -160,7 +221,8 @@
   function onWindowKey(e: KeyboardEvent) {
     const action = keys.handle(keyInput(e), {
       hasSelection: hasSelection(),
-      overlay,
+      // La carte de question remplace la saisie : ni palette ni sélecteur.
+      overlay: store.question ? null : overlay,
       question: store.question ? { canSkip: store.question.canSkip } : null,
       busy,
       interrupting: interruptAsked || store.status === "Interrupting",
@@ -168,6 +230,12 @@
       now: performance.now(),
     });
     if (action.type === "pass") {
+      // Carte de question : la frappe est à elle (chiffres, champ libre).
+      if (store.question) {
+        const inCard = e.target instanceof Element && e.target.closest('[data-testid="question-card"]') !== null;
+        if (!inCard && e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) card?.focus();
+        return;
+      }
       // Une frappe ailleurs (conversation sélectionnée) va dans la saisie.
       const a = document.activeElement;
       const typing = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
@@ -356,6 +424,8 @@
           model = known?.resolved ?? value;
           return model;
         },
+        answer: async (requestId, answers) => m.answerQuestion(requestId, answers),
+        skip: async (requestId, reason) => m.skipQuestion(requestId, reason),
       },
     };
   }
@@ -373,6 +443,13 @@
       send: (t) => (mockCalls.push({ cmd: "send_message", args: { text: t } }), mb.backend.send(t)),
       interrupt: () => (mockCalls.push({ cmd: "interrupt", args: { cancel_queued: false } }), mb.backend.interrupt()),
       setModel: (v) => (mockCalls.push({ cmd: "set_model", args: { model: v } }), mb.backend.setModel(v)),
+      answer: (id, answers) => (
+        mockCalls.push({ cmd: "answer_question", args: { request_id: id, answers, response: null } }),
+        mb.backend.answer(id, answers)
+      ),
+      skip: (id, reason) => (
+        mockCalls.push({ cmd: "skip_question", args: { request_id: id, reason } }), mb.backend.skip(id, reason)
+      ),
     };
     mock.start(mb.filter);
     mockReady = true;
@@ -418,7 +495,16 @@
   <Conversation {store} {verbose} bind:this={conversation} />
   <!-- Vue détaillée (Ctrl+O) : la barre « Showing detailed transcript » de la
        conversation remplace la saisie et la ligne d'état, comme le TUI (03b). -->
-  {#if !verbose}
+  {#if store.question}
+    <!-- La carte prend la place de la saisie et de la ligne d'état (`07`). -->
+    <QuestionCard
+      bind:this={card}
+      question={store.question}
+      onanswer={answer}
+      onskip={skipQuestion}
+      onchat={chatAboutQuestion}
+    />
+  {:else if !verbose}
     <Prompt
       bind:this={prompt}
       bind:draft

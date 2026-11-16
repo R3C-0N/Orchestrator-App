@@ -9,6 +9,8 @@
     "allow-start-session",
     "allow-send-message",
     "allow-interrupt",
-    "allow-set-model"
+    "allow-set-model",
+    "allow-answer-question",
+    "allow-skip-question"
   ]
 }

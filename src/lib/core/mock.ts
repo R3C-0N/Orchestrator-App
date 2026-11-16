@@ -16,6 +16,7 @@
 import type { AgentEvent } from "./bindings/AgentEvent";
 import type { CoreEvent } from "./bindings/CoreEvent";
 import type { EventBody } from "./bindings/EventBody";
+import type { QuestionItem } from "./bindings/QuestionItem";
 
 const SESSION = "mock-1";
 
@@ -284,6 +285,11 @@ export class MockCore {
   #r: () => number;
   /** Bloc de texte ouvert par le flux en cours. */
   #open: { msg: string; text: string } | null = null;
+  /** Capacités annoncées par `init` (`can_skip` des questions). */
+  #caps: string[] = [];
+  /** Questions en attente de réponse (comme `pending_in` du cœur). */
+  #questions = new Map<string, { toolUseId: string; questions: QuestionItem[]; canSkip: boolean }>();
+  #asked = 0;
 
   constructor(opts: MockOptions = {}) {
     this.opts = { rows: opts.rows ?? 3000, rate: opts.rate ?? 100, seed: opts.seed ?? 15 };
@@ -319,6 +325,8 @@ export class MockCore {
       }),
     ];
     onEvents(boot);
+    const init = boot[2];
+    if (init.kind === "init") this.#caps = init.capabilities;
     if (this.opts.rows > 0) {
       const { events, stats } = buildHistory(f, this.opts.rows, this.opts.seed);
       this.stats = stats;
@@ -406,6 +414,83 @@ export class MockCore {
       result: text,
     });
     this.#emit({ kind: "status", state: "Idle" });
+  }
+
+  // --- AskUserQuestion (J8) ---------------------------------------------------
+  //
+  // Imite le cœur sur `t4` (réponse) et `t10` (« ignorer ») : appel
+  // AskUserQuestion dans le fil, `question` en attente, puis, à la réponse,
+  // `question_closed` (`Answered` ou `Skipped`), `tool_result` du CLI et une
+  // courte réponse de Claude. Erreurs du cœur : `UnknownRequest` pour une
+  // requête inconnue, `Unsupported` pour « ignorer » sans la capacité.
+
+  /** Claude pose une question ; renvoie le `request_id`. */
+  ask(questions: QuestionItem[], opts: { canSkip?: boolean } = {}): string {
+    const n = this.#asked++;
+    const requestId = `req_mock_q${n}`;
+    const toolUseId = `toolu_mock_ask_${n}`;
+    const canSkip = opts.canSkip ?? this.#caps.includes("ask_user_question_unanswered_v1");
+    const msg = `msg_ask_${n}`;
+    const input = {
+      questions: questions.map((q) => ({
+        question: q.question,
+        header: q.header,
+        options: q.options,
+        multiSelect: q.multi_select,
+      })),
+    };
+    this.#questions.set(requestId, { toolUseId, questions, canSkip });
+    this.#emit({ kind: "status", state: "Requesting" });
+    this.#emit({
+      kind: "block_done",
+      thread: "main",
+      msg,
+      index: 0,
+      block: { type: "ToolUse", tool_use_id: toolUseId, name: "AskUserQuestion", input },
+    });
+    this.#emit({ kind: "question", request_id: requestId, tool_use_id: toolUseId, questions, can_skip: canSkip });
+    return requestId;
+  }
+
+  /** Comme `answer_question` (`t4`). */
+  answerQuestion(requestId: string, answers: Record<string, string | string[]>): void {
+    const q = this.#takeQuestion(requestId);
+    this.#emit({ kind: "question_closed", request_id: requestId, reason: "Answered" });
+    const parts = Object.entries(answers).map(
+      ([k, v]) => `"${k}"="${Array.isArray(v) ? v.join(", ") : v}"`,
+    );
+    this.#questionResult(
+      q.toolUseId,
+      `Your questions have been answered: ${parts.join(", ")}. You can now continue with these answers in mind.`,
+    );
+  }
+
+  /** Comme `skip_question` (`t10`). */
+  skipQuestion(requestId: string, _reason: "skipped" | "dismissed"): void {
+    const q = this.#questions.get(requestId);
+    if (q && !q.canSkip) throw { kind: "unsupported", message: "ask_user_question_unanswered_v1" };
+    this.#takeQuestion(requestId);
+    this.#emit({ kind: "question_closed", request_id: requestId, reason: "Skipped" });
+    this.#questionResult(q!.toolUseId, "The user did not answer the questions.");
+  }
+
+  #takeQuestion(requestId: string): { toolUseId: string; questions: QuestionItem[]; canSkip: boolean } {
+    const q = this.#questions.get(requestId);
+    if (!q) throw { kind: "unknown_request", message: requestId };
+    this.#questions.delete(requestId);
+    return q;
+  }
+
+  #questionResult(toolUseId: string, text: string): void {
+    this.#emit({
+      kind: "tool_result",
+      thread: "main",
+      tool_use_id: toolUseId,
+      content: [{ type: "Text", text }],
+      is_error: false,
+      meta: null,
+    });
+    this.streamReply(160);
   }
 
   /** Regroupement du cœur : 16 ms ou 256 événements ; immédiat si calme. */
