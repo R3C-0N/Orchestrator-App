@@ -1,6 +1,6 @@
 # Plan d'implémentation : prototype 1 « utilisable au quotidien »
 
-Statut : plan révisé après les décisions 9 à 13 de la spec, puis aligné sur le TUI réel capturé au jalon J1 (commit `64d6717`, section 1.7, `docs/reference-tui/README.md`) et sur le contrat tel que codé au jalon J0 (commit `90f7691`, section 1.5 : le code fait foi). **Avancement : J0 (`90f7691`, `6a50634`), J1 (`64d6717`, `0bc9faa`), J2 (`e917ede`) et J3 (`f242437`, `9f5cae3`) sont faits** (voir les jalons en section 2 pour les écarts). La spec fait foi : `docs/spec.md` (décisions en section 2, protocole en section 4, périmètre en section 6). Ce plan ne redit pas le protocole : il renvoie aux sections de la spec et aux fixtures `fixtures/stream-json/t1` à `t12`.
+Statut : plan révisé après les décisions 9 à 13 de la spec, puis aligné sur le TUI réel capturé au jalon J1 (commit `64d6717`, section 1.7, `docs/reference-tui/README.md`) et sur le contrat tel que codé au jalon J0 (commit `90f7691`, section 1.5 : le code fait foi). **Avancement : prototype 1 terminé, jalons J0 à J12 faits** ; dernière passe de correctifs `c0f4c07` ; mesures de recette dans `docs/recette-prototype-1.md` ; décisions prises sans l'utilisateur : spec section 8 ; reste à faire : section 4 de ce plan. Commits : J0 (`90f7691`, `6a50634`), J1 (`64d6717`, `0bc9faa`), J2 (`e917ede`, `50deefa`), J3 (`f242437`, `9f5cae3`), J4 (`5c9f2f0`), J5 (`ebe39d9`, `bf3d6cb`), J6 (`5c09322`, `3fc9372`), J7 (`fda656c`, `6b6169d`, `64378f5`), J8 (`a3efe05`), J9 (`a8f5728`, branché par `32869dc`), J10 (`827a73f`), J11 (`4ea516b`, `99513a2`, branché par `b63eb7d`), finitions (`d5bda56`, `82e444c`, `d236af4`), J12 (`e034742`), passe de relecture (`64c3943`, `e5d2eef`, `4c41fd9`, `bafea38`, `c0f4c07`) (voir les jalons en section 2 pour les écarts). La spec fait foi : `docs/spec.md` (décisions en section 2, protocole en section 4, périmètre en section 6). Ce plan ne redit pas le protocole : il renvoie aux sections de la spec et aux fixtures `fixtures/stream-json/t1` à `t12`.
 
 Vérifications faites sur la machine pour ce plan (lecture seule, 2026-11-16) :
 
@@ -126,12 +126,12 @@ Principes :
 | `interrupt` | `(session, cancel_queued: bool) -> Result<InterruptAck, CoreError>` ; `InterruptAck { still_queued: Vec<String> }` | `control_request` `interrupt` (spec 4.5, `t6`) ; délai 5 s | `Timeout`, `NotRunning` |
 | `set_model` | `(session, model: String) -> Result<String, CoreError>` (modèle résolu, ex. `claude-sonnet-5-5`) | `control_request` `set_model` (`t5`) | `Timeout`, `Rejected(msg)` |
 | `answer_question` | `(session, request_id: String, answers: BTreeMap<String, Answer>, response: Option<String>) -> Result<(), CoreError>` ; `Answer = One(String) \| Many(Vec<String>)` | `control_response` `allow` + `updatedInput { questions, answers }` (`t4`) | `UnknownRequest` |
-| `skip_question` | `(session, request_id: String, reason: SkipReason) -> Result<(), CoreError>` ; `SkipReason = Skipped \| ReplyInChat \| Dismissed` (sérialisés `skipped`, `replied_in_chat`, `dismissed`) | `answers:{}` + `annotations[q].unanswered` (`t10`) ; refusé si la capacité manque ; émet `question_closed { Answered }` dans le code de J0 (raison `Skipped` à ajouter en J8) | `Unsupported` |
+| `skip_question` | `(session, request_id: String, reason: SkipReason) -> Result<(), CoreError>` ; `SkipReason = Skipped \| ReplyInChat \| Dismissed` (sérialisés `skipped`, `replied_in_chat`, `dismissed`) | `answers:{}` + `annotations[q].unanswered` (`t10`) ; refusé si la capacité manque ; émet `question_closed { Skipped }` depuis J8 | `Unsupported` |
 | `list_sessions` | `(cwd: String) -> Result<Vec<SessionSummary>, CoreError>` ; `SessionSummary { id, title: Option<String>, last_prompt: Option<String>, modified: u64, size_bytes: u64, entrypoint: Option<String> }` | aucun (lecture de fichiers, section 1.8) | `Io` |
 | `load_history` | `(session, session_id: String) -> Result<(), CoreError>` | aucun ; relit le transcript et pousse des `CoreEvent` marqués `history: true` dans le canal | `Io`, `TranscriptFormat` |
 | `stop_session` | `(session) -> Result<ExitInfo, CoreError>` ; `ExitInfo { code: Option<i32>, killed: bool }` (`killed` : tué par le Job Object faute de sortie dans le délai) | ferme stdin, attend 3 s, puis tue le Job Object | — |
 | `get_launch_info` | `() -> LaunchInfo` ; `LaunchInfo { cwd: String, claude_path: Option<String>, expected_version: String }` ; `cwd` = premier argument de l'app (`<app> .`, `<app> <chemin>`), sinon dossier courant dans le code de J0 | aucun (décision 11) | — |
-| `list_projects` — **à venir (J11), pas encore dans le code** | `() -> Result<Vec<ProjectSummary>, CoreError>` ; `ProjectSummary { encoded: String, path: Option<String>, exists: bool, last_used: u64, session_count: u32 }` | aucun ; lit `~/.claude/projects` (sections 1.8 et décision 11) | `Io` |
+| `list_projects` (livré en J11) | `() -> Result<Vec<ProjectSummary>, CoreError>` ; `ProjectSummary { encoded: String, path: Option<String>, exists: bool, last_used: u64, session_count: u32 }` | aucun ; lit `~/.claude/projects` (sections 1.8 et décision 11) | `Io` |
 | `get_diagnostics` | `() -> Diagnostics` ; `Diagnostics { claude_version, expected_version, claude_path, capabilities, log_path, stderr_tail }` ; J6 ajoute `unknown_count` et renseigne `log_path` | aucun | — |
 
 Ouvrir l'app = `get_launch_info` ; si aucun dossier n'a été passé en argument, l'interface montre le sélecteur de `list_projects`, puis appelle `start_session` sur le dossier choisi. Dans le code de J0, `cwd` retombe sur le dossier courant sans argument : J11 ajoute à `LaunchInfo` l'information « dossier passé en argument ou non » pour savoir quand ouvrir le sélecteur (décision 11). Reprendre une session = `stop_session` puis `start_session(cwd, Some(id), …)` puis `load_history`. Le cœur garde l'id local (`SessionKey`) inchangé côté interface.
@@ -368,19 +368,19 @@ Légende des estimations : j = journée d'agent (une session de travail continue
 
 ### Vague 2 : après J2 (cœur), J3 (interface) et les fixtures `t13`, `t14` de J1
 
-**J4. Réducteur d'état Rust et outil `replay`** — 1,5 j — après J2 et après les fixtures `t13` et `t14` de J1 (son critère les exige ; la validation des PNG n'est pas requise). Zone : `src-tauri/src/state/`, `src-tauri/src/bin/replay.rs`, `src-tauri/src/colors.rs`.
+**J4. Réducteur d'état Rust et outil `replay`** — **fait** (commit `5c9f2f0`) — 1,5 j — après J2 et après les fixtures `t13` et `t14` de J1 (son critère les exige ; la validation des PNG n'est pas requise). Zone : `src-tauri/src/state/`, `src-tauri/src/bin/replay.rs`, `src-tauri/src/colors.rs`.
 
 - Objectif : `reduce()` pur produisant tous les `CoreEvent` : fils, blocs, agents (`tool_use_id`, `task_id`, couleurs), `pending_in`/`pending_out`, `allow` automatique, `turn_result`, batcher.
 - Fichiers créés : `state/{reducer,agents,pending,threads,batcher}.rs`, `colors.rs`, `bin/replay.rs`, `tests/snapshots/*.snap`, `fixtures/ui-events/*.json`.
 - C'est fini quand : instantanés validés pour les 13 fixtures ; assertions ciblées de la section 1.10 vertes ; `npm run fixtures` régénère `fixtures/ui-events/`.
 
-**J5. Rendu terminal des blocs, vue détaillée Ctrl+O** — 2,5 j — après J3 et après la **validation par l'utilisateur** des captures de J1 ; peut commencer sur les données simulées avant la fin de J4. Zone : `src/lib/render/`, `src/lib/components/rows/`, `app.css`, polices.
+**J5. Rendu terminal des blocs, vue détaillée Ctrl+O** — **fait** (commits `ebe39d9`, puis `bf3d6cb` : correctifs de la relecture sur sécurité, diffs, fidélité et ligne d'état ; Write n'a jamais été capturé dans le TUI, voir section 4) — 2,5 j — après J3 et après la **validation par l'utilisateur** des captures de J1 ; peut commencer sur les données simulées avant la fin de J4. Zone : `src/lib/render/`, `src/lib/components/rows/`, `app.css`, polices.
 
 - Objectif : règles de la section 1.7, d'après les captures de J1 (**avant de coder Write, le capturer dans le TUI** : seul Edit est prouvé, section 1.7) : messages, markdown, code coloré, **regroupement des appels d'outils** en une ligne grise (vue normale), lignes Edit/Write, diffs, erreurs, interruption grise, lignes des sous-agents en arrière-plan, indicateur de tour et ligne de fin de tour. **Ctrl+O** (vue détaillée de `03b` : chaque appel sur sa ligne avec sa sortie complète, puis retour à la vue normale) entre dans le prototype 1 avec ce jalon.
 - Fichiers créés : `render/{markdown,highlight,diff,glyphs,colors,group}.ts` (`group.ts` : regroupement du type « Read 1 file, ran 1 shell command »), `rows/{ToolGroup,ToolCall,ToolResult,EditDiff,AgentLaunch,AgentFinished,TurnResult,Interrupted}.svelte`, `components/StatusLine.svelte`, `src/assets/fonts/CascadiaMono*.woff2`, `e2e/unit/render.test.ts`. J5 extrait aussi le rendu provisoire de `Conversation.svelte` vers `rows/`.
 - C'est fini quand : `t1`, `t3`, `t6`, `t13`, `t14` rejoués dans `dev:mock` cochent la liste de contrôle de `docs/reference-tui/README.md` (revue de l'utilisateur ; captures 02, 03, 03b, 04, 05, 06, 08, 09, 09b, k1) ; Ctrl+O bascule entre la vue normale et la vue détaillée sans perdre la position de lecture ; le scroll de J3 reste ≥ 58 i/s avec le rendu complet, dans les deux vues.
 
-**J6. Supervision du processus, robustesse et erreurs** — 1,5 j — après J2 ; en parallèle de J4 (fichiers disjoints). Zone : `src-tauri/src/process/supervisor.rs`, `errors.rs`, `logging.rs`, `tests/fake_claude`.
+**J6. Supervision du processus, robustesse et erreurs** — **fait** (commits `5c09322`, puis `3fc9372` : correctifs de la relecture sur interrupt, installeur, fin de session et flux brut) — 1,5 j — après J2 ; en parallèle de J4 (fichiers disjoints). Zone : `src-tauri/src/process/supervisor.rs`, `errors.rs`, `logging.rs`, `tests/fake_claude`.
 
 - Objectif : boucle `select!` stdout/stderr/stdin/minuteries, délais des requêtes, arrêt propre, cas de la section 1.9, journal. La notice de version (`unexpected_version`) est déjà émise par le réducteur depuis J0 (sur `ready` et `init`) : J6 n'a pas à la déplacer, il ajoute seulement le bandeau qui l'affiche.
 - Points de robustesse reportés de J0 :
@@ -392,7 +392,7 @@ Légende des estimations : j = journée d'agent (une session de travail continue
 - Fichiers créés : `process/supervisor.rs` (complété), `errors.rs`, `logging.rs`, `src-tauri/tests/bin/fake_claude.rs`, `tests/supervisor.rs`, `src/lib/components/Banner.svelte`.
 - C'est fini quand : les scénarios du faux CLI (mort en plein tour, code 1, rien sur stdout, stdout gardé ouvert par un enfant après la mort du processus, stderr abondant, ligne géante, UTF-8 coupé, CRLF) produisent les bons `exited`/`notice` ; fermer l'app ou recharger la webview ne laisse aucun `claude.exe` (vérifié avec `tasklist`) ; un faux CLI qui annonce `claude_code_version: "9.9.9"` et émet des types inconnus donne un seul bandeau « version non testée », une session qui fonctionne, un `unknown_count` non nul et un `log_path` renseigné dans `get_diagnostics`, sans aucun blocage.
 
-**J11. Projets, liste et reprise de sessions avec historique** — 2 j. Zone : `src-tauri/src/sessions/` (dont `transcript.rs` isolé), `components/{ProjectPicker,SessionPicker}.svelte`, `state/sessions.svelte.ts`, `fixtures/transcripts/`. Vague 2 : après J4 (le réducteur sert aussi à l'historique), en parallèle de J5 et J6 ; l'affichage de l'historique réutilise les lignes de rendu de J5 dès qu'elles existent.
+**J11. Projets, liste et reprise de sessions avec historique** — **fait** (commits `4ea516b`, puis `99513a2` : correctifs de la relecture (custom-title, plafonds de l'historique) ; branché dans l'écran principal par `b63eb7d`) — 2 j. Zone : `src-tauri/src/sessions/` (dont `transcript.rs` isolé), `components/{ProjectPicker,SessionPicker}.svelte`, `state/sessions.svelte.ts`, `fixtures/transcripts/`. Vague 2 : après J4 (le réducteur sert aussi à l'historique), en parallèle de J5 et J6 ; l'affichage de l'historique réutilise les lignes de rendu de J5 dès qu'elles existent.
 
 - Dossier de projet (décision 11) : `<app> .` ou `<app> <chemin>` ouvre directement ce dossier (`get_launch_info`, complété par l'information « dossier passé en argument ») ; sans argument, sélecteur des projets récents (`list_projects`, section 1.8), chemin réel lu dans le `cwd` du transcript, dossiers disparus grisés.
 - Reprise (décision 9) : tout l'historique relu dans le transcript par le lecteur isolé et tolérant, passé au même réducteur que le flux.
@@ -403,7 +403,7 @@ Légende des estimations : j = journée d'agent (une session de travail continue
 
 J7 à J10 touchent chacun un composant et une commande distincts ; le seul point commun est `api/commands.rs`, déjà figé en J0 (corps à remplir, signatures inchangées).
 
-**J7. Saisie, interruption, modèle, raccourcis** — 1 j. Zone : `components/Prompt.svelte`, `src/lib/state/keys.svelte.ts` (raccourcis globaux), corps de `send_message`, `interrupt`, `set_model`.
+**J7. Saisie, interruption, modèle, raccourcis** — **fait** (commits `fda656c`, `6b6169d` : tests adaptés à la saisie multiligne, puis `64378f5` : correctifs de la relecture sur IME, Échap répété, historique, interruption et /model) — 1 j. Zone : `components/Prompt.svelte`, `src/lib/state/keys.svelte.ts` (raccourcis globaux), corps de `send_message`, `interrupt`, `set_model`.
 
 - Raccourcis d'après le comportement observé du TUI 2.1.325 (décision 13, captures `c*`, `a*`, `n*`, `v*`, `k*` de `docs/reference-tui/README.md`) :
   - **Ctrl+C** : avec une sélection (conversation ou saisie), copie ; pendant un tour, **interrompt et garde la saisie** (`c4`, `k2`) ; au repos avec une saisie non vide, efface la saisie (`c2`) ; au repos avec une saisie vide, **ne fait rien** : le TUI affiche « Press Ctrl-C again to exit » (`c3`), mais l'app ne se quitte pas au clavier dans le prototype 1, et ne rien faire est le plus simple.
@@ -412,7 +412,7 @@ J7 à J10 touchent chacun un composant et une commande distincts ; le seul point
 - Capabilities : `send_message` est déjà autorisée ; ajouter `allow-interrupt` et `allow-set-model` à `src-tauri/capabilities/default.json` (section 1.5).
 - C'est fini quand : Entrée envoie, Maj+Entrée fait un saut de ligne, historique ↑↓ ; Échap pendant un tour interrompt (`t6` reproduit en vrai, état `Idle` < 2 s, rendu de `08`) ; Ctrl+C pendant un tour interrompt et laisse le brouillon dans la saisie ; chaque cas des deux listes ci-dessus a son test Vitest (sélection, tour en cours, saisie vide ou non, double Échap rapproché (< 0,8 s) ou espacé (> 0,8 s), double Échap sur saisie vide (sans effet), palette ouverte, carte ignorable ou non) ; un sélecteur alimenté par `ready.models` change le modèle et le tour suivant l'utilise (`init.model`).
 
-**J8. Carte `AskUserQuestion`** — 1 j. Zone : `components/QuestionCard.svelte`, corps de `answer_question` et `skip_question`, `api/events.rs` (raison `Skipped`).
+**J8. Carte `AskUserQuestion`** — **fait** (commit `a3efe05` ; finitions `d5bda56` : raison `replied_in_chat` et multi-sélection vérifiée en réel) — 1 j. Zone : `components/QuestionCard.svelte`, corps de `answer_question` et `skip_question`, `api/events.rs` (raison `Skipped`).
 
 - Rendu d'après `07-question.txt` (section 1.7) : pas d'encadré ; règle, pastille « ☐ <header> », question en gras, `❯ 1. <label>` et descriptions, « N. Type something. » pour la réponse libre, règle, « N+1. Chat about this », pied « Enter to select · ↑/↓ to navigate · Esc to cancel ». La carte prend la place de la saisie.
 - « Chat about this » : proposition à valider en revue, `skip_question` avec la raison `replied_in_chat` (valeur d'`annotations[…].unanswered` prévue par `sdk.d.ts`), puis focus dans la saisie.
@@ -420,12 +420,12 @@ J7 à J10 touchent chacun un composant et une commande distincts ; le seul point
 - Capabilities : ajouter `allow-answer-question` et `allow-skip-question` à `src-tauri/capabilities/default.json` (section 1.5).
 - C'est fini quand : en vrai, une question simple, une multi-sélection, une réponse libre (« Type something. ») et un « ignorer » par Échap aboutissent, et Claude cite la réponse ; les réponses envoyées égalent `t4` et `t10` ; `question_closed` porte `Skipped` après un « ignorer » ; tout se fait au clavier (↑↓, chiffres, Entrée, Échap) ; la carte coche les points « Question » de la liste de contrôle.
 
-**J9. Panneau des agents** — 1 j (+ 0,5 j pour le bonus). Zone : `components/AgentPanel.svelte`, `AgentLine.svelte`, `state/agents.svelte.ts`.
+**J9. Panneau des agents** — **fait** (commit `a8f5728` : composant autonome et démo simulée ; branché à droite de l'écran principal par `32869dc`) — 1 j (+ 0,5 j pour le bonus). Zone : `components/AgentPanel.svelte`, `AgentLine.svelte`, `state/agents.svelte.ts`.
 
 - Capabilities : aucune commande nouvelle (le panneau lit les événements `agent`) ; si un jalon ajoute `stop_task`, il ajoutera sa `allow-…`.
 - C'est fini quand : `t3` rejoué montre 2 lignes bleu et rouge dans le style du panneau du TUI (`◯ <agent>  <description> … <durée> · ↓ <tokens> tokens`, `05-agents-en-cours.txt`), état, durée qui avance puis se fige, `last_tool` ; en vrai, `/orchestrateur` avec 4 agents parallèles reste lisible ; bonus : clic → fil de l'agent.
 
-**J10. Palette (Ctrl+K et `/`)** — 0,5 j. Zone : `components/Palette.svelte`, `state/palette.svelte.ts`.
+**J10. Palette (Ctrl+K et `/`)** — **fait** (commit `827a73f` ; finitions `82e444c`, `d236af4`) — 0,5 j. Zone : `components/Palette.svelte`, `state/palette.svelte.ts`.
 
 - Deux entrées (décision 13) : Ctrl+K ouvre la palette n'importe où ; `/` tapé **en début de saisie** l'ouvre **au-dessus** de la ligne de saisie, comme le menu du TUI (`10-menu-slash.txt`), et les caractères suivants filtrent la liste. Un `/` au milieu du texte reste un caractère normal.
 - Capabilities : aucune commande nouvelle (la palette lit `ready` et `init`).
@@ -433,7 +433,7 @@ J7 à J10 touchent chacun un composant et une commande distincts ; le seul point
 
 ### Vague 4 : recette
 
-**J12. Performance, robustesse, build** — 1,5 j — après tous. Zone : `e2e/`, `docs/reference-tui/README.md`, réglages.
+**J12. Performance, robustesse, build** — **fait** (commit `e034742` : recette, mesures dans l'app compilée, installeur ; remesure après correctifs `4c41fd9`, `bafea38`, `c0f4c07`, voir `docs/recette-prototype-1.md`) — 1,5 j — après tous. Zone : `e2e/`, `docs/reference-tui/README.md`, réglages.
 
 - Objectif : mesurer les seuils de la section 1.11, corriger, produire l'installeur.
 - C'est fini quand : tous les seuils chiffrés sont atteints et consignés (tableau des mesures dans `docs/reference-tui/README.md`) ; la vérification manuelle de la section 1.10 (point 7) est passée ; `npm run tauri build` produit un MSI < 15 Mo qui s'installe et démarre.
@@ -460,3 +460,20 @@ Les 5 questions de la première version de ce plan sont tranchées par les déci
 1. **Format du transcript** (décision 9) : interne et non documenté, il peut changer à chaque version du CLI. Parade : lecteur isolé et tolérant, extraits de test par version, repli « reprise sans historique ».
 2. **Mises à jour automatiques actives** (décision 12) : le CLI peut changer sous l'app, y compris le flag non documenté `--permission-prompt-tool stdio` (spec 4.8). Parade : bandeau « version non testée », types inconnus ignorés, fixtures rejouées à chaque nouvelle version.
 3. **Captures par script** (décision 10) : fenêtre au premier plan, délais et `SendKeys` sont fragiles ; un état intermédiaire (agents en cours, interruption) peut être manqué. Parade : délais par scénario, refaire une capture avec `-Only`, validation par l'utilisateur.
+
+---
+
+## 4. Reste à faire
+
+Le prototype 1 est terminé et la recette J12 est faite (`docs/recette-prototype-1.md`). Ce qui n'a pas pu être fait en l'absence de l'utilisateur, ou qui reste à nettoyer :
+
+- **Capture de l'outil Write dans le TUI** : elle demande l'écran déverrouillé (SendKeys et capture de fenêtre). Le libellé `Write(…)` reste une hypothèse (section 1.7).
+- **Installation du MSI** : elle demande une élévation (installation pour toute la machine). Seul l'installeur NSIS a été installé et désinstallé en silencieux pendant la recette.
+- **Vérification manuelle d'une heure de session réelle avec 4 agents** (section 1.10, point 7).
+- **Croissance mémoire sur 4 h** (critère de la section 1.11, « < 15 % sur 4 h d'usage ») : non mesurée.
+- **Revue de fidélité par l'utilisateur**, avec les comparaisons de `.claude-work/j5`, `.claude-work/j8-j10`, `.claude-work/j9` et `.claude-work/j12` (liste de contrôle de `docs/reference-tui/README.md`, critère « 100 % validé »).
+- **Image de retard due à virtua** : la nouvelle ligne n'est insérée dans le DOM qu'à l'événement `scroll` du recollage, à l'image suivante ; elle ne se retire pas côté application (`docs/recette-prototype-1.md`).
+- **Nettoyage de l'ancien scénario `echap`** dans `tools/capture-tui/scenarios.json`, remplacé par `echap-intervalles` (J1).
+- **Transcripts de test laissés dans `~/.claude/projects`** : dossiers `j0-sandbox`, `j11-sandbox`, `j12-sandbox` et autres signalés par les agents (essais réels) ; à supprimer à la main après vérification.
+- **Serveur Vite resté ouvert sur le port 1430** : à fermer.
+- **Décisions à valider** : spec section 8.

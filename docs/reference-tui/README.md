@@ -136,9 +136,11 @@ Question :
 - [ ] Pas d'encadré : règle `─`, pastille « ☐ <header> » (texte noir sur bleu lavande), question en gras (07).
 - [ ] Options `❯ 1. …` : sélection en bleu lavande, descriptions grises en retrait de 5 ; puis « N. Type something. », règle, « N+1. Chat about this » (07).
 - [ ] Pied « Enter to select · ↑/↓ to navigate · Esc to cancel » (07).
+- [ ] Pendant qu'une carte est ouverte, l'appel `AskUserQuestion` qui l'a posée est **masqué** dans le fil, en vue normale comme en vue détaillée (`src/lib/render/group.ts`). Sans carte (historique repris, processus arrêté), l'appel reste visible. Règle de l'app : la carte le remplace (07).
 
 Saisie et menu `/` :
 
 - [ ] Saisie : `❯` entre deux règles `─` pleine largeur, collée en bas (01).
+- [ ] Reprise d'une session très longue : la ligne grise « ⎿  Début de l'historique omis (N lignes) » en tête du fil indique que seuls les derniers Mo du transcript ont été relus (spec section 8, décision 2). Règle de l'app, sans capture du TUI.
 - [ ] Menu `/` au-dessus de la saisie, sans cadre ; entrée choisie `❯` en bleu lavande ; descriptions alignées en colonne, repliées puis tronquées par `…` (10).
 - [ ] Indications clavier : « Esc again to clear » à droite au-dessus de la saisie, sans effacer (`a*`, `n*`) ; second Échap en moins d'environ 0,8 s : saisie effacée (`n000` à `n700`), gardée au-delà (`n800`) ; double Échap sur saisie vide : rien dans l'app (Rewind hors périmètre, `v1`, `v4`) ; pas de « Press Ctrl-C again to exit » dans l'app (choix du prototype 1, décision 13).
