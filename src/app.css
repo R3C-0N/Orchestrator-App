@@ -1,0 +1,28 @@
+:root {
+  --bg: #18181b;
+  --fg: #e4e4e7;
+  --dim: #8b8b93;
+  --accent: #d97757;
+  --warn: #e5c07b;
+  --error: #e06c75;
+  --line: #2e2e33;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 14px;
+}
+
+#app {
+  height: 100%;
+}
