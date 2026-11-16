@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::api::events::{
@@ -19,9 +18,12 @@ use crate::api::events::{
 };
 use crate::api::types::{Answers, CoreError, ExitInfo, InterruptAck, SessionKey, SkipReason};
 use crate::process::locate::display_path;
+use crate::process::reader::{LineReader, RawLine};
 use crate::process::spawn::{
     build_args, spawn_claude, validate_launch_options, Job, LaunchOptions,
 };
+use crate::process::writer;
+use crate::protocol::inbound::Inbound;
 use crate::protocol::outbound;
 use crate::state::batcher::{run_batcher, Sink};
 use crate::state::reducer::{Action, Reducer, CAP_UNANSWERED};
@@ -116,19 +118,7 @@ impl Session {
         let stderr = spawned.child.stderr.take().expect("stderr piped");
 
         // Écrivain : une ligne JSON par message ; fermer le canal ferme stdin.
-        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
-        tokio::spawn(async move {
-            let mut stdin = stdin;
-            while let Some(line) = stdin_rx.recv().await {
-                if stdin.write_all(line.as_bytes()).await.is_err()
-                    || stdin.write_all(b"\n").await.is_err()
-                    || stdin.flush().await.is_err()
-                {
-                    break;
-                }
-            }
-            drop(stdin);
-        });
+        let (stdin_tx, _writer_task) = writer::spawn_writer(stdin);
 
         // stderr : gardé en mémoire (200 lignes) et relayé.
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
@@ -136,14 +126,17 @@ impl Session {
             let tail = stderr_tail.clone();
             let em = emitter.clone();
             tokio::spawn(async move {
-                let mut r = BufReader::new(stderr);
-                let mut buf = Vec::new();
+                let mut r = LineReader::new(stderr);
                 loop {
-                    buf.clear();
-                    match r.read_until(b'\n', &mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+                    match r.next_line().await {
+                        Ok(None) | Err(_) => break,
+                        Ok(Some(raw)) => {
+                            let line = match raw {
+                                RawLine::Line(l) => l.trim_end().to_string(),
+                                RawLine::TooLong { len, head } => {
+                                    format!("{head}… [ligne de {len} octets tronquée]")
+                                }
+                            };
                             {
                                 let mut t = tail.lock().unwrap();
                                 if t.len() == STDERR_KEEP {
@@ -172,24 +165,33 @@ impl Session {
             let tail = stderr_tail.clone();
             let mut child = spawned.child;
             tokio::spawn(async move {
-                let mut r = BufReader::new(stdout);
-                let mut buf = Vec::new();
+                let mut r = LineReader::new(stdout);
                 let mut last_bad_json: Option<Instant> = None;
                 loop {
-                    buf.clear();
-                    match r.read_until(b'\n', &mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
+                    let raw = match r.next_line().await {
+                        Ok(Some(raw)) => raw,
+                        Ok(None) | Err(_) => break,
+                    };
                     let t = now_ms();
-                    let text = String::from_utf8_lossy(&buf);
-                    let line = text.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let v: Value = match serde_json::from_str(line) {
-                        Ok(v) => v,
-                        Err(e) => {
+                    // Ligne trop longue : traitée comme une ligne illisible
+                    // (notice Warn limitée à 1 par minute, plan 1.9).
+                    let parsed = match &raw {
+                        RawLine::Line(text) => {
+                            let line = text.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            Inbound::from_line(line)
+                                .map_err(|e| (e.to_string(), line.chars().take(500).collect()))
+                        }
+                        RawLine::TooLong { len, head } => Err((
+                            format!("ligne de {len} octets au-delà du plafond"),
+                            head.clone(),
+                        )),
+                    };
+                    let msg = match parsed {
+                        Ok(m) => m,
+                        Err((e, line)) => {
                             let now = Instant::now();
                             if last_bad_json.is_none_or(|l| now - l >= Duration::from_secs(60)) {
                                 last_bad_json = Some(now);
@@ -198,9 +200,7 @@ impl Session {
                                         level: NoticeLevel::Warn,
                                         code: "bad_json".into(),
                                         message: format!("Ligne illisible ignorée : {e}"),
-                                        detail: Some(Value::String(
-                                            line.chars().take(500).collect(),
-                                        )),
+                                        detail: Some(Value::String(line)),
                                     },
                                     t,
                                 );
@@ -208,7 +208,7 @@ impl Session {
                             continue;
                         }
                     };
-                    let actions = reducer.lock().unwrap().handle(&v);
+                    let actions = reducer.lock().unwrap().handle_inbound(&msg);
                     apply_actions(actions, &em, &writer, &pending, t);
                 }
                 let code = child.wait().await.ok().and_then(|s| s.code());
