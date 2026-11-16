@@ -7,6 +7,7 @@ pub mod errors;
 pub mod logging;
 pub mod process;
 pub mod protocol;
+pub mod sessions;
 pub mod state;
 
 use api::commands::{self, AppState};
@@ -17,13 +18,15 @@ pub fn run() {
     // continue sans journal s'il est indisponible.
     logging::init();
 
-    // `<app> .` : le premier argument devient le cwd de claude.exe.
-    let cwd = process::locate::launch_cwd_from_args(std::env::args())
-        .or_else(|_| std::env::current_dir())
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // `<app> .` : le premier argument devient le cwd de claude.exe ; sans
+    // argument, l'interface ouvre le sélecteur des projets (décision 11).
+    let launch = sessions::launch_dir_from_args(std::env::args());
+    if let Some(e) = &launch.error {
+        tracing::warn!("dossier de projet en argument inutilisable : {e}");
+    }
 
     let app = tauri::Builder::default()
-        .manage(AppState::new(cwd))
+        .manage(AppState::with_launch(launch))
         // Rechargement de la webview : les canaux des sessions sont perdus,
         // ces sessions orphelines sont fermées (plan J6).
         .on_page_load(|webview, payload| {
@@ -42,6 +45,7 @@ pub fn run() {
             commands::set_model,
             commands::answer_question,
             commands::skip_question,
+            commands::list_projects,
             commands::list_sessions,
             commands::load_history,
             commands::stop_session,

@@ -93,8 +93,64 @@ pub struct Diagnostics {
 pub struct LaunchInfo {
     /// Dossier de projet : premier argument de l'app, sinon dossier courant.
     pub cwd: String,
+    /// J11 (décision 11) : vrai si `cwd` vient d'un argument valide
+    /// (`<app> .`, `<app> <chemin>`) ; faux sans argument, l'interface ouvre
+    /// alors le sélecteur des projets récents (`list_projects`).
+    pub cwd_from_args: bool,
+    /// J11 : argument donné mais inutilisable (dossier absent…) ; `cwd` est
+    /// alors le dossier courant et `cwd_from_args` vaut `false`.
+    pub launch_error: Option<String>,
     pub claude_path: Option<String>,
     pub expected_version: String,
+}
+
+/// Entrée de `list_projects` (J11, plan 1.8, décision 11) : un sous-dossier
+/// de `~/.claude/projects` qui contient au moins un transcript.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProjectSummary {
+    /// Nom du dossier (cwd encodé, non réversible).
+    pub encoded: String,
+    /// Vrai chemin, lu dans le champ `cwd` du transcript le plus récent ;
+    /// `None` si aucun transcript n'en contient.
+    pub path: Option<String>,
+    /// `path` existe encore (sinon : grisé dans le sélecteur).
+    pub exists: bool,
+    /// Date (ms depuis l'epoch) du transcript le plus récent.
+    #[ts(type = "number")]
+    pub last_used: u64,
+    pub session_count: u32,
+}
+
+/// Réponse de `load_history` (J11, décision 9) : l'historique relu dans le
+/// transcript, en `CoreEvent` déjà réduits (même réducteur que le flux,
+/// messages utilisateur d'origine `History`), numérotés à partir de 0 et
+/// horodatés avec le `timestamp` des lignes. Aucun `status` n'y figure.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HistoryLoaded {
+    pub session_id: String,
+    pub events: Vec<super::events::CoreEvent>,
+    /// Lignes non vides du transcript.
+    pub lines: u32,
+    /// Lignes passées au réducteur (`user`, `assistant`, `system` utiles).
+    pub used: u32,
+    /// Lignes ignorées : types sans affichage, messages internes.
+    pub ignored: u32,
+    /// Parmi `ignored`, lignes d'un type inconnu du lecteur.
+    pub unknown: u32,
+    /// Éléments inconnus vus par le réducteur (blocs, sous-types).
+    pub unknown_elements: u32,
+    /// Lignes illisibles (JSON invalide, trop longues) : notice
+    /// `history_damaged` en fin d'`events`.
+    pub bad: u32,
+    /// Lignes `isSidechain: true` du fichier principal (ignorées).
+    pub sidechain: u32,
+    /// La dernière ligne est inachevée (transcript tronqué ou en cours
+    /// d'écriture) ; elle est ignorée sans avertissement.
+    pub truncated: bool,
+    /// Fils de sous-agents `subagents/agent-*.jsonl` présents (non relus).
+    pub subagent_threads: u32,
 }
 
 /// Erreurs des commandes, sérialisées `{ kind, message? }`.

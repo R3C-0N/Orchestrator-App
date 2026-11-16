@@ -9,6 +9,7 @@ const COMMANDS: &[&str] = &[
     "set_model",
     "answer_question",
     "skip_question",
+    "list_projects",
     "list_sessions",
     "load_history",
     "stop_session",

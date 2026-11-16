@@ -8,4 +8,15 @@ export type LaunchInfo = {
 /**
  * Dossier de projet : premier argument de l'app, sinon dossier courant.
  */
-cwd: string, claude_path: string | null, expected_version: string, };
+cwd: string, 
+/**
+ * J11 (décision 11) : vrai si `cwd` vient d'un argument valide
+ * (`<app> .`, `<app> <chemin>`) ; faux sans argument, l'interface ouvre
+ * alors le sélecteur des projets récents (`list_projects`).
+ */
+cwd_from_args: boolean, 
+/**
+ * J11 : argument donné mais inutilisable (dossier absent…) ; `cwd` est
+ * alors le dossier courant et `cwd_from_args` vaut `false`.
+ */
+launch_error: string | null, claude_path: string | null, expected_version: string, };

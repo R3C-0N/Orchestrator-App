@@ -1,7 +1,7 @@
 //! Commandes Tauri (plan 1.5). Noms d'arguments en `snake_case` côté JS.
 //!
-//! J0 : `list_sessions` et `load_history` ont un corps provisoire (jalon de la
-//! reprise de session).
+//! J11 : `list_projects`, `list_sessions` et `load_history` lisent les
+//! transcripts du CLI (module `sessions`, lecture seule).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,8 +13,8 @@ use tauri::{AppHandle, Manager, State};
 
 use super::events::CoreEvent;
 use super::types::{
-    Answers, CoreError, Diagnostics, ExitInfo, InterruptAck, LaunchInfo, SessionKey,
-    SessionStarted, SessionSummary, SkipReason,
+    Answers, CoreError, Diagnostics, ExitInfo, HistoryLoaded, InterruptAck, LaunchInfo,
+    ProjectSummary, SessionKey, SessionStarted, SessionSummary, SkipReason,
 };
 use crate::process::locate::{display_path, locate_claude, EXPECTED_CLAUDE_VERSION};
 use crate::process::spawn::LaunchOptions;
@@ -29,11 +29,23 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// `cwd` réputé passé en argument (tests et outils).
     pub fn new(cwd: PathBuf) -> Self {
+        Self::with_launch(crate::sessions::LaunchDir {
+            cwd,
+            from_args: true,
+            error: None,
+        })
+    }
+
+    /// Dossier de lancement lu dans les arguments (`sessions::launch_dir_from_args`).
+    pub fn with_launch(dir: crate::sessions::LaunchDir) -> Self {
         AppState {
             sessions: Mutex::new(HashMap::new()),
             launch: LaunchInfo {
-                cwd: display_path(&cwd),
+                cwd: display_path(&dir.cwd),
+                cwd_from_args: dir.from_args,
+                launch_error: dir.error,
                 claude_path: locate_claude().ok().map(|p| display_path(&p)),
                 expected_version: EXPECTED_CLAUDE_VERSION.into(),
             },
@@ -196,8 +208,21 @@ pub async fn set_model(
     session: SessionKey,
     model: String,
 ) -> Result<String, CoreError> {
+    validate_model(&model)?;
     let s = state.get(&session)?;
     s.set_model(&model).await
+}
+
+/// Même règle que l'argument `--model` du lancement
+/// (`process::spawn::validate_launch_options`) : non vide, pas de `-` en
+/// tête, ni espace ni caractère de contrôle. Sinon `InvalidArgument`, sans
+/// rien envoyer au CLI.
+pub fn validate_model(model: &str) -> Result<(), CoreError> {
+    crate::process::spawn::validate_launch_options(&LaunchOptions {
+        model: Some(model.to_string()),
+        ..LaunchOptions::default()
+    })
+    .map_err(CoreError::InvalidArgument)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -223,19 +248,51 @@ pub fn skip_question(
     state.get(&session)?.skip_question(&request_id, reason)
 }
 
-#[tauri::command(rename_all = "snake_case")]
-pub fn list_sessions(cwd: String) -> Result<Vec<SessionSummary>, CoreError> {
-    // Provisoire (J0) : la lecture des transcripts arrive avec la reprise.
-    let _ = cwd;
-    Ok(vec![])
+fn projects_root() -> Result<PathBuf, CoreError> {
+    crate::sessions::paths::projects_root()
+        .ok_or_else(|| CoreError::Io("dossier personnel introuvable (USERPROFILE)".into()))
 }
 
+/// Projets récents de `~/.claude/projects` (J11, décision 11), du plus
+/// récent au plus ancien. Lecture seule.
 #[tauri::command(rename_all = "snake_case")]
-pub fn load_history(session: SessionKey, session_id: String) -> Result<(), CoreError> {
-    let _ = (session, session_id);
-    Err(CoreError::Unsupported(
-        "load_history (jalon de reprise)".into(),
-    ))
+pub async fn list_projects() -> Result<Vec<ProjectSummary>, CoreError> {
+    let root = projects_root()?;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions::list::list_projects(&root))
+        .await
+        .map_err(|e| CoreError::Io(e.to_string()))
+}
+
+/// Sessions du projet `cwd`, de la plus récente à la plus ancienne, 200 au
+/// plus (plan 1.8). Projet jamais ouvert avec le CLI : liste vide.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn list_sessions(cwd: String) -> Result<Vec<SessionSummary>, CoreError> {
+    let root = projects_root()?;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions::list::list_sessions(&root, &cwd))
+        .await
+        .map_err(|e| CoreError::Io(e.to_string()))
+}
+
+/// Historique de la session `session_id` (décision 9), relu dans le
+/// transcript du dossier de travail de la session `session` (celle lancée
+/// avec `resume`). Les événements sont **renvoyés** (pas poussés dans le
+/// canal) : l'interface les applique avant les événements vivants. Erreur :
+/// l'interface reprend sans historique, avec un avertissement.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn load_history(
+    state: State<'_, AppState>,
+    session: SessionKey,
+    session_id: String,
+) -> Result<HistoryLoaded, CoreError> {
+    let cwd = display_path(&state.get(&session)?.cwd);
+    let root = projects_root()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = crate::sessions::paths::find_project_dir(&root, &cwd)
+            .ok_or_else(|| CoreError::Io(format!("aucun transcript pour le dossier {cwd}")))?;
+        crate::sessions::transcript::load_history(&dir, &session_id, &session)
+    })
+    .await
+    .map_err(|e| CoreError::Io(e.to_string()))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -267,4 +324,30 @@ pub fn get_diagnostics(state: State<'_, AppState>) -> Diagnostics {
         d.stderr_tail = tail.iter().rev().take(50).rev().cloned().collect();
     }
     d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_model_value_is_validated_like_the_launch_argument() {
+        for ok in ["haiku", "claude-sonnet-5-5", "opus[1m]"] {
+            assert_eq!(validate_model(ok), Ok(()), "{ok}");
+        }
+        for bad in [
+            "",
+            "-x",
+            "--dangerously-skip-permissions",
+            "haiku sonnet",
+            "a\tb",
+            "a\nb",
+            "a\u{7f}",
+        ] {
+            assert!(
+                matches!(validate_model(bad), Err(CoreError::InvalidArgument(_))),
+                "{bad:?}"
+            );
+        }
+    }
 }
