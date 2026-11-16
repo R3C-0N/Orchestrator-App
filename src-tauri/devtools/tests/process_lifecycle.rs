@@ -57,7 +57,7 @@ fn wait_dead(pid: u32, within: Duration) -> bool {
 }
 
 fn sandbox() -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.claude-work/j0-sandbox");
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.claude-work/j0-sandbox");
     std::fs::create_dir_all(&p).unwrap();
     p.canonicalize().unwrap()
 }

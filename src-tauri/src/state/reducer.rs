@@ -155,6 +155,10 @@ impl Reducer {
     /// Message tapé par l'utilisateur et écrit sur stdin : `user_message`
     /// `Typed` puis `status` `Requesting` (ce que fait `send_message`).
     pub fn user_sent(&mut self, text: &str) -> Vec<Action> {
+        // Rien après `Exited` (relecture J6, N6).
+        if self.state == Some(SessionState::Exited) {
+            return vec![];
+        }
         let mut out = vec![Action::Emit(EventBody::UserMessage {
             thread: ThreadId::main(),
             uuid: None,
@@ -178,14 +182,34 @@ impl Reducer {
         })]
     }
 
-    /// Fin du processus : `exited` (avec `during_turn`), puis `status`
-    /// `Exited`, terminal.
+    /// Fin du processus : les agents non terminés passent en `Stopped`, puis
+    /// `exited` (avec `during_turn`), puis `status` `Exited`, terminal. Rien
+    /// la seconde fois. L'heure de fin des agents est celle de la dernière
+    /// ligne lue (rejeu déterministe) ; [`Reducer::exited_at`] la précise.
     pub fn exited(&mut self, code: Option<i32>, stderr_tail: Vec<String>) -> Vec<Action> {
-        let mut out = vec![Action::Emit(EventBody::Exited {
+        self.exited_at(code, stderr_tail, self.now)
+    }
+
+    /// Comme [`Reducer::exited`], à l'heure `t` (ms depuis l'epoch).
+    pub fn exited_at(
+        &mut self,
+        code: Option<i32>,
+        stderr_tail: Vec<String>,
+        t: u64,
+    ) -> Vec<Action> {
+        if self.state == Some(SessionState::Exited) {
+            return vec![];
+        }
+        self.now = t;
+        let mut out = Vec::new();
+        for a in self.agents.stop_unfinished(t) {
+            out.push(Action::Emit(EventBody::Agent(a)));
+        }
+        out.push(Action::Emit(EventBody::Exited {
             code,
             during_turn: self.in_turn(),
             stderr_tail,
-        })];
+        }));
         self.set_state(SessionState::Exited, &mut out);
         out
     }

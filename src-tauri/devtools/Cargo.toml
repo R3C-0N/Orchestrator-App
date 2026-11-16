@@ -1,0 +1,19 @@
+# Outils de développement du cœur Rust, hors de l'installeur (relecture J6, B2) :
+#
+# - `probe` : mode sans interface (lance claude.exe, imprime les CoreEvent) ;
+# - `replay` : fixtures/stream-json -> fixtures/ui-events (plan J4) ;
+# - `fake_claude` : faux CLI scriptable des tests du superviseur (plan 1.10).
+#
+# Les tests qui lancent ces binaires (`CARGO_BIN_EXE_*`) sont dans `tests/`.
+[package]
+name = "orchestrator-devtools"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+orchestrator = { path = ".." }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt-multi-thread"] }
+uuid = { version = "1", features = ["v4"] }

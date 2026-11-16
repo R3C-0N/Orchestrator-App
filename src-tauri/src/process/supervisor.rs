@@ -21,9 +21,7 @@ use tokio::process::{Child, ChildStdout};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::api::events::{
-    CoreEvent, EventBody, QuestionCloseReason, SessionState, ThreadId, UserOrigin,
-};
+use crate::api::events::{CoreEvent, EventBody, QuestionCloseReason, SessionState};
 use crate::api::types::{Answers, CoreError, ExitInfo, InterruptAck, SessionKey, SkipReason};
 use crate::errors::{self, NoticeLimiter};
 use crate::logging::{self, RawLog};
@@ -220,8 +218,12 @@ impl Supervision {
         drop(r);
 
         // stderr complet avant `exited` (dernier message d'erreur du CLI).
-        if let Some(task) = self.stderr_task.take() {
-            let _ = tokio::time::timeout(STDERR_DRAIN, task).await;
+        if let Some(mut task) = self.stderr_task.take() {
+            if tokio::time::timeout(STDERR_DRAIN, &mut task).await.is_err() {
+                // stderr tenu au-delà du délai : la lecture est abandonnée,
+                // plus aucune ligne `stderr` après `exited`.
+                task.abort();
+            }
         }
 
         let during_turn = self.reducer.lock().unwrap().in_turn();
@@ -246,26 +248,20 @@ impl Supervision {
             "claude.exe arrêté"
         );
         let t = now_ms();
-        self.em.emit(
-            EventBody::Exited {
-                code,
-                during_turn,
-                stderr_tail: tail.clone(),
-            },
-            t,
-        );
-        // Code non nul sans arrêt demandé : alerte (plan 1.9). Code 0 après
-        // fermeture de stdin : arrêt normal.
-        if code != Some(0) && !stopping {
-            self.em.emit(errors::exit_nonzero(code, &tail), t);
+        {
+            // Sous le verrou du réducteur : tout événement émis ailleurs passe
+            // aussi par ce verrou (`Session::with_reducer`), donc rien ne peut
+            // s'intercaler, et le réducteur refuse tout changement après.
+            let mut r = self.reducer.lock().unwrap();
+            // Code non nul sans arrêt demandé : alerte (plan 1.9), avant
+            // `exited`. Code 0 après fermeture de stdin : arrêt normal.
+            if code != Some(0) && !stopping {
+                self.em.emit(errors::exit_nonzero(code, &tail), t);
+            }
+            // Agents non terminés -> `Stopped`, `exited`, puis `status Exited`.
+            let out = r.exited_at(code, tail, t);
+            self.em.emit_actions(out, t);
         }
-        // Par le réducteur : `Exited` y devient terminal.
-        let mut out = Vec::new();
-        self.reducer
-            .lock()
-            .unwrap()
-            .set_state(SessionState::Exited, &mut out);
-        self.em.emit_actions(out, t);
         if let Some(raw) = &self.raw {
             raw.exit(code);
         }
@@ -288,11 +284,19 @@ impl Supervision {
                         for k in msg.unknown_kinds() {
                             tracing::info!(session = %self.key.0, kind = %k, "type inconnu ignoré");
                         }
-                        let actions = self.reducer.lock().unwrap().handle_inbound_at(&msg, t);
+                        let mut r = self.reducer.lock().unwrap();
+                        let actions = r.handle_inbound_at(&msg, t);
                         apply_actions(actions, &self.em, &self.writer, &self.pending, &self.raw, t);
+                        drop(r);
                     }
                     Err(e) => {
-                        tracing::warn!(session = %self.key.0, error = %e, line, "ligne illisible");
+                        tracing::warn!(
+                            session = %self.key.0,
+                            error = %e,
+                            len = line.len(),
+                            head = %errors::head(line),
+                            "ligne illisible"
+                        );
                         if limiter.allow(errors::BAD_JSON, Instant::now()) {
                             let n = limiter.take_suppressed(errors::BAD_JSON);
                             self.em.emit(errors::bad_json(&e.to_string(), line, n), t);
@@ -368,6 +372,7 @@ fn watch_writer(
     task: JoinHandle<std::io::Result<()>>,
     mut exit_rx: watch::Receiver<Option<Option<i32>>>,
     em: Emitter,
+    reducer: Arc<Mutex<Reducer>>,
     stopping: Arc<AtomicBool>,
     key: SessionKey,
 ) {
@@ -383,7 +388,11 @@ fn watch_writer(
                 )
                 .await
                 .is_ok();
-                if !exited && !stopping.load(Ordering::SeqCst) {
+                let r = reducer.lock().unwrap();
+                if !exited
+                    && !stopping.load(Ordering::SeqCst)
+                    && r.state != Some(SessionState::Exited)
+                {
                     em.emit(errors::stdin_broken(&e.to_string()), now_ms());
                 }
             }
@@ -479,6 +488,7 @@ impl Session {
             writer_task,
             exit_rx.clone(),
             emitter.clone(),
+            reducer.clone(),
             stopping.clone(),
             key.clone(),
         );
@@ -657,44 +667,45 @@ impl Session {
         if !self.is_running() {
             return Err(CoreError::NotRunning);
         }
-        if !self.reducer.lock().unwrap().questions.is_empty() {
+        let mut r = self.reducer.lock().unwrap();
+        if r.state == Some(SessionState::Exited) {
+            return Err(CoreError::NotRunning);
+        }
+        if !r.questions.is_empty() {
             return Err(CoreError::QuestionPending);
         }
         self.write(outbound::user_message(text))?;
-        let t = now_ms();
-        self.emitter.emit(
-            EventBody::UserMessage {
-                thread: ThreadId::main(),
-                uuid: None,
-                text: text.to_string(),
-                origin: UserOrigin::Typed,
-            },
-            t,
-        );
-        self.set_state(SessionState::Requesting, t);
+        let out = r.user_sent(text);
+        self.emitter.emit_actions(out, now_ms());
         Ok(())
     }
 
-    fn set_state(&self, st: SessionState, t: u64) {
-        self.with_reducer(t, |r, out| r.set_state(st, out));
-    }
-
-    /// Exécute `f` sous le verrou du réducteur et émet les événements produits.
+    /// Exécute `f` sous le verrou du réducteur et émet les événements produits
+    /// **sous ce verrou** : l'ordre des `seq` suit celui du réducteur, et rien
+    /// ne sort après `Exited` (émis lui aussi sous ce verrou).
     fn with_reducer<R>(&self, t: u64, f: impl FnOnce(&mut Reducer, &mut Vec<Action>) -> R) -> R {
         let mut out = Vec::new();
-        let res = f(&mut self.reducer.lock().unwrap(), &mut out);
-        for a in out {
-            if let Action::Emit(b) = a {
-                self.emitter.emit(b, t);
-            }
-        }
+        let mut r = self.reducer.lock().unwrap();
+        let res = f(&mut r, &mut out);
+        self.emitter.emit_actions(out, t);
         res
     }
 
     pub async fn interrupt(&self, cancel_queued: bool) -> Result<InterruptAck, CoreError> {
-        // `Interrupting` seulement pendant un tour ; rien après `Exited`.
-        let gen = self.interrupt_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        let prev = self.with_reducer(now_ms(), |r, out| r.begin_interrupt(out));
+        // `Interrupting` seulement pendant un tour ; rien après `Exited`. Le
+        // numéro de garde n'avance que si l'état vient de passer en
+        // `Interrupting` : un second Échap pendant `Interrupting` ne désarme
+        // pas la garde de la première interruption (relecture J6, B1).
+        let gens = self.interrupt_gen.clone();
+        let (prev, gen) = self.with_reducer(now_ms(), |r, out| {
+            let prev = r.begin_interrupt(out);
+            let gen = if prev.is_some() {
+                gens.fetch_add(1, Ordering::SeqCst) + 1
+            } else {
+                gens.load(Ordering::SeqCst)
+            };
+            (prev, gen)
+        });
         let mut extra = Map::new();
         if cancel_queued {
             extra.insert("cancel_queued".into(), json!(true));
@@ -749,17 +760,13 @@ impl Session {
             }
             let t = now_ms();
             let mut out = Vec::new();
-            let stuck = {
-                let mut r = reducer.lock().unwrap();
-                let stuck = r.state == Some(SessionState::Interrupting);
-                r.abort_interrupt(prev, &mut out);
-                stuck
-            };
-            if stuck {
+            let mut r = reducer.lock().unwrap();
+            if r.state == Some(SessionState::Interrupting) {
                 tracing::warn!(session = %key.0, "interrupt accepté sans result après {wait:?}");
                 em.emit(errors::interrupt_no_result(wait), t);
+                r.abort_interrupt(prev, &mut out);
+                em.emit_actions(out, t);
             }
-            em.emit_actions(out, t);
         });
     }
 
@@ -782,19 +789,17 @@ impl Session {
         answers: &Answers,
         response: Option<&str>,
     ) -> Result<(), CoreError> {
-        send_then_forget_question(&self.reducer, request_id, |input| {
-            self.write(outbound::answer_question(
-                request_id, input, answers, response,
-            ))
-        })?;
-        self.emitter.emit(
-            EventBody::QuestionClosed {
-                request_id: request_id.into(),
-                reason: QuestionCloseReason::Answered,
+        send_then_close_question(
+            &self.reducer,
+            request_id,
+            QuestionCloseReason::Answered,
+            |input| {
+                self.write(outbound::answer_question(
+                    request_id, input, answers, response,
+                ))
             },
-            now_ms(),
-        );
-        Ok(())
+            |out| self.emitter.emit_actions(out, now_ms()),
+        )
     }
 
     pub fn skip_question(&self, request_id: &str, reason: SkipReason) -> Result<(), CoreError> {
@@ -808,17 +813,13 @@ impl Session {
         if !supported {
             return Err(CoreError::Unsupported(CAP_UNANSWERED.into()));
         }
-        send_then_forget_question(&self.reducer, request_id, |input| {
-            self.write(outbound::skip_question(request_id, input, reason))
-        })?;
-        self.emitter.emit(
-            EventBody::QuestionClosed {
-                request_id: request_id.into(),
-                reason: QuestionCloseReason::Skipped,
-            },
-            now_ms(),
-        );
-        Ok(())
+        send_then_close_question(
+            &self.reducer,
+            request_id,
+            QuestionCloseReason::Skipped,
+            |input| self.write(outbound::skip_question(request_id, input, reason)),
+            |out| self.emitter.emit_actions(out, now_ms()),
+        )
     }
 
     /// Ferme stdin, attend 3 s, puis tue l'arbre par le Job Object.
@@ -858,19 +859,25 @@ impl Session {
 /// Répond à une question en attente : la réponse est écrite sur stdin sous le
 /// verrou du réducteur (deux réponses simultanées sont impossibles), et la
 /// question n'est retirée de la table qu'après un envoi réussi. En cas d'échec,
-/// elle reste en attente et peut recevoir une nouvelle réponse.
-pub(crate) fn send_then_forget_question(
+/// elle reste en attente et peut recevoir une nouvelle réponse. Le
+/// `question_closed` est émis par `emit`, sous le même verrou.
+pub(crate) fn send_then_close_question(
     reducer: &Mutex<Reducer>,
     request_id: &str,
+    reason: QuestionCloseReason,
     send: impl FnOnce(&Value) -> Result<(), CoreError>,
+    emit: impl FnOnce(Vec<Action>),
 ) -> Result<(), CoreError> {
     let mut r = reducer.lock().unwrap();
+    if r.state == Some(SessionState::Exited) {
+        return Err(CoreError::NotRunning);
+    }
     let input = r
         .questions
         .get(request_id)
         .ok_or_else(|| CoreError::UnknownRequest(request_id.into()))?;
     send(input)?;
-    r.questions.remove(request_id);
+    emit(r.close_question(request_id, reason));
     Ok(())
 }
 
@@ -922,7 +929,8 @@ mod tests {
     #[test]
     fn failed_send_keeps_the_question_pending() {
         let r = reducer_with_question("q1");
-        let err = send_then_forget_question(&r, "q1", |_| Err(CoreError::NotRunning));
+        let ans = QuestionCloseReason::Answered;
+        let err = send_then_close_question(&r, "q1", ans, |_| Err(CoreError::NotRunning), |_| {});
         assert_eq!(err, Err(CoreError::NotRunning));
         assert!(
             r.lock().unwrap().questions.contains_key("q1"),
@@ -930,18 +938,38 @@ mod tests {
         );
         // Une nouvelle tentative réussie la retire.
         let mut seen = None;
-        send_then_forget_question(&r, "q1", |input| {
-            seen = Some(input.clone());
-            Ok(())
-        })
+        let mut emitted = Vec::new();
+        send_then_close_question(
+            &r,
+            "q1",
+            ans,
+            |input| {
+                seen = Some(input.clone());
+                Ok(())
+            },
+            |out| emitted = out,
+        )
         .unwrap();
         assert!(
             seen.unwrap()["questions"].is_array(),
             "input transmis à l'envoi"
         );
         assert!(!r.lock().unwrap().questions.contains_key("q1"));
+        assert!(matches!(
+            emitted.as_slice(),
+            [Action::Emit(EventBody::QuestionClosed {
+                reason: QuestionCloseReason::Answered,
+                ..
+            })]
+        ));
         // Déjà répondue : requête inconnue, rien n'est envoyé.
-        let again = send_then_forget_question(&r, "q1", |_| panic!("ne doit pas envoyer"));
+        let again = send_then_close_question(
+            &r,
+            "q1",
+            ans,
+            |_| panic!("ne doit pas envoyer"),
+            |_| panic!("rien à émettre"),
+        );
         assert_eq!(again, Err(CoreError::UnknownRequest("q1".into())));
     }
 
@@ -995,5 +1023,49 @@ mod tests {
         r.set_state(SessionState::Idle, &mut out);
         assert!(status_events(&out).is_empty(), "aucun status après Exited");
         assert_eq!(r.state, Some(SessionState::Exited));
+    }
+
+    #[test]
+    fn exit_stops_running_agents_then_nothing_more() {
+        let mut r = Reducer::new();
+        r.handle_at(
+            &json!({"type": "assistant", "message": {"id": "msg_1", "content": [
+                {"type": "tool_use", "id": "toolu_a", "name": "Agent",
+                 "input": {"subagent_type": "agent-bleu", "description": "D"}}]}}),
+            100,
+        );
+        r.user_sent("x");
+        let out = r.exited_at(Some(1), vec![], 500);
+        let kinds: Vec<&str> = out
+            .iter()
+            .map(|a| match a {
+                Action::Emit(EventBody::Agent(a)) => {
+                    assert_eq!(a.status, crate::api::events::AgentStatus::Stopped);
+                    assert_eq!(a.ended_at, Some(500));
+                    "agent"
+                }
+                Action::Emit(EventBody::Exited { during_turn, .. }) => {
+                    assert!(during_turn);
+                    "exited"
+                }
+                Action::Emit(EventBody::Status { state }) => {
+                    assert_eq!(*state, SessionState::Exited);
+                    "status"
+                }
+                other => panic!("inattendu : {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["agent", "exited", "status"]);
+        assert!(
+            r.exited_at(Some(1), vec![], 600).is_empty(),
+            "une seule fois"
+        );
+        assert!(
+            r.user_sent("y").is_empty(),
+            "pas de user_message après Exited"
+        );
+        assert!(r
+            .close_question("q", QuestionCloseReason::Answered)
+            .is_empty());
     }
 }

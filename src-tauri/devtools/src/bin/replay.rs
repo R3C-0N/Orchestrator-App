@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use orchestrator_lib::state::replay::{replay_fixture, to_json_lines, UI_EVENT_FIXTURES};
 
 fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn main() -> ExitCode {

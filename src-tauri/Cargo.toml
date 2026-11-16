@@ -5,6 +5,9 @@ description = "Interface de bureau pour Claude Code"
 edition = "2021"
 rust-version = "1.94"
 default-run = "orchestrator"
+# Un seul binaire dans ce paquet, donc dans l'installeur : les outils de
+# développement (`probe`, `replay`, `fake_claude`) sont dans `devtools/`.
+autobins = false
 
 [lib]
 name = "orchestrator_lib"
@@ -14,10 +17,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "orchestrator"
 path = "src/main.rs"
 
-# Mode sans interface : lance claude.exe, envoie un message, imprime les CoreEvent.
-[[bin]]
-name = "probe"
-path = "src/bin/probe.rs"
+# `devtools` : binaires de développement et tests qui les lancent. Membre par
+# défaut : `cargo test`, `cargo clippy` et `cargo run --bin replay` les voient
+# depuis `src-tauri/`, mais le bundle Tauri ne prend que le binaire ci-dessus.
+[workspace]
+members = ["devtools"]
+default-members = [".", "devtools"]
 
 [build-dependencies]
 tauri-build = { version = "2.7.4", features = [] }

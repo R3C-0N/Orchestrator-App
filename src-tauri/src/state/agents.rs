@@ -390,6 +390,10 @@ impl AgentRegistry {
     ) -> Option<AgentEvent> {
         self.update(tool_use_id, None, |a| {
             if a.background {
+                // Accusé de lancement ; en erreur, l'agent n'a pas démarré.
+                if is_error {
+                    Self::set_status(a, AgentStatus::Failed, now);
+                }
                 return;
             }
             let status = if is_error {
@@ -402,10 +406,67 @@ impl AgentRegistry {
     }
 }
 
+impl AgentRegistry {
+    /// Fin du processus : les agents non terminés passent en `Stopped`.
+    /// Renvoie leur nouvel état complet.
+    pub fn stop_unfinished(&mut self, now: u64) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        for a in &mut self.agents {
+            if !is_terminal(a.status) {
+                Self::set_status(a, AgentStatus::Stopped, now);
+                out.push(a.clone());
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn background_launch_error_fails_and_exit_stops_the_rest() {
+        let mut r = AgentRegistry::new();
+        r.on_tool_use(
+            "t_bg",
+            "Agent",
+            &json!({"subagent_type":"agent-rouge","description":"A","run_in_background":true}),
+            None,
+            10,
+        );
+        r.on_tool_use(
+            "t_ok",
+            "Agent",
+            &json!({"subagent_type":"agent-bleu","description":"B","run_in_background":true}),
+            None,
+            10,
+        );
+        r.on_tool_use(
+            "t_fg",
+            "Agent",
+            &json!({"subagent_type":"agent-vert","description":"C","run_in_background":false}),
+            None,
+            10,
+        );
+        // Lancement d'arrière-plan en erreur : `Failed`.
+        let a = r.on_tool_result("t_bg", true, 20).unwrap();
+        assert_eq!(a.status, AgentStatus::Failed);
+        assert_eq!(a.ended_at, Some(20));
+        // Accusé normal : l'agent continue.
+        assert!(r.on_tool_result("t_ok", false, 20).is_none());
+        assert!(!is_terminal(r.get("t_ok").unwrap().status));
+        // Fin du processus : les deux agents non terminés passent en `Stopped`.
+        let stopped = r.stop_unfinished(30);
+        let ids: Vec<_> = stopped.iter().map(|a| a.tool_use_id.as_str()).collect();
+        assert_eq!(ids, vec!["t_ok", "t_fg"]);
+        assert!(stopped
+            .iter()
+            .all(|a| a.status == AgentStatus::Stopped && a.ended_at == Some(30)));
+        assert_eq!(r.get("t_bg").unwrap().status, AgentStatus::Failed);
+        assert!(r.stop_unfinished(40).is_empty(), "une seule fois");
+    }
 
     #[test]
     fn foreground_agent_lifecycle() {
