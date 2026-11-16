@@ -28,7 +28,9 @@ export default defineConfig({
     command: `npx vite --port ${PORT} --strictPort`,
     cwd: "..",
     url: `http://localhost:${PORT}/?mock=demo`,
-    reuseExistingServer: false,
-    timeout: 60_000,
+    // Réutilisé s'il tourne déjà (machine chargée : l'optimisation des
+    // dépendances de Vite peut dépasser une minute).
+    reuseExistingServer: true,
+    timeout: 240_000,
   },
 });

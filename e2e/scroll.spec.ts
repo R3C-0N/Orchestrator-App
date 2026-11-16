@@ -10,14 +10,14 @@ const ROWS = 3000;
 const RATE = 100;
 
 type Orch = {
-  store: { rows: unknown[]; live: unknown };
+  store: { rows: unknown[]; live: unknown; status: string };
   mock: {
     streamReply(chars?: number): void;
     stopStream(): void;
     send(text: string, replyChars?: number): void;
     stats: { rows: number; textBytes: number; tools: number; agents: number } | null;
   };
-  conversation: () => { scrollToTop(): void; scrollToBottom(): void; isSticky(): boolean };
+  conversation: () => { scrollToTop(): void; scrollToBottom(): void; isSticky(): boolean; itemCount(): number };
   latencies: number[];
 };
 declare global {
@@ -148,16 +148,23 @@ async function wheelScroll(page: Page, ms: number) {
 test.describe.configure({ mode: "serial" });
 
 let page: Page;
+/** Index de la dernière ligne affichée (après regroupement des appels, J5). */
+let LAST = ROWS - 1;
 
 test.beforeAll(async ({ browser }) => {
   page = await browser.newPage();
   await page.addInitScript(installFrameRecorder);
   await page.goto(`/?mock=long&rows=${ROWS}&rate=${RATE}`);
-  await page.waitForFunction((n) => window.__orch?.store.rows.length === n, ROWS);
-  await page.waitForSelector(`[data-index="${ROWS - 1}"]`);
+  // J5 : les agents d'arrière-plan ajoutent leur ligne de fin, d'où « ≥ ».
+  await page.waitForFunction(
+    (n) => window.__orch?.store.status === "Idle" && window.__orch.store.rows.length >= n,
+    ROWS,
+  );
+  LAST = (await page.evaluate(() => window.__orch.conversation().itemCount())) - 1;
+  await page.waitForSelector(`[data-index="${LAST}"]`);
   await page.mouse.move(500, 300);
   const stats = await page.evaluate(() => window.__orch.mock.stats);
-  report("session", { ...stats, domRows: await page.locator("[data-row-kind]").count() });
+  report("session", { ...stats, items: LAST + 1, domRows: await page.locator("[data-row-kind]").count() });
 });
 
 test.afterAll(async () => {
@@ -185,6 +192,33 @@ test("scroll : ≥ 58 i/s et < 1 % d'images > 33 ms, 10 s au glisser puis 10 s �
     expect(m.seconds).toBeGreaterThanOrEqual(9.9);
     expect(m.viewports).toBeGreaterThanOrEqual(20);
     expect(m.rowsSpan).toBeGreaterThanOrEqual(30);
+    expect(m.fps).toBeGreaterThanOrEqual(58);
+    expect(m.over33pct).toBeLessThan(1);
+  }
+});
+
+test("scroll en vue détaillée (Ctrl+O) : mêmes seuils", async () => {
+  await page.locator(".vlist").focus();
+  await page.keyboard.press("Control+o");
+  await page.locator(".detail-bar").waitFor();
+  await page.waitForTimeout(500);
+  await page.mouse.move(500, 300);
+  await page.evaluate(() => window.__frames.start());
+  await dragScroll(page, 10_000, 3000);
+  const drag = summarize(await page.evaluate(() => window.__frames.stop()));
+  await page.evaluate(() => window.__frames.start());
+  await wheelScroll(page, 10_000);
+  const wheel = summarize(await page.evaluate(() => window.__frames.stop()));
+  const items = await page.evaluate(() => window.__orch.conversation().itemCount());
+  await page.locator(".vlist").focus();
+  await page.keyboard.press("Control+o");
+  await page.locator(".detail-bar").waitFor({ state: "detached" });
+  await page.waitForTimeout(500);
+  report("scroll-detail-glisser", { ...drag, items });
+  report("scroll-detail-molette", wheel);
+  for (const m of [drag, wheel]) {
+    expect(m.seconds).toBeGreaterThanOrEqual(9.9);
+    expect(m.viewports).toBeGreaterThanOrEqual(20);
     expect(m.fps).toBeGreaterThanOrEqual(58);
     expect(m.over33pct).toBeLessThan(1);
   }
@@ -219,7 +253,7 @@ test("saut en haut / en bas : affichage complet < 100 ms", async () => {
           };
           requestAnimationFrame(check);
         }),
-      { to, last: ROWS - 1 },
+      { to, last: LAST },
     );
   const res = { top: [] as number[], bottom: [] as number[] };
   for (let i = 0; i < 10; i++) {

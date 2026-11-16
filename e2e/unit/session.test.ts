@@ -23,7 +23,8 @@ describe("SessionStore", () => {
     const { events, stats } = buildHistory(f, 3000);
     s.apply(events);
     expect(stats.rows).toBe(3000);
-    expect(s.rows.length).toBe(3000);
+    // J5 : chaque agent d'arrière-plan qui finit ajoute sa ligne « Agent … finished » (capture 06).
+    expect(s.rows.length).toBe(3000 + stats.agents);
     expect(s.gaps).toBe(0);
     expect(s.live).toBeNull();
   });
@@ -116,8 +117,10 @@ describe("SessionStore", () => {
         { kind: "agent", ...agent, status: "Completed" },
       ),
     );
-    expect(s.rows).toHaveLength(1);
+    // L'appel reste une seule ligne ; J5 ajoute la ligne de fin de l'agent d'arrière-plan (06).
+    expect(s.rows).toHaveLength(2);
     expect(s.rows[0]).toMatchObject({ kind: "agent", agent: { status: "Completed" } });
+    expect(s.rows[1]).toMatchObject({ kind: "agentDone", toolUseId: "ta" });
     expect(s.agents).toHaveLength(1);
     expect(s.live).toBeNull();
     expect(s.threads.get("ta")?.[0]).toMatchObject({ kind: "assistant", text: "sous-agent", done: true });
@@ -172,7 +175,7 @@ describe("SessionStore", () => {
     expect(all.every((e, i) => e.seq === i)).toBe(true);
     const s = new SessionStore();
     s.apply(all);
-    expect(s.rows.length).toBe(500);
+    expect(s.rows.length).toBe(500 + (m.stats?.agents ?? 0));
     expect(s.status).toBe("Idle");
   });
 

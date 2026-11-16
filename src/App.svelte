@@ -22,6 +22,15 @@
   const store = new SessionStore();
   let mock: MockCore | null = null;
   let conversation: Conversation | undefined = $state();
+  /** Vue détaillée (Ctrl+O, jalon J5) : un appel par ligne, sorties complètes. */
+  let verbose = $state(false);
+
+  function onWindowKey(e: KeyboardEvent) {
+    if (e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey && (e.key === "o" || e.key === "O")) {
+      e.preventDefault();
+      verbose = !verbose;
+    }
+  }
 
   let session: SessionKey | null = $state(null);
   let cwd = $state("");
@@ -126,6 +135,8 @@
   });
 </script>
 
+<svelte:window onkeydown={onWindowKey} />
+
 <main>
   {#each store.banners as b (b.id)}
     <div class="banner {b.level.toLowerCase()}">{b.message}</div>
@@ -133,7 +144,7 @@
   {#if startError}
     <div class="banner error">{startError}</div>
   {/if}
-  <Conversation {store} bind:this={conversation} />
+  <Conversation {store} {verbose} bind:this={conversation} />
   <form onsubmit={send}>
     <span class="prompt">❯</span>
     <input

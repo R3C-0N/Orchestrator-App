@@ -1,20 +1,38 @@
 <script lang="ts">
-  // Conversation : liste virtualisée (virtua) du fil principal.
+  // Conversation : liste virtualisée (virtua) du fil principal, rendu
+  // « terminal » du TUI 2.1.325 (plan 1.7, jalon J5).
   //
+  // - Les `Row` du magasin deviennent des `Item` affichés (render/group.ts) :
+  //   vue normale avec appels regroupés, ou vue détaillée (Ctrl+O, `verbose`)
+  //   avec un appel par ligne et les sorties complètes.
   // - Collée en bas tant que l'utilisateur n'a pas remonté : chaque ajout et
   //   chaque croissance de la ligne vivante ramène en bas.
   // - Le collage ne se perd que sur une intention de l'utilisateur (molette,
   //   glisser, clavier) qui l'éloigne du bas, jamais sur un saut de mesure ;
   //   il revient dès qu'il redescend au bas.
-  // - Rendu provisoire « terminal » (texte mono, puce ●) ; le rendu fidèle
-  //   des lignes est le jalon J5.
+  // - La bascule de vue garde la position de lecture : la ligne source en
+  //   haut de la vue reste en haut après la bascule.
   import { tick } from "svelte";
   import { VList } from "virtua/svelte";
-  import type { Row, SessionStore } from "../state/session.svelte";
+  import { ItemCache, firstRowId, itemIndexOfRow, type Item } from "../render/group";
+  import type { SessionStore } from "../state/session.svelte";
+  import AgentFinished from "./rows/AgentFinished.svelte";
+  import AgentLaunch from "./rows/AgentLaunch.svelte";
+  import AssistantText from "./rows/AssistantText.svelte";
+  import Interrupted from "./rows/Interrupted.svelte";
+  import PlainRow from "./rows/PlainRow.svelte";
+  import ToolCall from "./rows/ToolCall.svelte";
+  import ToolGroup from "./rows/ToolGroup.svelte";
+  import TurnIndicator from "./rows/TurnIndicator.svelte";
+  import TurnResult from "./rows/TurnResult.svelte";
+  import UserRow from "./rows/UserRow.svelte";
 
-  let { store }: { store: SessionStore } = $props();
+  let { store, verbose = false }: { store: SessionStore; verbose?: boolean } = $props();
 
-  let list: VList<Row> | undefined = $state();
+  const cache = new ItemCache();
+  const items: Item[] = $derived(cache.build(store.rows, verbose));
+
+  let list: VList<Item> | undefined = $state();
   /** Collé en bas (suivi du streaming). */
   let sticky = $state(true);
   /** Fin de la dernière intention de défilement de l'utilisateur. */
@@ -79,8 +97,8 @@
 
   /** Après un changement des données : virtua place la dernière ligne (hauteurs estimées comprises). */
   function follow() {
-    if (!sticky || !list || store.rows.length === 0) return;
-    if (distanceFromBottom() > 0.5) list.scrollToIndex(store.rows.length - 1, { align: "end" });
+    if (!sticky || !list || items.length === 0) return;
+    if (distanceFromBottom() > 0.5) list.scrollToIndex(items.length - 1, { align: "end" });
   }
 
   /**
@@ -116,7 +134,7 @@
 
   export function scrollToBottom() {
     sticky = true;
-    list?.scrollToIndex(store.rows.length - 1, { align: "end" });
+    list?.scrollToIndex(items.length - 1, { align: "end" });
   }
 
   export function isSticky() {
@@ -125,6 +143,11 @@
 
   export function handle() {
     return list;
+  }
+
+  /** Nombre de lignes affichées (après regroupement). */
+  export function itemCount() {
+    return items.length;
   }
 
   // Écouteurs d'intention posés à la main (molette passive : ne bloque pas le défilement).
@@ -151,77 +174,131 @@
 
   // Nouvelle ligne, ou croissance de la ligne vivante : suivre si collé.
   $effect(() => {
-    void store.rows.length;
+    void items.length;
     void store.live?.text.length;
     follow();
   });
 
-  function toolLabel(row: Extract<Row, { kind: "tool" }>): string {
-    const inp = row.input as Record<string, unknown> | null;
-    const arg =
-      inp && typeof inp === "object"
-        ? (inp.file_path ?? inp.command ?? inp.pattern ?? inp.path ?? "")
-        : "";
-    return `${row.name}(${String(arg)})`;
+  // --- Bascule Ctrl+O sans perdre la lecture ---------------------------------
+
+  /** Items affichés au dernier rendu (non réactif : lu avant la bascule). */
+  let shown: Item[] = [];
+  $effect(() => {
+    shown = items;
+  });
+  /** Ligne source en haut de la vue au moment de la bascule. */
+  let anchor: string | null = null;
+
+  $effect.pre(() => {
+    void verbose;
+    // Avant la mise à jour du DOM : la liste montre encore l'ancienne vue.
+    if (!list || sticky || shown.length === 0) {
+      anchor = null;
+      return;
+    }
+    const i = list.findItemIndex(list.getScrollOffset());
+    anchor = shown[i] ? firstRowId(shown[i]) : null;
+  });
+
+  /** Après le montage de la liste de la nouvelle vue : même ligne en haut, ou toujours collé en bas. */
+  function restore(_el: HTMLElement) {
+    const a = anchor;
+    requestAnimationFrame(() => {
+      if (!list) return;
+      if (sticky || a === null) {
+        if (items.length) list.scrollToIndex(items.length - 1, { align: "end" });
+        return;
+      }
+      const j = itemIndexOfRow(items, a);
+      if (j >= 0) {
+        markIntent(400);
+        list.scrollToIndex(j, { align: "start" });
+      }
+    });
   }
 
-  function resultSummary(text: string): string {
-    const lines = text.split("\n");
-    const first = lines[0] ?? "";
-    return lines.length > 1 ? `${first} … +${lines.length - 1} lines` : first;
-  }
+  // --- Indicateur de tour (`k1`) ------------------------------------------------
 
-  function seconds(ms: number): string {
-    const s = Math.round(ms / 1000);
-    return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
-  }
+  const busy = $derived(
+    store.status === "Requesting" || store.status === "Streaming" || store.status === "Interrupting",
+  );
+  let turnSince = $state(0);
+  let turnFirstRow = 0;
+  $effect.pre(() => {
+    if (busy) {
+      if (turnSince === 0) {
+        turnSince = Date.now();
+        turnFirstRow = store.rows.length;
+      }
+    } else turnSince = 0;
+  });
+  const turnChars = $derived.by(() => {
+    if (!busy) return 0;
+    let n = 0;
+    const rows = store.rows;
+    for (let i = Math.max(0, turnFirstRow - 1); i < rows.length; i++) {
+      const r = rows[i];
+      if (r.kind === "assistant") n += r.text.length;
+      else if (r.kind === "tool" && r.input) n += JSON.stringify(r.input).length;
+    }
+    return n;
+  });
 </script>
 
-<div class="conversation" role="log" aria-live="off" {@attach listen}>
-  <VList
-    bind:this={list}
-    data={store.rows}
-    getKey={(r) => r.id}
-    class="vlist"
-    tabindex={0}
-    {onscroll}
-    onresize={followResize}
-  >
-    {#snippet children(row: Row, index: number)}
-      <div class="row {row.kind}" data-row-kind={row.kind} data-index={index}>
-        {#if row.kind === "user"}
-          <div class="band"><span class="glyph dim">❯</span><span class="text strong">{row.text}</span></div>
-        {:else if row.kind === "assistant"}
-          <div class="line"><span class="glyph">●</span><span class="text" class:streaming={!row.done}>{row.text}</span></div>
-        {:else if row.kind === "tool"}
-          <div class="line">
-            <span class="glyph" class:ok={row.result && !row.result.isError} class:err={row.result?.isError}>●</span>
-            <span class="text">{toolLabel(row)}</span>
+<div class="conversation term" role="log" aria-live="off" {@attach listen}>
+  {#key verbose}
+    <div class="host" {@attach restore}>
+      <VList
+        bind:this={list}
+        data={items}
+        getKey={(it) => it.key}
+        class="vlist"
+        tabindex={0}
+        {onscroll}
+        onresize={followResize}
+      >
+        {#snippet children(item: Item, index: number)}
+          <div
+            class="row"
+            class:attached={item.kind === "interrupted" && item.attached}
+            data-row-kind={item.kind}
+            data-index={index}
+          >
+            {#if item.kind === "user"}
+              <UserRow row={item.row} />
+            {:else if item.kind === "assistant"}
+              <AssistantText row={item.row} {verbose} model={store.meta.model} />
+            {:else if item.kind === "group"}
+              <ToolGroup rows={item.rows} noResult={item.noResult} />
+            {:else if item.kind === "tool"}
+              <ToolCall row={item.row} {verbose} cwd={store.meta.cwd} noResult={item.noResult} />
+            {:else if item.kind === "agents"}
+              <AgentLaunch rows={item.rows} />
+            {:else if item.kind === "agentDone"}
+              <AgentFinished row={item.row} {verbose} />
+            {:else if item.kind === "turn"}
+              <TurnResult row={item.row} />
+            {:else if item.kind === "interrupted"}
+              <Interrupted row={item.row} />
+            {:else}
+              <PlainRow row={item.row} />
+            {/if}
           </div>
-          {#if row.result}
-            <div class="line dim" class:errtext={row.result.isError}>
-              <span class="glyph"></span><span class="text">⎿  {resultSummary(row.result.text)}</span>
-            </div>
-          {/if}
-        {:else if row.kind === "agent"}
-          <div class="line">
-            <span class="glyph ok">●</span>
-            <span class="text">Agent "{row.agent.description}" · {row.agent.status}</span>
-          </div>
-        {:else if row.kind === "turn"}
-          <div class="line dim">
-            <span class="glyph">✻</span><span class="text">Worked for {seconds(row.durationMs)}</span>
-          </div>
-        {:else if row.kind === "interrupted"}
-          <div class="line dim"><span class="glyph"></span><span class="text">⎿  {row.text}</span></div>
-        {:else}
-          <div class="line" class:errtext={row.level === "Error"}>
-            <span class="glyph">!</span><span class="text">{row.code} : {row.message}</span>
-          </div>
-        {/if}
-      </div>
-    {/snippet}
-  </VList>
+        {/snippet}
+      </VList>
+    </div>
+  {/key}
+  {#if busy && turnSince > 0}
+    <div class="indicator-line">
+      <TurnIndicator since={turnSince} chars={turnChars} />
+    </div>
+  {/if}
+  {#if verbose}
+    <div class="detail-bar">
+      <span>Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll</span>
+      <span>verbose</span>
+    </div>
+  {/if}
   {#if !sticky}
     <button class="jump" onclick={scrollToBottom} title="Revenir en bas (Fin)">↓ bas</button>
   {/if}
@@ -232,64 +309,46 @@
     position: relative;
     flex: 1;
     min-height: 0;
-    background: #0c0c0c;
-    color: #cccccc;
-    font-family: "Cascadia Mono", Consolas, monospace;
-    font-size: 14px;
-    line-height: 18px;
+    display: flex;
+    flex-direction: column;
+  }
+  .host {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
   .conversation :global(.vlist) {
     outline: none;
     overscroll-behavior: contain;
+    flex: 1;
+    min-height: 0;
   }
+  /* Une ligne vide entre deux blocs, comme le terminal. */
   .row {
-    padding: 18px 1ch 0;
+    padding: var(--t-lh) 1ch 0;
   }
-  .line,
-  .band {
-    display: grid;
-    grid-template-columns: 2ch 1fr;
+  .row.attached {
+    padding-top: 0;
   }
-  .band {
-    background: #373737;
-    margin: 0 -1ch;
-    padding: 0 1ch;
+  .indicator-line {
+    padding: var(--t-lh) 1ch 0;
   }
-  .text {
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    min-width: 0;
-  }
-  .strong {
-    color: #ffffff;
-    font-weight: bold;
-  }
-  .glyph {
-    color: #ffffff;
-  }
-  .dim,
-  .dim .glyph,
-  .glyph.dim {
-    color: #8b8b8b;
-  }
-  .ok {
-    color: #16c60c;
-  }
-  .err,
-  .errtext,
-  .errtext .glyph {
-    color: #ff6b80;
-  }
-  .streaming::after {
-    content: "▍";
-    color: #8b8b8b;
+  /* Barre de la vue détaillée (`03b`) : règle grise puis l'aide, « verbose » à droite. */
+  .detail-bar {
+    display: flex;
+    justify-content: space-between;
+    margin: var(--t-lh) 1ch 0;
+    padding: 0 1ch 0 2ch;
+    border-top: 1px solid var(--t-rule-detail);
+    color: var(--t-dim);
   }
   .jump {
     position: absolute;
     right: 2ch;
     bottom: 8px;
-    background: #0c0c0c;
-    color: #cccccc;
+    background: var(--t-bg);
+    color: var(--t-fg);
     border: 1px solid #555;
     font: inherit;
     padding: 0 1ch;

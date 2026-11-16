@@ -26,7 +26,8 @@ import type { ResultPart } from "../core/bindings/ResultPart";
 import type { SessionState } from "../core/bindings/SessionState";
 import type { UserOrigin } from "../core/bindings/UserOrigin";
 
-export type UserRow = { kind: "user"; id: string; text: string; origin: UserOrigin };
+/** `at` : horodatage `t` de l'événement source (ms epoch), pour le rendu (heure, durée). */
+export type UserRow = { kind: "user"; id: string; text: string; origin: UserOrigin; at: number };
 export type AssistantTextRow = {
   kind: "assistant";
   id: string;
@@ -34,6 +35,7 @@ export type AssistantTextRow = {
   block: string;
   text: string;
   done: boolean;
+  at: number;
 };
 export type ToolResult = { text: string; isError: boolean; meta: JsonValue | null };
 export type ToolCallRow = {
@@ -43,8 +45,11 @@ export type ToolCallRow = {
   name: string;
   input: JsonValue | null;
   result: ToolResult | null;
+  at: number;
 };
 export type AgentCallRow = { kind: "agent"; id: string; toolUseId: string; agent: AgentEvent };
+/** Fin d'un agent lancé en arrière-plan : ligne ajoutée au moment où il finit (`06`). */
+export type AgentDoneRow = { kind: "agentDone"; id: string; toolUseId: string; agent: AgentEvent; at: number };
 export type TurnResultRow = {
   kind: "turn";
   id: string;
@@ -52,6 +57,9 @@ export type TurnResultRow = {
   isError: boolean;
   durationMs: number;
   result: string | null;
+  at: number;
+  /** Agents d'arrière-plan encore en cours à la fin du tour (« Waiting for N background agents », `05`). */
+  waiting: number;
 };
 export type NoticeRow = { kind: "notice"; id: string; level: NoticeLevel; code: string; message: string };
 export type InterruptedRow = { kind: "interrupted"; id: string; text: string };
@@ -61,6 +69,7 @@ export type Row =
   | AssistantTextRow
   | ToolCallRow
   | AgentCallRow
+  | AgentDoneRow
   | TurnResultRow
   | NoticeRow
   | InterruptedRow;
@@ -74,6 +83,8 @@ export type Question = {
   canSkip: boolean;
 };
 export type SessionMeta = {
+  /** Dossier de travail (`starting.cwd`) : chemins relatifs du rendu. */
+  cwd: string | null;
   version: string | null;
   model: string | null;
   sessionId: string | null;
@@ -100,6 +111,9 @@ function resultText(parts: ResultPart[]): string {
     .join("\n");
 }
 
+/** États finaux d'un agent. */
+const AGENT_OVER = new Set<AgentEvent["status"]>(["Completed", "Failed", "Stopped"]);
+
 const INTERRUPTED_TEXT = "Interrupted · What should Claude do instead?";
 
 export class SessionStore {
@@ -110,6 +124,7 @@ export class SessionStore {
   agents: AgentEvent[] = $state([]);
   question: Question | null = $state(null);
   meta: SessionMeta = $state({
+    cwd: null,
     version: null,
     model: null,
     sessionId: null,
@@ -247,6 +262,7 @@ export class SessionStore {
     switch (ev.kind) {
       case "starting":
         this.status = "Starting";
+        this.meta.cwd = ev.cwd;
         break;
       case "ready":
         this.meta.version = ev.version;
@@ -273,7 +289,7 @@ export class SessionStore {
         const row: Row =
           ev.origin === "Interrupted"
             ? { kind: "interrupted", id: this.#id("i", ev.seq), text: INTERRUPTED_TEXT }
-            : { kind: "user", id: this.#id("u", ev.seq), text: ev.text, origin: ev.origin };
+            : { kind: "user", id: this.#id("u", ev.seq), text: ev.text, origin: ev.origin, at: ev.t };
         if (ev.thread === "main") this.#append(row);
         else this.#threadRows(ev.thread).push(row);
         break;
@@ -288,6 +304,7 @@ export class SessionStore {
               block: key,
               text: "",
               done: false,
+              at: ev.t,
             });
             break;
           }
@@ -298,6 +315,7 @@ export class SessionStore {
             block: key,
             text: "",
             done: false,
+            at: ev.t,
           };
           this.#blockIndex.set(key, this.#append(this.live));
         } else if (ev.block.type === "ToolUse") {
@@ -308,6 +326,7 @@ export class SessionStore {
             name: ev.block.name,
             input: null,
             result: null,
+            at: ev.t,
           };
           if (ev.thread !== "main") {
             this.#threadRows(ev.thread).push(row);
@@ -344,10 +363,17 @@ export class SessionStore {
           const i = this.#blockIndex.get(key);
           const prev = i === undefined ? undefined : this.#current()[i];
           if (i !== undefined && prev && prev.kind === "assistant" && prev.block === key) {
-            this.#replace(i, { kind: "assistant", id: prev.id, block: key, text: ev.block.text, done: true });
+            this.#replace(i, { kind: "assistant", id: prev.id, block: key, text: ev.block.text, done: true, at: prev.at });
             this.#blockIndex.delete(key);
           } else if (ev.block.text.length > 0) {
-            this.#append({ kind: "assistant", id: this.#id("a", ev.seq), block: key, text: ev.block.text, done: true });
+            this.#append({
+              kind: "assistant",
+              id: this.#id("a", ev.seq),
+              block: key,
+              text: ev.block.text,
+              done: true,
+              at: ev.t,
+            });
           }
           if (this.live?.block === key) this.live = null;
         } else if (ev.block.type === "ToolUse") {
@@ -366,6 +392,7 @@ export class SessionStore {
                 name: ev.block.name,
                 input: ev.block.input,
                 result: null,
+                at: ev.t,
               }),
             );
           }
@@ -391,6 +418,7 @@ export class SessionStore {
         const { kind: _k, seq: _s, t: _t, session: _se, ...agent } = ev;
         const a = agent as AgentEvent;
         const k = this.agents.findIndex((x) => x.tool_use_id === a.tool_use_id);
+        const wasOver = k >= 0 && AGENT_OVER.has(this.agents[k].status);
         if (k >= 0) this.agents[k] = a;
         else this.agents.push(a);
         const i = this.byToolUse.get(a.tool_use_id);
@@ -404,6 +432,10 @@ export class SessionStore {
             a.tool_use_id,
             this.#append({ kind: "agent", id: this.#id("g", ev.seq), toolUseId: a.tool_use_id, agent: a }),
           );
+        }
+        // Agent d'arrière-plan qui finit : sa propre ligne, à la suite du fil (`06`).
+        if (a.background && AGENT_OVER.has(a.status) && !wasOver) {
+          this.#append({ kind: "agentDone", id: this.#id("d", ev.seq), toolUseId: a.tool_use_id, agent: a, at: ev.t });
         }
         break;
       }
@@ -428,6 +460,8 @@ export class SessionStore {
           isError: ev.is_error,
           durationMs: ev.duration_ms,
           result: ev.result,
+          at: ev.t,
+          waiting: this.agents.filter((x) => x.background && !AGENT_OVER.has(x.status)).length,
         });
         break;
       case "notice": {
@@ -453,7 +487,7 @@ export class SessionStore {
     const i = this.#blockIndex.get(live.block);
     const prev = i === undefined ? undefined : this.#current()[i];
     if (i !== undefined && prev?.kind === "assistant" && prev.block === live.block) {
-      this.#replace(i, { kind: "assistant", id: live.id, block: live.block, text: live.text, done: true });
+      this.#replace(i, { kind: "assistant", id: live.id, block: live.block, text: live.text, done: true, at: live.at });
       this.#blockIndex.delete(live.block);
     }
     this.live = null;
@@ -471,7 +505,14 @@ export class SessionStore {
         r.text = ev.block.text;
         r.done = true;
       } else {
-        rows.push({ kind: "assistant", id: this.#id("a", ev.seq), block: key, text: ev.block.text, done: true });
+        rows.push({
+          kind: "assistant",
+          id: this.#id("a", ev.seq),
+          block: key,
+          text: ev.block.text,
+          done: true,
+          at: ev.t,
+        });
       }
     } else if (ev.block.type === "ToolUse") {
       const id = ev.block.tool_use_id;
@@ -485,6 +526,7 @@ export class SessionStore {
           name: ev.block.name,
           input: ev.block.input,
           result: null,
+          at: ev.t,
         });
     }
   }

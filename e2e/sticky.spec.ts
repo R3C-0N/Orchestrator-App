@@ -16,7 +16,8 @@ async function open(page: Page, rows: number) {
   await page.goto(`/?mock=long&rows=${rows}&rate=400`);
   await expect.poll(() => orch(page)).toBe(true);
   await page.waitForFunction(
-    (n) => (window as unknown as { __orch: Orch }).__orch.store.rows.length === n,
+    // J5 : les agents d'arrière-plan ajoutent leur ligne de fin, d'où « ≥ ».
+    (n) => (window as unknown as { __orch: Orch }).__orch.store.rows.length >= n,
     rows,
   );
 }

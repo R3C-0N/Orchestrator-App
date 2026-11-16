@@ -1,3 +1,23 @@
+/* Police du terminal de référence (Windows Terminal, Cascadia Mono 12 pt),
+   embarquée pour un rendu identique sur toute machine (licence OFL :
+   src/assets/fonts/CascadiaMono-LICENSE.txt). Police variable (graisse
+   200 à 700). Les glyphes absents (⎿, ✻, ✽…) passent par la police de
+   secours du système, comme dans le terminal. */
+@font-face {
+  font-family: "Cascadia Mono";
+  src: url("./assets/fonts/CascadiaMono.woff2") format("woff2");
+  font-weight: 200 700;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "Cascadia Mono";
+  src: url("./assets/fonts/CascadiaMonoItalic.woff2") format("woff2");
+  font-weight: 200 700;
+  font-style: italic;
+  font-display: block;
+}
+
 :root {
   --bg: #18181b;
   --fg: #e4e4e7;
@@ -6,6 +26,25 @@
   --warn: #e5c07b;
   --error: #e06c75;
   --line: #2e2e33;
+
+  /* Terminal de référence : TUI 2.1.325, thème dark, jeu Campbell (J1).
+     Valeurs relevées sur les pixels des captures ; voir render/colors.ts. */
+  --t-bg: #0c0c0c;
+  --t-fg: #cccccc;
+  --t-bold: #f2f2f2;
+  --t-white: #ffffff;
+  --t-dim: #999999;
+  --t-band: #373737;
+  --t-lavender: #b1b9f9;
+  --t-ok: #4eba65;
+  --t-error: #ff6b80;
+  --t-spinner: #d77757;
+  --t-spinner-text: #df8666;
+  --t-rule: #888888;
+  --t-rule-detail: #666666;
+  /* Grille : une ligne de texte par ligne de grille. */
+  --t-font-size: 16px;
+  --t-lh: 19px;
   color-scheme: dark;
 }
 
@@ -17,7 +56,7 @@ html,
 body {
   margin: 0;
   height: 100%;
-  background: var(--bg);
+  background: var(--t-bg);
   color: var(--fg);
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 14px;
@@ -25,4 +64,211 @@ body {
 
 #app {
   height: 100%;
+}
+
+/* ---- Conversation « terminal » (plan 1.7) ------------------------------ */
+
+.term {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: var(--t-font-size);
+  line-height: var(--t-lh);
+  color: var(--t-fg);
+  background: var(--t-bg);
+  font-variant-ligatures: none;
+  font-feature-settings: "calt" 0;
+}
+
+/* Une ligne : colonne du glyphe (2 colonnes), puis le texte. */
+.term .l {
+  display: grid;
+  grid-template-columns: 2ch minmax(0, 1fr);
+}
+/* Ligne de résultat : « ⎿ » en colonne 2, texte en colonne 5. */
+.term .r {
+  display: grid;
+  grid-template-columns: 2ch 3ch minmax(0, 1fr);
+}
+.term .r > .g {
+  grid-column: 2;
+  color: var(--t-dim);
+}
+.term .r > .x {
+  grid-column: 3;
+}
+/* Suite d'une ligne de résultat (« 2 » à « 5 » sous « ⎿  1 », `03b`). */
+.term .rc {
+  padding-left: 5ch;
+}
+.term .x {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+/* Glyphe isolé dans sa cellule : les glyphes de la police de secours
+   (⎿, ✻, ✽) ne décalent pas la grille. */
+.term .g {
+  display: inline-block;
+  width: 1ch;
+  text-align: center;
+  overflow: visible;
+  white-space: pre;
+}
+.term .dim {
+  color: var(--t-dim);
+}
+.term .b {
+  font-weight: bold;
+  color: var(--t-bold);
+}
+.term .ok {
+  color: var(--t-ok);
+}
+.term .err {
+  color: var(--t-error);
+}
+.term .white {
+  color: var(--t-white);
+}
+.term .link {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+/* ---- Markdown ---------------------------------------------------------- */
+
+.md > * + *,
+.md > * + .md-pre,
+.md > * + .md-table {
+  margin-top: var(--t-lh);
+}
+.md-h,
+.md b {
+  font-weight: bold;
+  color: var(--t-bold);
+}
+.md-p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.md-code {
+  color: var(--t-lavender);
+}
+.md-link {
+  color: var(--t-lavender);
+}
+.md-li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+.md-mark {
+  white-space: pre;
+}
+.md-lic > * + * {
+  margin-top: 0;
+}
+.md-pre,
+.md-table {
+  /* Marge haute : règle `.md > * + .md-pre` (une ligne entre blocs). */
+  margin: 0;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.md-table {
+  white-space: pre;
+  overflow-x: auto;
+}
+.md-quote {
+  color: var(--t-dim);
+  font-style: italic;
+  border-left: 1ch solid transparent;
+  box-shadow: inset 2px 0 0 var(--t-dim);
+  padding-left: 1ch;
+}
+.md-hr {
+  color: var(--t-dim);
+  overflow: hidden;
+  white-space: pre;
+}
+
+/* Message utilisateur : texte blanc gras (`02`). */
+.user-band .md,
+.user-band .md b,
+.user-band .md-h {
+  color: var(--t-white);
+  font-weight: bold;
+}
+.user-band .md-code,
+.user-band .md-link {
+  color: var(--t-lavender);
+}
+
+/* ---- Coloration : blocs de code (ANSI Campbell, `02`) -------------------- */
+
+.hl-ansi .hljs-keyword,
+.hl-ansi .hljs-literal,
+.hl-ansi .hljs-selector-tag {
+  color: #0037da;
+}
+.hl-ansi .hljs-title,
+.hl-ansi .hljs-title.function_,
+.hl-ansi .hljs-title.class_,
+.hl-ansi .hljs-section {
+  color: #c19c00;
+}
+.hl-ansi .hljs-string,
+.hl-ansi .hljs-regexp,
+.hl-ansi .hljs-char {
+  color: #c50f1f;
+}
+.hl-ansi .hljs-built_in,
+.hl-ansi .hljs-type,
+.hl-ansi .hljs-attr,
+.hl-ansi .hljs-attribute {
+  color: #3a96dd;
+}
+.hl-ansi .hljs-number {
+  color: #13a10e;
+}
+.hl-ansi .hljs-comment,
+.hl-ansi .hljs-quote {
+  color: #767676;
+}
+.hl-ansi .hljs-meta,
+.hl-ansi .hljs-variable.language_ {
+  color: #881798;
+}
+.hl-ansi .hljs-subst {
+  color: var(--t-fg);
+}
+
+/* ---- Coloration : diffs (couleurs vraies, `04`) ------------------------- */
+
+.hl-diff {
+  color: #f8f8f2;
+}
+.hl-diff .hljs-keyword,
+.hl-diff .hljs-selector-tag {
+  color: #f92672;
+}
+.hl-diff .hljs-string,
+.hl-diff .hljs-regexp {
+  color: #e6db74;
+}
+.hl-diff .hljs-number,
+.hl-diff .hljs-literal {
+  color: #be84ff;
+}
+.hl-diff .hljs-title,
+.hl-diff .hljs-title.function_,
+.hl-diff .hljs-attr {
+  color: #a6e22e;
+}
+.hl-diff .hljs-built_in,
+.hl-diff .hljs-type {
+  color: #66d9ef;
+}
+.hl-diff .hljs-comment,
+.hl-diff .hljs-meta {
+  color: #75715e;
 }
