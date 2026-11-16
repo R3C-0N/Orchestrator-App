@@ -65,7 +65,8 @@ export type Row =
   | NoticeRow
   | InterruptedRow;
 
-export type Notice = { level: NoticeLevel; code: string; message: string; seq: number };
+/** `id` : unique dans la session (clé d'affichage), `seq` : événement source ou -1. */
+export type Notice = { id: number; level: NoticeLevel; code: string; message: string; seq: number };
 export type Question = {
   requestId: string;
   toolUseId: string | null;
@@ -123,6 +124,8 @@ export class SessionStore {
   /** Dernier `seq` appliqué (détection de trou). */
   lastSeq = $state(-1);
   gaps = $state(0);
+  /** Événements rejetés parce que leur application a levé une exception. */
+  failed = $state(0);
 
   /** Fils des sous-agents (non réactifs : bonus du panneau, J7). */
   readonly threads = new Map<string, Row[]>();
@@ -131,8 +134,8 @@ export class SessionStore {
   /** `tool_use_id` → index dans `rows` (outil ou appel Agent). */
   readonly byToolUse = new Map<string, number>();
 
-  /** Appelé après chaque application, avec le plus grand `t` de `text_delta` du lot. */
-  onApplied: ((info: { lastDeltaT: number | null; count: number }) => void) | null = null;
+  /** Appelé après chaque application, avec le `t` de chaque `text_delta` du fil principal. */
+  onApplied: ((info: { deltaTs: number[]; count: number }) => void) | null = null;
 
   #queue: CoreEvent[] = [];
   #scheduled = false;
@@ -142,6 +145,7 @@ export class SessionStore {
   /** Copie de travail de `rows` pendant une application (copie paresseuse). */
   #next: Row[] | null = null;
   #idn = 0;
+  #noticeId = 0;
 
   constructor(schedule: FrameScheduler = defaultScheduler) {
     this.#schedule = schedule;
@@ -165,23 +169,39 @@ export class SessionStore {
     this.apply(q);
   };
 
-  /** Applique des événements tout de suite. */
+  /**
+   * Applique des événements tout de suite. Un événement qui lève une
+   * exception est compté (`failed`) et ignoré ; les autres du lot sont
+   * appliqués et la copie de travail est toujours publiée, pour que
+   * `byToolUse` et les index de blocs restent alignés sur `rows`.
+   */
   apply(events: CoreEvent[]): void {
-    let lastDeltaT: number | null = null;
+    const deltaTs: number[] = [];
     this.#next = null;
-    for (const ev of events) {
-      if (this.lastSeq >= 0 && ev.seq !== this.lastSeq + 1) this.gaps++;
-      this.lastSeq = ev.seq;
-      if (ev.kind === "text_delta" && ev.thread === "main") {
-        lastDeltaT = lastDeltaT === null ? ev.t : Math.max(lastDeltaT, ev.t);
+    try {
+      for (const ev of events) {
+        if (this.lastSeq >= 0 && ev.seq !== this.lastSeq + 1) this.gaps++;
+        this.lastSeq = ev.seq;
+        if (ev.kind === "text_delta" && ev.thread === "main") deltaTs.push(ev.t);
+        try {
+          this.#reduce(ev);
+        } catch (err) {
+          this.failed++;
+          console.error("événement rejeté", ev.kind, ev.seq, err);
+        }
       }
-      this.#reduce(ev);
+    } finally {
+      if (this.#next) {
+        this.rows = this.#next;
+        this.#next = null;
+      }
     }
-    if (this.#next) {
-      this.rows = this.#next;
-      this.#next = null;
-    }
-    this.onApplied?.({ lastDeltaT, count: events.length });
+    this.onApplied?.({ deltaTs, count: events.length });
+  }
+
+  /** Bandeau en tête de la conversation (erreur locale de l'interface, par exemple). */
+  addBanner(level: NoticeLevel, code: string, message: string, seq = -1): void {
+    this.banners.push({ id: this.#noticeId++, level, code, message, seq });
   }
 
   /** Nombre d'événements en attente de la prochaine image. */
@@ -323,7 +343,7 @@ export class SessionStore {
           // Le message complet fait foi et remplace le texte accumulé.
           const i = this.#blockIndex.get(key);
           const prev = i === undefined ? undefined : this.#current()[i];
-          if (i !== undefined && prev && prev.kind === "assistant") {
+          if (i !== undefined && prev && prev.kind === "assistant" && prev.block === key) {
             this.#replace(i, { kind: "assistant", id: prev.id, block: key, text: ev.block.text, done: true });
             this.#blockIndex.delete(key);
           } else if (ev.block.text.length > 0) {
@@ -334,7 +354,7 @@ export class SessionStore {
           const id = ev.block.tool_use_id;
           const i = this.byToolUse.get(id);
           const prev = i === undefined ? undefined : this.#current()[i];
-          if (i !== undefined && prev && prev.kind === "tool") {
+          if (i !== undefined && prev && prev.kind === "tool" && prev.toolUseId === id) {
             this.#replace(i, { ...prev, name: ev.block.name, input: ev.block.input });
           } else if (i === undefined) {
             this.byToolUse.set(
@@ -362,7 +382,9 @@ export class SessionStore {
         }
         const i = this.byToolUse.get(ev.tool_use_id);
         const prev = i === undefined ? undefined : this.#current()[i];
-        if (i !== undefined && prev && prev.kind === "tool") this.#replace(i, { ...prev, result });
+        if (i !== undefined && prev && prev.kind === "tool" && prev.toolUseId === ev.tool_use_id) {
+          this.#replace(i, { ...prev, result });
+        }
         break;
       }
       case "agent": {
@@ -373,7 +395,9 @@ export class SessionStore {
         else this.agents.push(a);
         const i = this.byToolUse.get(a.tool_use_id);
         const prev = i === undefined ? undefined : this.#current()[i];
-        if (i !== undefined && prev) {
+        // L'appel Agent (ligne `tool` puis `agent`) devient une ligne `agent` ;
+        // jamais une autre ligne, même si l'index était faux.
+        if (i !== undefined && prev && (prev.kind === "tool" || prev.kind === "agent") && prev.toolUseId === a.tool_use_id) {
           this.#replace(i, { kind: "agent", id: prev.id, toolUseId: a.tool_use_id, agent: a });
         } else if (i === undefined) {
           this.byToolUse.set(
@@ -407,9 +431,9 @@ export class SessionStore {
         });
         break;
       case "notice": {
-        const n: Notice = { level: ev.level, code: ev.code, message: ev.message, seq: ev.seq };
-        if (ev.level === "Info") this.infos.push(n);
-        else this.banners.push(n);
+        if (ev.level === "Info") {
+          this.infos.push({ id: this.#noticeId++, level: ev.level, code: ev.code, message: ev.message, seq: ev.seq });
+        } else this.addBanner(ev.level, ev.code, ev.message, ev.seq);
         break;
       }
       case "rate_limit":
@@ -418,12 +442,7 @@ export class SessionStore {
       case "exited":
         this.#closeLive();
         this.status = "Exited";
-        this.banners.push({
-          level: "Error",
-          code: "exited",
-          message: `claude.exe s'est arrêté (code ${ev.code ?? "?"})`,
-          seq: ev.seq,
-        });
+        this.addBanner("Error", "exited", `claude.exe s'est arrêté (code ${ev.code ?? "?"})`, ev.seq);
         break;
     }
   }
@@ -432,7 +451,8 @@ export class SessionStore {
     const live = this.live;
     if (!live) return;
     const i = this.#blockIndex.get(live.block);
-    if (i !== undefined) {
+    const prev = i === undefined ? undefined : this.#current()[i];
+    if (i !== undefined && prev?.kind === "assistant" && prev.block === live.block) {
       this.#replace(i, { kind: "assistant", id: live.id, block: live.block, text: live.text, done: true });
       this.#blockIndex.delete(live.block);
     }

@@ -8,6 +8,7 @@
   //   il revient dès qu'il redescend au bas.
   // - Rendu provisoire « terminal » (texte mono, puce ●) ; le rendu fidèle
   //   des lignes est le jalon J5.
+  import { tick } from "svelte";
   import { VList } from "virtua/svelte";
   import type { Row, SessionStore } from "../state/session.svelte";
 
@@ -31,10 +32,25 @@
     intentUntil = performance.now() + ms;
   }
 
-  function onwheel(e: WheelEvent) {
+  /** Vrai si le contenu dépasse la vue : un geste vers le haut peut alors l'éloigner du bas. */
+  function canScroll(): boolean {
+    return !!list && list.getScrollSize() - list.getViewportSize() > BOTTOM_EPS;
+  }
+
+  /**
+   * Geste vers le haut : décroche tout de suite (sans attendre l'événement
+   * scroll, qu'une croissance de la ligne vivante pourrait devancer), mais
+   * seulement s'il y a de quoi défiler. Sinon aucun `scroll` ne suivrait et
+   * le collage ne reviendrait jamais.
+   */
+  function gestureUp() {
     markIntent();
-    // Remonter à la molette décroche immédiatement, sans attendre l'événement scroll.
-    if (e.deltaY < 0) sticky = false;
+    if (canScroll()) sticky = false;
+  }
+
+  function onwheel(e: WheelEvent) {
+    if (e.deltaY < 0) gestureUp();
+    else markIntent();
   }
 
   function onkeydown(e: KeyboardEvent) {
@@ -45,8 +61,8 @@
       e.preventDefault();
       scrollToBottom();
     } else if (["PageUp", "PageDown", "ArrowUp", "ArrowDown"].includes(e.key)) {
-      markIntent();
-      if (e.key === "PageUp" || e.key === "ArrowUp") sticky = false;
+      if (e.key === "PageUp" || e.key === "ArrowUp") gestureUp();
+      else markIntent();
     }
   }
 
@@ -73,9 +89,24 @@
    * « ResizeObserver loop completed with undelivered notifications »).
    */
   function followResize() {
-    if (!sticky) return;
+    if (!sticky) {
+      // Le contenu ne dépasse plus la vue (fenêtre agrandie, lignes repliées) :
+      // on est au bas sans qu'aucun `scroll` ne le dise ; reprendre le collage.
+      if (!pointerDown && performance.now() >= intentUntil && distanceFromBottom() <= BOTTOM_EPS) sticky = true;
+      return;
+    }
     const el = root?.querySelector<HTMLElement>(".vlist");
-    if (el && el.scrollHeight - el.clientHeight - el.scrollTop > 0.5) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const toBottom = () => {
+      if (sticky && el.scrollHeight - el.clientHeight - el.scrollTop > 0.5) el.scrollTop = el.scrollHeight;
+    };
+    toBottom();
+    // virtua applique la nouvelle hauteur totale au prochain rendu Svelte
+    // (microtâche) : on recommence après, toujours avant la peinture.
+    tick().then(toBottom);
+    // Les lignes montées pendant ce rappel ne sont mesurées par virtua qu'à
+    // l'image suivante : dernière correction à ce moment-là (écart borné à une image).
+    requestAnimationFrame(toBottom);
   }
 
   export function scrollToTop() {
@@ -108,11 +139,13 @@
     el.addEventListener("keydown", onkeydown);
     el.addEventListener("pointerdown", down);
     window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
     return () => {
       el.removeEventListener("wheel", onwheel);
       el.removeEventListener("keydown", onkeydown);
       el.removeEventListener("pointerdown", down);
       window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
     };
   }
 

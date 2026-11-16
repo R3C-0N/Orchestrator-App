@@ -1,3 +1,4 @@
+/// <reference types="node" />
 // Mesures du jalon J3 (plan 1.11) sur 3 000 lignes simulées :
 // cadence du scroll, collage en bas, absence de saut en lecture, image max
 // pendant le streaming, latence d'un token, saut en haut / en bas, ajout
@@ -22,38 +23,63 @@ type Orch = {
 declare global {
   interface Window {
     __orch: Orch;
-    __frames: { start(): void; stop(): number[] };
+    __frames: { start(): void; stop(): Recording };
   }
 }
 
-/** Enregistreur d'images : durée entre deux `requestAnimationFrame`. */
+/**
+ * Enregistrement : durée entre deux `requestAnimationFrame`, plus le chemin
+ * parcouru (somme des |Δ scrollTop|) et les lignes réellement affichées
+ * (plus petit et plus grand `data-index` vus dans la vue).
+ */
+type Recording = { d: number[]; traveledPx: number; viewportPx: number; minIndex: number; maxIndex: number };
+
 function installFrameRecorder() {
   let run = false;
-  let d: number[] = [];
+  let rec: Recording = { d: [], traveledPx: 0, viewportPx: 0, minIndex: Infinity, maxIndex: -Infinity };
   window.__frames = {
     start() {
-      d = [];
+      rec = { d: [], traveledPx: 0, viewportPx: 0, minIndex: Infinity, maxIndex: -Infinity };
       run = true;
       let last = 0;
+      let lastTop: number | null = null;
       const loop = (t: number) => {
         if (!run) return;
-        if (last) d.push(t - last);
+        if (last) rec.d.push(t - last);
         last = t;
+        const el = document.querySelector<HTMLElement>(".vlist");
+        if (el) {
+          rec.viewportPx = el.clientHeight;
+          if (lastTop !== null) rec.traveledPx += Math.abs(el.scrollTop - lastTop);
+          lastTop = el.scrollTop;
+          const vp = el.getBoundingClientRect();
+          for (const r of el.querySelectorAll<HTMLElement>("[data-index]")) {
+            const b = r.getBoundingClientRect();
+            if (b.bottom <= vp.top || b.top >= vp.bottom) continue;
+            const i = Number(r.dataset.index);
+            if (i < rec.minIndex) rec.minIndex = i;
+            if (i > rec.maxIndex) rec.maxIndex = i;
+          }
+        }
         requestAnimationFrame(loop);
       };
       requestAnimationFrame(loop);
     },
     stop() {
       run = false;
-      return d;
+      return rec;
     },
   };
 }
 
-function summarize(frames: number[]) {
+function summarize(rec: Recording) {
+  const frames = rec.d;
   const total = frames.reduce((a, b) => a + b, 0);
   const sorted = [...frames].sort((a, b) => a - b);
   return {
+    traveledPx: Math.round(rec.traveledPx),
+    viewports: +(rec.traveledPx / rec.viewportPx).toFixed(1),
+    rowsSpan: rec.maxIndex - rec.minIndex,
     frames: frames.length,
     seconds: +(total / 1000).toFixed(2),
     fps: +((frames.length * 1000) / total).toFixed(1),
@@ -108,13 +134,13 @@ async function dragScroll(page: Page, ms: number, pxPerSec: number) {
 async function wheelScroll(page: Page, ms: number) {
   const end = Date.now() + ms;
   let dir = -1;
-  let flip = Date.now() + 1000;
+  let flip = Date.now() + 2500;
   while (Date.now() < end) {
     await page.mouse.wheel(0, dir * 100);
     await page.waitForTimeout(8);
     if (Date.now() > flip) {
       dir = -dir;
-      flip = Date.now() + 1000;
+      flip = Date.now() + 2500;
     }
   }
 }
@@ -145,16 +171,20 @@ test("démarre collé en bas, liste virtualisée", async () => {
   expect(await page.locator("[data-row-kind]").count()).toBeLessThan(150);
 });
 
-test("scroll : ≥ 58 i/s et < 1 % d'images > 33 ms sur 10 s (glisser + molette)", async () => {
+test("scroll : ≥ 58 i/s et < 1 % d'images > 33 ms, 10 s au glisser puis 10 s à la molette", async () => {
   await page.evaluate(() => window.__frames.start());
-  await dragScroll(page, 5000, 3000);
+  await dragScroll(page, 10_000, 3000);
   const drag = summarize(await page.evaluate(() => window.__frames.stop()));
   await page.evaluate(() => window.__frames.start());
-  await wheelScroll(page, 5000);
+  await wheelScroll(page, 10_000);
   const wheel = summarize(await page.evaluate(() => window.__frames.stop()));
   report("scroll-glisser", drag);
   report("scroll-molette", wheel);
   for (const m of [drag, wheel]) {
+    // 10 s de défilement réel sur le contenu, pas une vue immobile.
+    expect(m.seconds).toBeGreaterThanOrEqual(9.9);
+    expect(m.viewports).toBeGreaterThanOrEqual(20);
+    expect(m.rowsSpan).toBeGreaterThanOrEqual(30);
     expect(m.fps).toBeGreaterThanOrEqual(58);
     expect(m.over33pct).toBeLessThan(1);
   }
@@ -276,14 +306,16 @@ test("streaming : reste collé en bas, puis ne saute pas pendant la lecture, pui
 test("streaming pendant le scroll : aucune image > 50 ms à 100 text_delta/s", async () => {
   await page.evaluate(() => window.__orch.mock.streamReply(Infinity));
   await page.evaluate(() => window.__frames.start());
-  await dragScroll(page, 3000, 3000);
-  await wheelScroll(page, 3000);
+  await dragScroll(page, 5000, 3000);
+  await wheelScroll(page, 5000);
   const m = summarize(await page.evaluate(() => window.__frames.stop()));
+  await page.evaluate(() => window.__orch.mock.stopStream());
   report("streaming-et-scroll", m);
+  expect(m.viewports).toBeGreaterThanOrEqual(10);
   expect(m.over50).toBe(0);
 });
 
-test("latence d'un token : p50 < 25 ms, p95 < 50 ms (t → peinture)", async () => {
+test("latence d'un token : p50 < 25 ms, p95 < 50 ms (t de chaque delta → peinture)", async () => {
   await page.evaluate(() => {
     window.__orch.conversation().scrollToBottom();
     window.__orch.mock.streamReply(Infinity);

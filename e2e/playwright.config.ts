@@ -1,3 +1,4 @@
+/// <reference types="node" />
 // Mesures de recette de l'interface (plan 1.10 point 6, 1.11) sur Vite en
 // mode simulé. Chromium (≈ moteur de WebView2). Un seul worker : les mesures
 // de cadence et de mémoire ne doivent pas se partager la machine.

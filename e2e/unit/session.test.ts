@@ -175,4 +175,75 @@ describe("SessionStore", () => {
     expect(s.rows.length).toBe(500);
     expect(s.status).toBe("Idle");
   });
+
+  it("B2 : deux bandeaux identiques ont des id distincts", () => {
+    const { s } = setup();
+    s.addBanner("Error", "send", "échec");
+    s.addBanner("Error", "send", "échec");
+    expect(new Set(s.banners.map((b) => b.id)).size).toBe(2);
+  });
+
+  it("B3 : un événement qui lève une exception est ignoré sans désaligner les index", () => {
+    const { s, ev } = setup();
+    const errors: unknown[] = [];
+    const orig = console.error;
+    console.error = (...a: unknown[]) => errors.push(a);
+    try {
+      s.apply(
+        ev(
+          { kind: "block_start", ...text("m1"), block: { type: "ToolUse", tool_use_id: "tu1", name: "Read" } },
+          // `content` invalide : l'application de cet événement lève une exception.
+          { kind: "tool_result", thread: "main", tool_use_id: "tu1", content: null as never, is_error: false, meta: null },
+          { kind: "user_message", thread: "main", uuid: null, text: "après", origin: "Typed" },
+          { kind: "tool_result", thread: "main", tool_use_id: "tu1", content: [{ type: "Text", text: "ok" }], is_error: false, meta: null },
+        ),
+      );
+    } finally {
+      console.error = orig;
+    }
+    expect(s.failed).toBe(1);
+    expect(errors).toHaveLength(1);
+    // Le lot est publié : les lignes créées avant et après l'erreur sont là.
+    expect(s.rows.map((r) => r.kind)).toEqual(["tool", "user"]);
+    expect(s.byToolUse.get("tu1")).toBe(0);
+    expect(s.rows[0]).toMatchObject({ kind: "tool", result: { text: "ok" } });
+  });
+
+  it("B3 : un événement agent n'écrase jamais une ligne d'un autre genre", () => {
+    const { s, ev } = setup();
+    s.apply(ev({ kind: "user_message", thread: "main", uuid: null, text: "u", origin: "Typed" }));
+    // Index corrompu volontairement : tu9 pointe sur la ligne utilisateur.
+    s.byToolUse.set("tu9", 0);
+    s.apply(
+      ev({
+        kind: "agent",
+        tool_use_id: "tu9",
+        task_id: null,
+        agent_type: "Explore",
+        color: null,
+        description: "d",
+        status: "Running",
+        background: true,
+        started_at: null,
+        ended_at: null,
+        last_tool: null,
+        tokens: null,
+        tool_uses: null,
+        summary: null,
+      }),
+    );
+    expect(s.rows[0]).toMatchObject({ kind: "user", text: "u" });
+  });
+
+  it("transmet le t de chaque text_delta du lot (latence par delta)", () => {
+    const { f, s } = setup();
+    let ts: number[] = [];
+    s.onApplied = (i) => (ts = i.deltaTs);
+    s.apply([
+      f.make({ kind: "block_start", ...text("m1"), block: { type: "Text" } }, 1),
+      f.make({ kind: "text_delta", ...text("m1"), text: "a" }, 10),
+      f.make({ kind: "text_delta", ...text("m1"), text: "b" }, 20),
+    ]);
+    expect(ts).toEqual([10, 20]);
+  });
 });

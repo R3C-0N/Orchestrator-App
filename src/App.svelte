@@ -11,11 +11,13 @@
     startSession,
     type SessionKey,
   } from "./lib/core/client";
-  import { MockCore, mockOptionsFromUrl } from "./lib/core/mock";
+  import type { MockCore } from "./lib/core/mock";
   import { SessionStore } from "./lib/state/session.svelte";
 
+  // Mode simulé : `?mock=…`, ou d'office hors de Tauri. `mock.ts` n'est
+  // chargé qu'à ce moment (import dynamique, hors du bundle principal).
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-  const mockOpts = mockOptionsFromUrl(location.search) ?? (inTauri ? null : { name: "demo", rows: 60 });
+  const mockMode = new URLSearchParams(location.search).has("mock") || !inTauri;
 
   const store = new SessionStore();
   let mock: MockCore | null = null;
@@ -27,24 +29,24 @@
   let input = $state("");
   let inputEl: HTMLInputElement | undefined = $state();
 
-  // Latence d'un token : de `t` (lecture de la ligne) à la peinture. Le
-  // message posté depuis l'image où le lot est appliqué s'exécute après
-  // la peinture de cette image.
+  // Latence d'un token : de `t` (lecture de la ligne) à la peinture, pour
+  // chaque `text_delta`. Le message posté depuis l'image où le lot est
+  // appliqué s'exécute après la peinture de cette image.
   const latencies: number[] = [];
   let p50 = $state("–");
   let p95 = $state("–");
   const afterPaint = new MessageChannel();
-  const paintQueue: number[] = [];
   afterPaint.port1.onmessage = () => {
     const now = performance.timeOrigin + performance.now();
-    const t = paintQueue.shift();
-    if (t === undefined) return;
-    latencies.push(now - t);
-    if (latencies.length > 2000) latencies.splice(0, latencies.length - 2000);
+    const ts = paintQueue.shift();
+    if (ts === undefined) return;
+    for (const t of ts) latencies.push(now - t);
+    if (latencies.length > 5000) latencies.splice(0, latencies.length - 5000);
   };
-  store.onApplied = ({ lastDeltaT }) => {
-    if (lastDeltaT === null) return;
-    paintQueue.push(lastDeltaT);
+  const paintQueue: number[][] = [];
+  store.onApplied = ({ deltaTs }) => {
+    if (deltaTs.length === 0) return;
+    paintQueue.push(deltaTs);
     afterPaint.port2.postMessage(0);
   };
 
@@ -63,7 +65,8 @@
     return () => clearInterval(id);
   });
 
-  const ready = $derived(mockOpts !== null || session !== null);
+  let mockReady = $state(false);
+  const ready = $derived(mockReady || session !== null);
 
   $effect(() => {
     if (ready) inputEl?.focus();
@@ -84,22 +87,29 @@
     try {
       await sendMessage(session, text);
     } catch (err) {
-      store.banners.push({ level: "Error", code: "send", message: describeError(err), seq: -1 });
+      store.addBanner("Error", "send", describeError(err));
     }
   }
 
+  async function startMock() {
+    const { MockCore, mockOptionsFromUrl } = await import("./lib/core/mock");
+    const opts = mockOptionsFromUrl(location.search) ?? { name: "demo", rows: 60 };
+    mock = new MockCore(opts);
+    cwd = `simulé : ${opts.name}`;
+    mock.start(store.push);
+    mockReady = true;
+    // Points d'accès des mesures e2e (mode simulé seulement).
+    (window as unknown as Record<string, unknown>).__orch = {
+      store,
+      mock,
+      conversation: () => conversation,
+      latencies,
+    };
+  }
+
   onMount(() => {
-    if (mockOpts) {
-      mock = new MockCore(mockOpts);
-      cwd = `simulé : ${mockOpts.name}`;
-      mock.start(store.push);
-      // Points d'accès des mesures e2e (mode simulé seulement).
-      (window as unknown as Record<string, unknown>).__orch = {
-        store,
-        mock,
-        conversation: () => conversation,
-        latencies,
-      };
+    if (mockMode) {
+      startMock().catch((err) => (startError = String(err)));
       return;
     }
     (async () => {
@@ -117,7 +127,7 @@
 </script>
 
 <main>
-  {#each store.banners as b (b.seq + b.code)}
+  {#each store.banners as b (b.id)}
     <div class="banner {b.level.toLowerCase()}">{b.message}</div>
   {/each}
   {#if startError}
