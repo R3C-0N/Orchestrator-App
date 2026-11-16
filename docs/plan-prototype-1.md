@@ -1,6 +1,6 @@
 # Plan d'implémentation : prototype 1 « utilisable au quotidien »
 
-Statut : plan révisé après les décisions 9 à 13 de la spec (reprise avec historique, captures par un agent, dossier de projet, version du CLI, raccourcis). La spec fait foi : `docs/spec.md` (décisions en section 2, protocole en section 4, périmètre en section 6). Ce plan ne redit pas le protocole : il renvoie aux sections de la spec et aux fixtures `fixtures/stream-json/t1` à `t12`.
+Statut : plan révisé après les décisions 9 à 13 de la spec, puis aligné sur le TUI réel capturé au jalon J1 (commit `64d6717`, section 1.7, `docs/reference-tui/README.md`) et sur le contrat tel que codé au jalon J0 (commit `90f7691`, section 1.5 : le code fait foi). La spec fait foi : `docs/spec.md` (décisions en section 2, protocole en section 4, périmètre en section 6). Ce plan ne redit pas le protocole : il renvoie aux sections de la spec et aux fixtures `fixtures/stream-json/t1` à `t12`.
 
 Vérifications faites sur la machine pour ce plan (lecture seule, 2026-11-16) :
 
@@ -21,7 +21,7 @@ orchestrator/
 ├─ docs/
 │  ├─ spec.md                      spécification (fait foi)
 │  ├─ plan-prototype-1.md          ce plan
-│  └─ reference-tui/               captures de référence du TUI (PNG) + README (scénario, taille, police)
+│  └─ reference-tui/               README : liste des captures du TUI, méthode, liste de contrôle (PNG locaux non versionnés)
 ├─ fixtures/
 │  ├─ stream-json/                 captures brutes du CLI (t1, t3..t12 existantes, + t13 Edit, t14 erreurs, t15 longue session)
 │  ├─ ui-events/                   événements normalisés générés par `replay` (entrée des tests de l'interface)
@@ -57,7 +57,7 @@ Zones indépendantes une fois le contrat figé (jalon J0) : `src-tauri/src/{proc
 
 | Élément | Version visée | Remarque |
 | - | - | - |
-| Rust | 1.94.1 (installé), édition 2021, `rust-toolchain.toml` épinglé | cible `x86_64-pc-windows-msvc` |
+| Rust | 1.94.1 (installé), édition 2021, `src-tauri/rust-toolchain.toml` épinglé | cible `x86_64-pc-windows-msvc` |
 | Tauri | 2.x, dernière mineure stable au jalon J0 ; `@tauri-apps/cli` et `@tauri-apps/api` de la même mineure | WebView2 fourni par Windows 11 |
 | Svelte | 5.x (runes), avec Vite et `@sveltejs/vite-plugin-svelte` ; **pas de SvelteKit** | une seule fenêtre, pas de routage |
 | Node | 24.4.1 (installé, LTS), pour le build seulement | `"engines"` dans `package.json` |
@@ -113,6 +113,7 @@ Principes :
 - Chaque événement porte `seq: u64` (ordre, détection de trou) et `t: u64` (ms depuis l'epoch à la lecture de la ligne, pour mesurer la latence).
 - Prototype 1 : une session à la fois (spec section 6), mais chaque commande et événement porte `session: SessionKey` (identifiant local à l'app) pour ne pas casser le contrat le jour où le multi-session arrivera.
 - Les noms ci-dessous sont en Rust (`snake_case`) ; ts-rs produit les types TS équivalents.
+- **Écarts de J0 intégrés** (le code de `src-tauri/src/api/` fait foi, il est testé) : `get_launch_info` remplace `get_launch_dir` ; `ExitInfo` porte `killed` ; l'événement `init` porte `version` ; `turn_result` porte `result` (texte final) ; le champ `kind` de `rate_limit` s'appelle `limit_kind` ; la notice de version a le code `unexpected_version` et vient du réducteur ; `skip_question` émet pour l'instant `question_closed { Answered }` ; `rust-toolchain.toml` est dans `src-tauri/`.
 
 #### Commandes Tauri
 
@@ -123,15 +124,15 @@ Principes :
 | `interrupt` | `(session, cancel_queued: bool) -> Result<InterruptAck, CoreError>` ; `InterruptAck { still_queued: Vec<String> }` | `control_request` `interrupt` (spec 4.5, `t6`) ; délai 5 s | `Timeout`, `NotRunning` |
 | `set_model` | `(session, model: String) -> Result<String, CoreError>` (modèle résolu, ex. `claude-sonnet-5-5`) | `control_request` `set_model` (`t5`) | `Timeout`, `Rejected(msg)` |
 | `answer_question` | `(session, request_id: String, answers: BTreeMap<String, Answer>, response: Option<String>) -> Result<(), CoreError>` ; `Answer = One(String) \| Many(Vec<String>)` | `control_response` `allow` + `updatedInput { questions, answers }` (`t4`) | `UnknownRequest` |
-| `skip_question` | `(session, request_id: String, reason: SkipReason) -> Result<(), CoreError>` ; `SkipReason = Skipped \| Dismissed` | `answers:{}` + `annotations[q].unanswered` (`t10`) ; refusé si la capacité manque | `Unsupported` |
+| `skip_question` | `(session, request_id: String, reason: SkipReason) -> Result<(), CoreError>` ; `SkipReason = Skipped \| Dismissed` | `answers:{}` + `annotations[q].unanswered` (`t10`) ; refusé si la capacité manque ; émet `question_closed { Answered }` dans le code de J0 (raison `Skipped` à ajouter en J8) | `Unsupported` |
 | `list_sessions` | `(cwd: String) -> Result<Vec<SessionSummary>, CoreError>` ; `SessionSummary { id, title: Option<String>, last_prompt: Option<String>, modified: u64, size_bytes: u64, entrypoint: Option<String> }` | aucun (lecture de fichiers, section 1.8) | `Io` |
 | `load_history` | `(session, session_id: String) -> Result<(), CoreError>` | aucun ; relit le transcript et pousse des `CoreEvent` marqués `history: true` dans le canal | `Io`, `TranscriptFormat` |
-| `stop_session` | `(session) -> Result<ExitInfo, CoreError>` | ferme stdin, attend 3 s, puis tue le Job Object | — |
-| `get_launch_dir` | `() -> Option<String>` : dossier passé en argument (`<app> .` → dossier courant, `<app> <chemin>`), résolu en chemin absolu | aucun (décision 11) | `BadCwd` si le dossier n'existe pas |
+| `stop_session` | `(session) -> Result<ExitInfo, CoreError>` ; `ExitInfo { code: Option<i32>, killed: bool }` (`killed` : tué par le Job Object faute de sortie dans le délai) | ferme stdin, attend 3 s, puis tue le Job Object | — |
+| `get_launch_info` | `() -> LaunchInfo` ; `LaunchInfo { cwd: String, claude_path: Option<String>, expected_version: String }` ; `cwd` = premier argument de l'app (`<app> .`, `<app> <chemin>`), sinon dossier courant dans le code de J0 | aucun (décision 11) | — |
 | `list_projects` | `() -> Result<Vec<ProjectSummary>, CoreError>` ; `ProjectSummary { encoded: String, path: Option<String>, exists: bool, last_used: u64, session_count: u32 }` | aucun ; lit `~/.claude/projects` (sections 1.8 et décision 11) | `Io` |
-| `get_diagnostics` | `() -> Diagnostics` (version CLI, chemin, capacités, chemin du journal, 50 dernières lignes de stderr) | aucun | — |
+| `get_diagnostics` | `() -> Diagnostics` ; `Diagnostics { claude_version, expected_version, claude_path, capabilities, log_path, stderr_tail }` ; J6 ajoute `unknown_count` et renseigne `log_path` | aucun | — |
 
-Ouvrir l'app = `get_launch_dir` ; s'il est vide, l'interface montre le sélecteur de `list_projects`, puis appelle `start_session` sur le dossier choisi. Reprendre une session = `stop_session` puis `start_session(cwd, Some(id), …)` puis `load_history`. Le cœur garde l'id local (`SessionKey`) inchangé côté interface.
+Ouvrir l'app = `get_launch_info` ; si aucun dossier n'a été passé en argument, l'interface montre le sélecteur de `list_projects`, puis appelle `start_session` sur le dossier choisi. Dans le code de J0, `cwd` retombe sur le dossier courant sans argument : J11 ajoute à `LaunchInfo` l'information « dossier passé en argument ou non » pour savoir quand ouvrir le sélecteur (décision 11). Reprendre une session = `stop_session` puis `start_session(cwd, Some(id), …)` puis `load_history`. Le cœur garde l'id local (`SessionKey`) inchangé côté interface.
 
 #### Événements `CoreEvent` (tag `kind`)
 
@@ -141,7 +142,7 @@ Ouvrir l'app = `get_launch_dir` ; s'il est vide, l'interface montre le sélecteu
 | - | - | - |
 | `starting` | `pid`, `cwd`, `args` | spawn |
 | `ready` | `version`, `capabilities`, `commands[] {name, description, argument_hint}`, `agents[]`, `models[] {value, resolved, display_name}`, `permission_mode` | réponse à `initialize` (`t11`) |
-| `init` | `session_id`, `model`, `permission_mode`, `capabilities`, `tools`, `mcp_servers[] {name, status}`, `skills`, `slash_commands` | `system/init`, à chaque tour : l'interface **fusionne**, elle ne réinitialise pas (spec 4.8) |
+| `init` | `session_id`, `version`, `model`, `permission_mode`, `capabilities`, `tools`, `mcp_servers[] {name, status}`, `skills`, `slash_commands` | `system/init`, à chaque tour : l'interface **fusionne**, elle ne réinitialise pas (spec 4.8) |
 | `status` | `state: Idle \| Requesting \| Streaming \| Interrupting \| Exited` | `system/status`, `stream_event`, `result`, sortie du processus |
 | `user_message` | `thread`, `uuid?`, `text`, `origin: Typed \| Replay \| Interrupted \| History` | stdin envoyé, `user` texte, « [Request interrupted by user] » |
 | `block_start` | `thread`, `msg`, `index`, `block: Text \| Thinking \| ToolUse { tool_use_id, name }` | `content_block_start` |
@@ -150,10 +151,10 @@ Ouvrir l'app = `get_launch_dir` ; s'il est vide, l'interface montre le sélecteu
 | `tool_result` | `thread`, `tool_use_id`, `content: Vec<ResultPart>`, `is_error`, `meta: Option<Value>` (`tool_use_result` brut) | `user` avec `tool_result` |
 | `agent` | `tool_use_id`, `task_id?`, `agent_type` (après `trim()`), `color`, `description`, `status: Starting \| Running \| Completed \| Failed \| Stopped`, `background`, `started_at`, `ended_at?`, `last_tool?`, `tokens?`, `tool_uses?`, `summary?` | `tool_use` Agent/Task, `task_started`, `task_progress`, `task_updated`, `task_notification`, `background_tasks_changed` |
 | `question` | `request_id`, `tool_use_id`, `questions[] {question, header, options[] {label, description}, multi_select}`, `can_skip` | `can_use_tool` `AskUserQuestion` |
-| `question_closed` | `request_id`, `reason: Answered \| Cancelled` | notre réponse ou `control_cancel_request` |
-| `turn_result` | `subtype`, `is_error`, `terminal_reason`, `duration_ms`, `cost_usd`, `num_turns`, `context_used?`, `context_window?`, `permission_denials` | `result` |
-| `rate_limit` | `status`, `resets_at`, `kind`, `utilization?` | `rate_limit_event` |
-| `notice` | `level: Info \| Warn \| Error`, `code`, `message`, `detail?` | version inattendue, échec de hook, JSON illisible, requête de contrôle en échec |
+| `question_closed` | `request_id`, `reason: Answered \| Cancelled` (J8 ajoute `Skipped`) | notre réponse ou `control_cancel_request` |
+| `turn_result` | `subtype`, `is_error`, `result` (texte final), `terminal_reason`, `duration_ms`, `cost_usd`, `num_turns`, `context_used?`, `context_window?`, `permission_denials` | `result` |
+| `rate_limit` | `status`, `resets_at`, `limit_kind`, `utilization?` | `rate_limit_event` |
+| `notice` | `level: Info \| Warn \| Error`, `code`, `message`, `detail?` | version inattendue (`unexpected_version`, émise par le réducteur, une fois, sur `ready` ou `init`), échec de hook, JSON illisible ou trop longue, requête de contrôle en échec |
 | `stderr` | `line` | stderr du processus |
 | `exited` | `code: Option<i32>`, `during_turn: bool`, `stderr_tail: Vec<String>` | fin du processus |
 
@@ -201,29 +202,33 @@ Row = User | AssistantText | ToolCall (+ résultat attaché) | AgentCall | TurnR
 
 ### 1.7 Règles de rendu « style terminal »
 
-**Référence de fidélité** : le TUI de Claude Code 2.1.325 dans Windows Terminal. Les captures sont faites **par un agent, par script**, puis validées par l'utilisateur (décision 10). Méthode détaillée au jalon J1 ; en résumé :
+**Référence de fidélité** : le TUI de Claude Code 2.1.325 dans Windows Terminal (120 × 40, Cascadia Mono 12 pt, jeu Campbell, thème `dark`, rendu `fullscreen`), capturé par script au jalon J1 (décision 10). La **vue normale** fait foi ; la vue détaillée (Ctrl+O) est reproduite aussi, au jalon J5. Liste des captures, emplacement local (non versionné), commande pour les refaire et liste de contrôle : `docs/reference-tui/README.md`. Chaque règle du tableau cite la capture qui la prouve (`NN-nom.txt` = transcription annotée des couleurs ; `NN-nom.uia.txt` = texte exact lu à l'écran).
 
-1. Windows Terminal, profil dédié : Cascadia Mono 12 pt, 120 colonnes × 40 lignes, thème sombre par défaut de Claude Code.
-2. Un script lance le TUI sur un scénario (mêmes scénarios que les fixtures, plus `t13` Edit et `t14` erreurs), attend l'état voulu, puis capture **la fenêtre seule** en PNG.
-3. Les 10 captures (liste au jalon J1) sont rangées dans `docs/reference-tui/NN-nom.png`, avec un `README.md` : scénario, version du CLI, statut de validation et liste de contrôle de chaque capture.
-4. La recette compare côte à côte la capture et l'app sur la même fixture rejouée (`npm run dev:mock`, même largeur en colonnes). Pas de comparaison pixel à pixel (polices et anticrénelage diffèrent) : une **liste de contrôle** par capture (glyphes, couleurs, retraits, troncatures).
+La recette compare côte à côte la capture et l'app sur la même situation, en 120 colonnes. Pas de comparaison pixel à pixel (polices et anticrénelage diffèrent) : on suit la liste de contrôle (glyphes, couleurs, retraits, regroupements).
 
-Règles, à confirmer contre les captures (les glyphes ci-dessous sont ceux que je connais du TUI, non vérifiés sur la 2.1.325) :
+| Élément | Rendu | Preuve |
+| - | - | - |
+| Grille | police mono, `line-height` fixe, largeur en colonnes (`ch`) ; fond `#0C0C0C` ; aucune bulle, carte ni ombre (décision 3) | toutes |
+| Message utilisateur | `❯` gris, puis texte **blanc gras sur une bande gris foncé** (≈ `#373737`) pleine largeur ; lignes suivantes en retrait de 2 ; le markdown du message est rendu | `02-markdown-code.txt` |
+| Texte de l'assistant | puce **`●` (U+25CF) blanche** en colonne 0, texte en retrait de 2 | `02-markdown-code.txt` |
+| Markdown | titres en gras blanc, **même taille**, sans `#` ; listes `-` et `1.` telles quelles ; gras, italique ; code en ligne **bleu lavande** (≈ `#B1B9F9`), sans fond ; blocs de code **sans cadre ni fond**, retrait de 2, colorés (mots-clés bleus, fonctions jaunes, chaînes rouges, nombres verts) | `02-markdown-code.txt` |
+| Fin de tour | « ✻ <Verbe> for <durée> · done <HH:MM> » en gris (verbe tiré au hasard : Crunched, Worked, Churned…) | `02-markdown-code.txt`, `06-agents-termines.txt` |
+| Indicateur pendant le tour | « <glyphe animé> <Verbe>… (<durée> · ↓ <N> tokens) » au-dessus de la saisie (glyphe observé : `✽`, il change pendant l'animation) | `k1-tour-en-cours-saisie-vide.txt` |
+| Appels d'outils, vue normale | les appels de lecture, de recherche et de commande sont **regroupés en une ligne grise**, en retrait de 2, sans puce ni résultat : « Read 1 file, ran 1 shell command », « Searched for 1 pattern, read 1 file », « Ran 2 shell commands » ; une commande en cours s'affiche avec son libellé et sa durée (« Running ping for 90 requests to localhost · 3s ») puis `  ⎿  $ <commande>` | `03-outils-tronque.txt`, `04-edit-diff.txt`, `09-erreurs.txt`, `k1-tour-en-cours-saisie-vide.txt` |
+| Appels qui restent sur leur ligne | Edit et Write : puce `●` **verte** + « Update(<chemin relatif>) », « Update » en gras ; puce **rouge** (≈ `#FF6B80`) en erreur | `04-edit-diff.txt`, `09-erreurs.txt` |
+| Ligne de résultat | `  ⎿  ` (2 espaces, `⎿`, 2 espaces) en gris, puis le résumé | `04-edit-diff.txt`, `08-interruption.txt` |
+| Vue détaillée (Ctrl+O) | bascule toute la conversation : un appel par ligne (`● Bash(commande)`, chemin absolu pour Update), sortie complète sous `⎿`, raison d'autorisation, heure et modèle alignés à droite avant chaque réponse, barre du bas « Showing detailed transcript · ctrl+o to toggle · … » ; Ctrl+O revient à la vue normale | `03b-outils-detail-ctrl-o.txt`, `09b-erreurs-detail-ctrl-o.txt` |
+| Diff d'`Edit` | « ⎿  Added N lines, removed M lines » (nombres en gras) ; numéros alignés à droite sur 6 colonnes, puis espace, `-` ou `+` ; suppressions sur fond rouge sombre, **numérotées dans l'ancien fichier** ; ajouts sur fond vert sombre, **numérotés dans le nouveau** ; 3 lignes de contexte avant et après, en coloration syntaxique ; calcul depuis `old_string`/`new_string` (forme de `tool_use_result` dans `t13`) | `04-edit-diff.txt` |
+| Thinking | blocs vides (signature seule, spec 4.8) : **rien** dans le fil | — |
+| Erreurs | outil sur sa ligne : `●` rouge, « ⎿  Error editing file » en rouge ; en vue normale, les Bash en erreur restent dans la ligne regroupée ; en vue détaillée, « ⎿  Error: Exit code N » et le stderr en rouge ; `notice` Warn/Error de l'app : bandeau en tête de la conversation | `09-erreurs.txt`, `09b-erreurs-detail-ctrl-o.txt` |
+| Interruption | « No result recorded for N call », « ⎿  $ <commande> », « ⎿  Interrupted · What should Claude do instead? », **en gris**, pas en rouge ; même rendu par Échap et par Ctrl+C | `08-interruption.txt`, `c4-ctrlc-saisie-non-vide-pendant-tour.txt`, `k2-ctrlc-saisie-vide-pendant-tour.txt` |
+| Sous-agents (fil principal) | « ● N background agents launched (↓ to manage) » (puce verte), puis une sous-ligne par agent, `├` / `└` gris en retrait de 3, **nom sur fond de sa couleur** (texte noir), « (description) » en blanc ; « ✻ Waiting for N background agents to finish » ; au retour, « › Message from @<agent> (ctrl+o to expand) » gris et « ● Agent "<description>" finished · <durée> » ; **pas** de « Done (N tool uses…) » | `05-agents-en-cours.txt`, `06-agents-termines.txt` |
+| Panneau des agents | dans le TUI, sous la ligne d'état : « ● main » en gras, puis « ◯ <agent>  <description> … <durée> · ↓ <tokens> tokens » en gris, durée vivante ; il disparaît quand tout est fini. Dans l'app, la **colonne de droite** (décision 4) reprend ce style, avec la couleur de l'agent (`trim()` U+00A0) et `last_tool` en plus ; agent inconnu en gris ; bonus : clic → fil de l'agent | `05-agents-en-cours.txt`, `06-agents-termines.txt` |
+| Carte `AskUserQuestion` | **pas d'encadré** : règle `─` grise, pastille « ☐ <header> » (texte noir sur bleu lavande), question en gras, options `❯ 1. <label>` (sélection en bleu lavande, autres en blanc) avec description grise en retrait de 5, puis « N. Type something. » (réponse libre), règle, « N+1. Chat about this » ; pied gris « Enter to select · ↑/↓ to navigate · Esc to cancel » ; la carte prend la place de la saisie | `07-question.txt` |
+| Saisie | `❯` entre deux règles `─` grises pleine largeur, collée en bas ; indication « Esc again to clear » à droite au-dessus de la saisie après un premier Échap | `01-accueil.txt`, `e1-echap-saisie-non-vide.txt` |
+| Menu `/` (palette) | **au-dessus** de la saisie, sans cadre ; entrée choisie `❯ /nom` et sa description en bleu lavande, autres en gris ; descriptions alignées en colonne, repliées puis tronquées par `…` | `10-menu-slash.txt` |
 
-| Élément | Rendu |
-| - | - |
-| Grille | police mono, `line-height` fixe, largeur en colonnes (`ch`) ; aucune bulle, carte ni ombre (décision 3) |
-| Message utilisateur | `> ` puis le texte, fond gris discret sur toute la ligne |
-| Texte de l'assistant | puce `⏺` blanche en colonne 0, texte retrait de 2 colonnes ; markdown rendu « terminal » : gras, italique, titres en gras sans taille différente, listes `-`/`1.`, code en ligne coloré, blocs de code colorés sans cadre |
-| Appel d'outil | `⏺ Nom(argument principal)` : `Bash(commande)`, `Read(chemin)`, `Update(chemin)` pour Edit, `Write(chemin)`, `Search(motif)` ; puce verte quand terminé, clignotante pendant l'exécution, rouge en erreur |
-| Résultat d'outil | ligne suivante `  ⎿  ` puis le résumé ; sortie longue tronquée à quelques lignes avec `… +N lines` (dépliable au clic, là où le TUI demande Ctrl+O) |
-| Diff d'`Edit` | `⎿  Updated <chemin> with N additions and M removals`, puis lignes numérotées, ajouts sur fond vert, suppressions sur fond rouge, 3 lignes de contexte ; calcul depuis `old_string`/`new_string` (le format de `tool_use_result` d'Edit sera lu dans `t13`) |
-| Thinking | blocs vides (signature seule, spec 4.8) : **rien** dans le fil ; pendant la réflexion, indicateur `✻ Thinking…` dans la ligne d'état (alimenté par `system/thinking_tokens`) |
-| Indicateur d'activité | ligne au-dessus de la saisie : glyphe animé, verbe, durée, tokens, « esc to interrupt » |
-| Erreurs | `tool_result` `is_error` : puce rouge, message en rouge sous `⎿` ; `result` en erreur : ligne rouge ; interruption : `⎿  Interrupted by user` en rouge ; `notice` Warn/Error : bandeau en tête de la conversation |
-| Sous-agent (fil principal) | `⏺ <agent-type>(description)` dans la couleur de l'agent, puis `⎿  ` outil en cours ou `Done (N tool uses · X tokens · Ys)` |
-| Colonne des agents | une ligne par agent : pastille et nom en couleur (décision 4, `trim()` U+00A0), état, durée vivante, `last_tool` ; agent inconnu = gris neutre ; bonus : clic → fil de l'agent avec les mêmes règles de rendu |
-| Carte `AskUserQuestion` | encadré en caractères de boîte (`╭─╮`), `header`, question, options numérotées avec `❯` sur la sélection, ↑↓/Entrée/1-4, ligne « Autre réponse » ; Échap = ignorer si `can_skip`, sinon sans effet (la carte reste, décision 13) |
+Hors référence : la ligne d'état personnalisée du poste de capture (emojis, `statusLine`), le chemin du projet sous le logo et « ⏵⏵ auto mode on » (les captures tournaient en mode `auto`). Le menu Rewind (`k3-echap-echap-saisie-vide-apres-tour.txt`) est hors du prototype 1.
 
 Rendu en flux : pendant le streaming, la ligne `live` réanalyse son markdown au plus 10 fois par seconde (texte brut ajouté entre deux analyses) ; au `block_done`, analyse finale puis HTML mis en cache par `(msg, index)`.
 
@@ -252,16 +257,16 @@ Règles (décisions 9 et 11 de la spec) :
 | - | - | - |
 | `claude.exe` introuvable | `locate.rs` : variable `ORCH_CLAUDE_PATH`, puis `%USERPROFILE%\.local\bin\claude.exe`, puis `PATH` | écran d'accueil avec le chemin cherché et un bouton « choisir l'exécutable » |
 | Échec de démarrage | erreur de spawn, ou sortie avant la réponse à `initialize`, ou pas de réponse en 20 s | `start_session` renvoie `SpawnFailed` avec les dernières lignes de stderr ; bouton « réessayer » |
-| Mort en cours de session | fin de stdout + `wait()` | `exited { code, during_turn, stderr_tail }` ; bandeau rouge, saisie désactivée, bouton « relancer » = `start_session` avec `--resume <session_id>` |
+| Mort en cours de session | `select!` sur `child.wait()` (et non la fin de stdout, qu'un enfant peut garder ouverte), puis `job.terminate()` (J6) | `exited { code, during_turn, stderr_tail }` ; bandeau rouge, saisie désactivée, bouton « relancer » = `start_session` avec `--resume <session_id>` |
 | Sortie non nulle | `code != 0` | idem, `notice` Error avec code ; code 0 après fermeture de stdin = arrêt normal, pas d'alerte |
 | stderr | lu en continu, ligne à ligne | 200 lignes en mémoire, toutes dans le journal ; `stderr` vers l'interface (panneau diagnostics), jamais dans le fil |
-| Ligne JSON illisible | `serde_json` échoue | ignorée, `notice` Warn (1 par minute au plus), ligne brute au journal |
-| Événement de type inconnu | variante `Unknown` (y compris sous-types `system/*` et types de blocs inconnus) | ignoré, compté, journalisé ; aucun `notice` (le flux en ajoute sans prévenir, décision 12) ; le compteur figure dans `get_diagnostics` |
+| Ligne JSON illisible ou trop longue | `serde_json` échoue, ou ligne au-delà du plafond de taille (J6) | ignorée, `notice` Warn (1 par minute au plus), ligne brute au journal |
+| Événement de type inconnu | variante `Unknown` (y compris sous-types `system/*` et types de blocs inconnus) | ignoré, compté, journalisé ; aucun `notice` (le flux en ajoute sans prévenir, décision 12) ; le compteur `unknown_count` du réducteur est exposé par `get_diagnostics` (J6) |
 | Requête de contrôle sans réponse | `deadline` dans `pending_out` | `Timeout` à l'appelant après 5 s (`interrupt`, `set_model`) ou 20 s (`initialize`) |
 | `control_cancel_request` | réducteur | `question_closed { Cancelled }`, la carte disparaît |
-| Version du CLI inattendue | le **superviseur** compare `claude_code_version` de la réponse à `initialize` à `"2.1.325"`, sans passer par le réducteur | bandeau Warn « version non testée (attendue 2.1.325, trouvée X) », l'app continue, sans blocage (décision 12) ; les mises à jour automatiques de Claude Code restent actives, donc ce cas est normal et non une erreur |
+| Version du CLI inattendue | le **réducteur** compare `version` de `ready` (réponse à `initialize`) et de `init` à `"2.1.325"` | une seule `notice` Warn `unexpected_version` (« version non testée »), affichée en bandeau ; l'app continue, sans blocage (décision 12) ; les mises à jour automatiques de Claude Code restent actives, donc ce cas est normal et non une erreur |
 | Capacités | `ready.capabilities` (initialize) puis `init.capabilities` (`system/init`) | `can_skip` de la carte = `ask_user_question_unanswered_v1` présent dans `init.capabilities` (absent de la réponse à `initialize`, constaté dans `t11`) ; une capacité manquante masque la fonction, ne bloque pas |
-| Fermeture de l'app | `RunEvent::ExitRequested` | fermer stdin, attendre 3 s, puis fermer le Job Object (tue l'arbre) |
+| Fermeture de l'app | `RunEvent::Exit` | fermer stdin, attendre 3 s, puis fermer le Job Object (tue l'arbre) |
 
 Journal : `%LOCALAPPDATA%\orchestrator\logs\` (rotation quotidienne, 7 jours) ; le flux brut de chaque session y est copié en NDJSON pour fabriquer de nouvelles fixtures à partir d'un bogue réel. Il contient la conversation : il reste local et n'est jamais versionné.
 
@@ -304,12 +309,12 @@ Légende des estimations : j = journée d'agent (une session de travail continue
 **J0. Squelette et tuyau de bout en bout, contrat figé** — 1 j — aucune dépendance.
 
 - Objectif : prouver la chaîne complète la plus risquée : Tauri lance `claude.exe` sans console, dans un Job Object, envoie `initialize` puis un message, et l'interface affiche les tokens au fil de l'eau par un `Channel` avec lots ; figer le contrat de la section 1.5 dans le code.
-- Fichiers créés : `package.json`, `vite.config.ts`, `svelte.config.js`, `tsconfig.json`, `index.html`, `src/main.ts`, `src/App.svelte`, `src/lib/core/client.ts`, `src-tauri/` (`Cargo.toml`, `tauri.conf.json`, `capabilities/default.json`, `src/main.rs`, `src/lib.rs`, `src/api/{commands,events,types}.rs` avec des corps provisoires, `src/process/{locate,spawn}.rs`), `src/lib/core/bindings/*.ts` générés, `rust-toolchain.toml`.
+- Fichiers créés : `package.json`, `vite.config.ts`, `svelte.config.js`, `tsconfig.json`, `index.html`, `src/main.ts`, `src/App.svelte`, `src/lib/core/client.ts`, `src-tauri/` (`Cargo.toml`, `tauri.conf.json`, `capabilities/default.json`, `src/main.rs`, `src/lib.rs`, `src/api/{commands,events,types}.rs` avec des corps provisoires, `src/process/{locate,spawn}.rs`), `src/lib/core/bindings/*.ts` générés, `src-tauri/rust-toolchain.toml`.
 - C'est fini quand : `npm run tauri dev` ouvre une fenêtre ; « Dis bonjour en un mot » s'affiche token par token ; aucune fenêtre console n'apparaît ; tuer l'app dans le Gestionnaire des tâches tue aussi `claude.exe` ; la latence p50 d'un token mesurée à la main est < 50 ms ; `export_bindings` produit les types TS de **tous** les événements et commandes de la section 1.5 ; l'utilisateur valide le contrat.
 
 ### Vague 1 : en parallèle, après J0 (J1 peut démarrer avec J0)
 
-**J1. Captures de référence (par script) et nouvelles fixtures** — 1 j — sans dépendance de code : peut démarrer en même temps que J0. Zone : `tools/capture-tui/`, `docs/reference-tui/`, `fixtures/stream-json/`.
+**J1. Captures de référence (par script) et nouvelles fixtures** — **fait** (commit `64d6717` ; captures dans `.claude-work/j1/captures/`, non versionnées ; inventaire dans `docs/reference-tui/README.md`) — 1 j — sans dépendance de code : peut démarrer en même temps que J0. Zone : `tools/capture-tui/`, `docs/reference-tui/`, `fixtures/stream-json/`.
 
 - Objectif : produire la référence de fidélité (section 1.7, décision 10) **par un agent**, et capturer en stream-json `t13` (un `Edit` puis un `Write`, avec `tool_use_result`), `t14` (outil en erreur, commande Bash à code non nul, `result` en erreur), puis générer `t15` (session longue, section 1.11).
 - Méthode de capture (`tools/capture-tui/capture.ps1`, PowerShell 7) :
@@ -334,7 +339,7 @@ Légende des estimations : j = journée d'agent (une session de travail continue
   | 10 | `10-menu-slash.png` | menu ouvert par `/` en début de saisie |
 
 - Validation par l'utilisateur (**point d'attente** : J5 ne démarre sa revue de fidélité qu'une fois les captures validées) : `docs/reference-tui/README.md` contient un tableau par capture (scénario, version, statut `à valider` / `validée` / `à refaire`, remarque) et la liste de contrôle. L'utilisateur parcourt les 10 PNG et marque chaque capture. L'agent refait celles qui sont `à refaire` avec `-Only`, jusqu'à 10 `validée`.
-- Fichiers créés : `tools/capture-tui/{capture.ps1,scenarios.json,README.md}`, `docs/reference-tui/NN-*.png`, `docs/reference-tui/README.md`, `fixtures/stream-json/t13.jsonl`, `t14.jsonl`, `t15.jsonl`, mise à jour du README des fixtures.
+- Fichiers créés : `tools/capture-tui/{capture.ps1,scenarios.json,README.md}`, captures `NN-*.png`, `.uia.txt` et `.txt` dans `.claude-work/j1/captures/` (non versionnées : elles montrent des chemins personnels), `docs/reference-tui/README.md`, `fixtures/stream-json/t13.jsonl`, `t14.jsonl`, `t15.jsonl`, mise à jour du README des fixtures.
 - C'est fini quand : `capture.ps1` rejoue les 10 scénarios sans intervention ; les 10 captures sont `validée` par l'utilisateur ; chaque capture a sa liste de contrôle ; `t13` montre la forme de `tool_use_result` d'Edit ; les captures ne contiennent ni nom d'utilisateur ni chemin personnel (dossier de scénario neutre, invite sans chemin complet).
 
 **J2. Lecteur et protocole Rust** — 1 j — après J0. Zone : `src-tauri/src/protocol/`, `src-tauri/src/process/{reader,writer}.rs`, `src-tauri/tests/`.
@@ -357,21 +362,27 @@ Légende des estimations : j = journée d'agent (une session de travail continue
 - Fichiers créés : `state/{reducer,agents,pending,threads,batcher}.rs`, `colors.rs`, `bin/replay.rs`, `tests/snapshots/*.snap`, `fixtures/ui-events/*.json`.
 - C'est fini quand : instantanés validés pour les 13 fixtures ; assertions ciblées de la section 1.10 vertes ; `npm run fixtures` régénère `fixtures/ui-events/`.
 
-**J5. Rendu terminal des blocs** — 2 j — après J3 et après la **validation par l'utilisateur** des captures de J1 ; peut commencer sur les données simulées avant la fin de J4. Zone : `src/lib/render/`, `src/lib/components/rows/`, `app.css`, polices.
+**J5. Rendu terminal des blocs, vue détaillée Ctrl+O** — 2,5 j — après J3 et après la **validation par l'utilisateur** des captures de J1 ; peut commencer sur les données simulées avant la fin de J4. Zone : `src/lib/render/`, `src/lib/components/rows/`, `app.css`, polices.
 
-- Objectif : règles de la section 1.7 : markdown, code coloré, appels et résultats d'outils, troncature, diffs d'Edit, erreurs, interruption, ligne d'appel Agent, ligne d'activité.
-- Fichiers créés : `render/{markdown,highlight,diff,glyphs,colors,truncate}.ts`, `rows/{ToolCall,ToolResult,EditDiff,AgentCall,TurnResult,ErrorRow}.svelte`, `components/StatusLine.svelte`, `src/assets/fonts/CascadiaMono*.woff2`, `tests/render.test.ts`.
-- C'est fini quand : `t1`, `t3`, `t6`, `t13`, `t14` rejoués dans `dev:mock` passent les listes de contrôle de `docs/reference-tui/` (revue de l'utilisateur) ; le scroll de J3 reste ≥ 58 i/s avec le rendu complet.
+- Objectif : règles de la section 1.7, d'après les captures de J1 : messages, markdown, code coloré, **regroupement des appels d'outils** en une ligne grise (vue normale), lignes Edit/Write, diffs, erreurs, interruption grise, lignes des sous-agents en arrière-plan, indicateur de tour et ligne de fin de tour. **Ctrl+O** (vue détaillée : un appel par ligne avec sa sortie complète, puis retour à la vue normale) entre dans le prototype 1 avec ce jalon.
+- Fichiers créés : `render/{markdown,highlight,diff,glyphs,colors,group}.ts` (`group.ts` : regroupement du type « Read 1 file, ran 1 shell command »), `rows/{ToolGroup,ToolCall,ToolResult,EditDiff,AgentLaunch,AgentFinished,TurnResult,Interrupted}.svelte`, `components/StatusLine.svelte`, `src/assets/fonts/CascadiaMono*.woff2`, `tests/render.test.ts`.
+- C'est fini quand : `t1`, `t3`, `t6`, `t13`, `t14` rejoués dans `dev:mock` cochent la liste de contrôle de `docs/reference-tui/README.md` (revue de l'utilisateur ; captures 02, 03, 03b, 04, 05, 06, 08, 09, 09b, k1) ; Ctrl+O bascule entre la vue normale et la vue détaillée sans perdre la position de lecture ; le scroll de J3 reste ≥ 58 i/s avec le rendu complet, dans les deux vues.
 
-**J6. Supervision du processus et erreurs** — 1 j — après J2 ; en parallèle de J4 (fichiers disjoints). Zone : `src-tauri/src/process/supervisor.rs`, `errors.rs`, `logging.rs`, `tests/fake_claude`.
+**J6. Supervision du processus, robustesse et erreurs** — 1,5 j — après J2 ; en parallèle de J4 (fichiers disjoints). Zone : `src-tauri/src/process/supervisor.rs`, `errors.rs`, `logging.rs`, `tests/fake_claude`.
 
-- Objectif : boucle `select!` stdout/stderr/stdin/minuteries, délais des requêtes, arrêt propre, cas de la section 1.9, journal ; contrôle de version sans blocage (décision 12) : c'est le **superviseur** qui émet le `notice` Warn `untested_version`, dès la réponse à `initialize`, sans passer par le réducteur ; J6 ne dépend donc pas de J4.
-- Fichiers créés : `process/supervisor.rs`, `errors.rs`, `logging.rs`, `src-tauri/tests/bin/fake_claude.rs`, `tests/supervisor.rs`, `src/lib/components/Banner.svelte`.
-- C'est fini quand : les scénarios du faux CLI (mort en plein tour, code 1, rien sur stdout, stderr abondant) produisent les bons `exited`/`notice` ; fermer l'app ne laisse aucun `claude.exe` (vérifié avec `tasklist`) ; un faux CLI qui annonce `claude_code_version: "9.9.9"` et émet des types inconnus donne un seul bandeau « version non testée », une session qui fonctionne et un compteur d'inconnus dans `get_diagnostics`, sans aucun blocage.
+- Objectif : boucle `select!` stdout/stderr/stdin/minuteries, délais des requêtes, arrêt propre, cas de la section 1.9, journal. La notice de version (`unexpected_version`) est déjà émise par le réducteur depuis J0 (sur `ready` et `init`) : J6 n'a pas à la déplacer, il ajoute seulement le bandeau qui l'affiche.
+- Points de robustesse reportés de J0 :
+  - `exited` ne dépend pas de la fin de stdout : `select!` sur `child.wait()`, puis `job.terminate()` pour finir l'arbre ;
+  - une session orpheline après un rechargement de la webview (canal fermé, interface relancée) est détectée et fermée ;
+  - `Diagnostics` expose `unknown_count`, et `log_path` est renseigné ;
+  - plafond de taille de ligne sur stdout (au-delà : ligne ignorée, `notice` Warn, journal) ;
+  - tests du lecteur : lignes très longues, UTF-8 coupé entre deux lectures, fins de ligne CRLF, stderr abondant.
+- Fichiers créés : `process/supervisor.rs` (complété), `errors.rs`, `logging.rs`, `src-tauri/tests/bin/fake_claude.rs`, `tests/supervisor.rs`, `src/lib/components/Banner.svelte`.
+- C'est fini quand : les scénarios du faux CLI (mort en plein tour, code 1, rien sur stdout, stdout gardé ouvert par un enfant après la mort du processus, stderr abondant, ligne géante, UTF-8 coupé, CRLF) produisent les bons `exited`/`notice` ; fermer l'app ou recharger la webview ne laisse aucun `claude.exe` (vérifié avec `tasklist`) ; un faux CLI qui annonce `claude_code_version: "9.9.9"` et émet des types inconnus donne un seul bandeau « version non testée », une session qui fonctionne, un `unknown_count` non nul et un `log_path` renseigné dans `get_diagnostics`, sans aucun blocage.
 
 **J11. Projets, liste et reprise de sessions avec historique** — 2 j. Zone : `src-tauri/src/sessions/` (dont `transcript.rs` isolé), `components/{ProjectPicker,SessionPicker}.svelte`, `state/sessions.svelte.ts`, `fixtures/transcripts/`. Vague 2 : après J4 (le réducteur sert aussi à l'historique), en parallèle de J5 et J6 ; l'affichage de l'historique réutilise les lignes de rendu de J5 dès qu'elles existent.
 
-- Dossier de projet (décision 11) : `<app> .` ou `<app> <chemin>` ouvre directement ce dossier (`get_launch_dir`) ; sans argument, sélecteur des projets récents (`list_projects`, section 1.8), chemin réel lu dans le `cwd` du transcript, dossiers disparus grisés.
+- Dossier de projet (décision 11) : `<app> .` ou `<app> <chemin>` ouvre directement ce dossier (`get_launch_info`, complété par l'information « dossier passé en argument ») ; sans argument, sélecteur des projets récents (`list_projects`, section 1.8), chemin réel lu dans le `cwd` du transcript, dossiers disparus grisés.
 - Reprise (décision 9) : tout l'historique relu dans le transcript par le lecteur isolé et tolérant, passé au même réducteur que le flux.
 - C'est fini quand : `<app> .` lancé depuis un dossier ouvre une session dans ce dossier ; sans argument, le sélecteur liste les projets de `~/.claude/projects` avec leur vrai chemin ; la liste des sessions d'un dossier s'affiche en < 300 ms pour 200 sessions (titre, date) ; reprendre une session affiche **tout** son historique (texte, outils, résultats) et le tour suivant garde le contexte (comme `t7`) ; un transcript avec des lignes inconnues ou abîmées se charge quand même (lignes ignorées comptées), et un transcript illisible donne une reprise sans historique avec un avertissement ; les tests `transcripts` passent sur les extraits anonymisés.
 
@@ -381,23 +392,26 @@ J7 à J10 touchent chacun un composant et une commande distincts ; le seul point
 
 **J7. Saisie, interruption, modèle, raccourcis** — 1 j. Zone : `components/Prompt.svelte`, `src/lib/state/keys.svelte.ts` (raccourcis globaux), corps de `send_message`, `interrupt`, `set_model`.
 
-- Raccourcis comme Claude Code (décision 13) :
-  - **Échap** ferme d'abord la palette ou le sélecteur ; sur une carte de question ignorable (`can_skip`), il l'ignore (`skip_question`) ; sur une carte non ignorable, il ne fait rien et la carte reste ; dans les autres cas, il interrompt le tour en cours.
-  - **Ctrl+C** avec une sélection (conversation ou saisie) copie ; sans sélection, il efface la saisie en cours si elle n'est pas vide, sinon il interrompt le tour en cours. Pas de « double Ctrl+C pour quitter » au prototype 1.
-  - **`/`** en début de saisie et **Ctrl+K** ouvrent la palette (J10).
-- C'est fini quand : Entrée envoie, Maj+Entrée fait un saut de ligne, historique ↑↓ ; Échap interrompt (`t6` reproduit en vrai, état `Idle` < 2 s), ferme la palette sans interrompre quand elle est ouverte, ignore une carte `can_skip` et laisse en place une carte non ignorable ; Ctrl+C sur une sélection met le texte dans le presse-papiers, sans sélection efface une saisie non vide, et sur une saisie vide envoie `interrupt` (tests Vitest pour chaque cas) ; un sélecteur alimenté par `ready.models` change le modèle et le tour suivant l'utilise (`init.model`).
+- Raccourcis d'après le comportement observé du TUI 2.1.325 (décision 13, captures `c*`, `e*`, `k*` de `docs/reference-tui/README.md`) :
+  - **Ctrl+C** : avec une sélection (conversation ou saisie), copie ; pendant un tour, **interrompt et garde la saisie** (`c4`, `k2`) ; au repos avec une saisie non vide, efface la saisie (`c2`) ; au repos avec une saisie vide, **ne fait rien** : le TUI affiche « Press Ctrl-C again to exit » (`c3`), mais l'app ne se quitte pas au clavier dans le prototype 1, et ne rien faire est le plus simple.
+  - **Échap** : palette ou sélecteur ouvert, il les ferme d'abord ; carte de question ouverte, il l'ignore si `can_skip` (« Esc to cancel », `07`), sinon il ne fait rien ; pendant un tour, il interrompt (`08`) ; au repos avec une saisie non vide, premier appui → indication « Esc again to clear » (`e1`), second appui à moins d'environ 0,5 s → la saisie est effacée ; double Échap sur une saisie vide → rien (le menu Rewind du TUI, `k3`, est hors du prototype 1).
+  - **`/`** en début de saisie et **Ctrl+K** ouvrent la palette (J10) ; **Ctrl+O** bascule la vue détaillée (J5).
+- C'est fini quand : Entrée envoie, Maj+Entrée fait un saut de ligne, historique ↑↓ ; Échap pendant un tour interrompt (`t6` reproduit en vrai, état `Idle` < 2 s, rendu de `08`) ; Ctrl+C pendant un tour interrompt et laisse le brouillon dans la saisie ; chaque cas des deux listes ci-dessus a son test Vitest (sélection, tour en cours, saisie vide ou non, double Échap rapproché ou espacé, palette ouverte, carte ignorable ou non) ; un sélecteur alimenté par `ready.models` change le modèle et le tour suivant l'utilise (`init.model`).
 
-**J8. Carte `AskUserQuestion`** — 1 j. Zone : `components/QuestionCard.svelte`, corps de `answer_question`, `skip_question`.
+**J8. Carte `AskUserQuestion`** — 1 j. Zone : `components/QuestionCard.svelte`, corps de `answer_question` et `skip_question`, `api/events.rs` (raison `Skipped`).
 
-- C'est fini quand : en vrai, une question simple, une multi-sélection, une « autre réponse » libre et un « ignorer » aboutissent, Claude cite la réponse ; les réponses envoyées égalent `t4` et `t10` ; tout au clavier.
+- Rendu d'après `07-question.txt` (section 1.7) : pas d'encadré ; règle, pastille « ☐ <header> », question en gras, `❯ 1. <label>` et descriptions, « N. Type something. » pour la réponse libre, règle, « N+1. Chat about this », pied « Enter to select · ↑/↓ to navigate · Esc to cancel ». La carte prend la place de la saisie.
+- « Chat about this » : proposition à valider en revue, `skip_question` avec la raison `replied_in_chat` (valeur d'`annotations[…].unanswered` prévue par `sdk.d.ts`), puis focus dans la saisie.
+- Contrat : `skip_question` émet aujourd'hui `question_closed { Answered }` ; J8 ajoute la raison `Skipped` pour que l'interface distingue une question ignorée d'une question répondue.
+- C'est fini quand : en vrai, une question simple, une multi-sélection, une réponse libre (« Type something. ») et un « ignorer » par Échap aboutissent, et Claude cite la réponse ; les réponses envoyées égalent `t4` et `t10` ; `question_closed` porte `Skipped` après un « ignorer » ; tout se fait au clavier (↑↓, chiffres, Entrée, Échap) ; la carte coche les points « Question » de la liste de contrôle.
 
 **J9. Panneau des agents** — 1 j (+ 0,5 j pour le bonus). Zone : `components/AgentPanel.svelte`, `AgentLine.svelte`, `state/agents.svelte.ts`.
 
-- C'est fini quand : `t3` rejoué montre 2 lignes bleu et rouge, état, durée qui avance puis se fige, `last_tool` ; en vrai, `/orchestrateur` avec 4 agents parallèles reste lisible ; bonus : clic → fil de l'agent.
+- C'est fini quand : `t3` rejoué montre 2 lignes bleu et rouge dans le style du panneau du TUI (`◯ <agent>  <description> … <durée> · ↓ <tokens> tokens`, `05-agents-en-cours.txt`), état, durée qui avance puis se fige, `last_tool` ; en vrai, `/orchestrateur` avec 4 agents parallèles reste lisible ; bonus : clic → fil de l'agent.
 
 **J10. Palette (Ctrl+K et `/`)** — 0,5 j. Zone : `components/Palette.svelte`, `state/palette.svelte.ts`.
 
-- Deux entrées (décision 13) : Ctrl+K ouvre la palette n'importe où ; `/` tapé **en début de saisie** l'ouvre sous la ligne de saisie, comme le menu du TUI, et les caractères suivants filtrent la liste. Un `/` au milieu du texte reste un caractère normal.
+- Deux entrées (décision 13) : Ctrl+K ouvre la palette n'importe où ; `/` tapé **en début de saisie** l'ouvre **au-dessus** de la ligne de saisie, comme le menu du TUI (`10-menu-slash.txt`), et les caractères suivants filtrent la liste. Un `/` au milieu du texte reste un caractère normal.
 - C'est fini quand : Ctrl+K et `/` ouvrent la palette avant tout message (données de `ready`, `t11`) ; filtre flou sur nom et description ; Entrée insère `/nom ` dans la saisie ; Échap ferme sans rien insérer ; `init.skills` complète la liste sans la vider ; le rendu ressemble à la capture `10-menu-slash.png`.
 
 ### Vague 4 : recette
@@ -418,7 +432,7 @@ J0 ──┬─ J2 (lecteur) ─┬─ J4 (réducteur) ── J11 (projets, sess
                                   après J4 + J5 + J6 : J7 · J8 · J9 · J10 ───────┴── J12 (recette)
 ```
 
-Total ≈ 16 j d'agent (J1 passe à 1 j pour le script de capture, J11 à 2 j pour le sélecteur de projets et l'historique complet) ; avec 3 agents en parallèle, environ 7 à 8 jours calendaires.
+Total ≈ 17 j d'agent (J1 : 1 j pour le script de capture ; J5 : 2,5 j avec la vue détaillée Ctrl+O ; J6 : 1,5 j avec les points de robustesse reportés de J0 ; J11 : 2 j pour le sélecteur de projets et l'historique complet) ; avec 3 agents en parallèle, environ 7 à 8 jours calendaires.
 
 ---
 
