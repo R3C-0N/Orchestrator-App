@@ -300,14 +300,14 @@ test("Échap : ignore (skip_question skipped, t10) si ignorable, sinon ne fait r
     .toBe("The user did not answer the questions.");
 });
 
-test("« Chat about this » : skip_question dismissed, puis focus dans la saisie", async ({ page }) => {
+test("« Chat about this » : skip_question replied_in_chat, puis focus dans la saisie", async ({ page }) => {
   await open(page);
   const id = await ask(page, [LANG]);
   await page.keyboard.press("ArrowUp");
   await page.keyboard.press("Enter");
   await closed(page);
   expect(await calls(page, "skip_question")).toEqual([
-    { cmd: "skip_question", args: { request_id: id, reason: "dismissed" } },
+    { cmd: "skip_question", args: { request_id: id, reason: "replied_in_chat" } },
   ]);
   await expect(page.locator(PROMPT)).toBeFocused();
 });

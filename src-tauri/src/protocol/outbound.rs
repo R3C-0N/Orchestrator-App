@@ -170,6 +170,7 @@ pub fn answer_question(
 pub fn skip_question(request_id: &str, input: &Value, reason: SkipReason) -> String {
     let reason = match reason {
         SkipReason::Skipped => "skipped",
+        SkipReason::ReplyInChat => "replied_in_chat",
         SkipReason::Dismissed => "dismissed",
     };
     let questions = questions_of(input);

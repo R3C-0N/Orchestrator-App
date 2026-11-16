@@ -157,7 +157,7 @@ Réponse (testée) : `allow` avec `updatedInput` = `questions` recopiées + `ans
 {"behavior":"allow","updatedInput":{"questions":[…],"answers":{"Quelle est ta couleur préférée ?":"Bleu"}}}
 ```
 
-Selon la doc : multi-sélection = tableau de labels (ou labels joints par `", "`) ; texte libre (champ « autre réponse ») = le texte tapé devient la valeur ; `response` optionnel pour une réponse libre globale ; 1 à 4 questions, 2 à 4 options, `header` de 12 caractères au plus ; `preview` par option seulement si l'option SDK `toolConfig.askUserQuestion.previewFormat` est réglée (hors prototype 1, voir section 7). Non disponible dans les sous-agents. L'outil n'est offert à Claude qu'avec `--permission-prompt-tool stdio` (absent de `init.tools` sans hôte, présent dans `t5` et `t8`).
+Selon la doc : multi-sélection = tableau de labels (ou labels joints par `", "`) ; **vérifié en réel** (`t16`, finitions) : le tableau `["Rouge","Bleu"]` est accepté et Claude reçoit `"Quelles couleurs ?"="Rouge,Bleu"` (labels joints par `,` sans espace) ; texte libre (champ « autre réponse ») = le texte tapé devient la valeur ; `response` optionnel pour une réponse libre globale ; 1 à 4 questions, 2 à 4 options, `header` de 12 caractères au plus ; `preview` par option seulement si l'option SDK `toolConfig.askUserQuestion.previewFormat` est réglée (hors prototype 1, voir section 7). Non disponible dans les sous-agents. L'outil n'est offert à Claude qu'avec `--permission-prompt-tool stdio` (absent de `init.tools` sans hôte, présent dans `t5` et `t8`).
 
 **« Ignorer » une question (`t10`, testé).** Capacité `ask_user_question_unanswered_v1` (dans `init.capabilities`) : la réponse peut porter `annotations[<texte de la question>].unanswered` parmi `skipped`, `replied_in_chat`, `dismissed` (`sdk.d.ts`). À n'envoyer qu'à un CLI qui annonce la capacité. Réponse testée :
 
@@ -165,7 +165,7 @@ Selon la doc : multi-sélection = tableau de labels (ou labels joints par `", "`
 {"behavior":"allow","updatedInput":{"questions":[…],"answers":{},"annotations":{"Quelle est ta couleur préférée ?":{"unanswered":"skipped"}}}}
 ```
 
-Claude reçoit `{"type":"tool_result","content":"The user did not answer the questions."}` et le dit dans sa réponse.
+Claude reçoit `{"type":"tool_result","content":"The user did not answer the questions."}` et le dit dans sa réponse. Même texte, vérifié en réel, pour `replied_in_chat` (`t17`, envoyé par « Chat about this ») et `dismissed` (`t18`) : en 2.1.325 la raison ne figure pas dans le `tool_result`.
 
 **Interrompre (`t6`)**
 

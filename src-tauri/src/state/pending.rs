@@ -55,7 +55,8 @@ pub fn parse_questions(input: &Value) -> Vec<QuestionItem> {
 /// Raison de fermeture d'une question d'après la réponse que nous envoyons
 /// (`response` du `control_response`, `t4` et `t10`) : `Skipped` quand aucune
 /// réponse n'est donnée et qu'au moins une question est annotée
-/// `unanswered` (`skip_question`, raisons `skipped` et `dismissed`) ;
+/// `unanswered` (`skip_question`, raisons `skipped`, `replied_in_chat` et
+/// `dismissed`) ;
 /// `Answered` sinon.
 pub fn close_reason_of_response(response: &Value) -> QuestionCloseReason {
     let updated = response.get("updatedInput");
@@ -90,7 +91,11 @@ mod tests {
     fn skip_and_answer_are_told_apart() {
         let input =
             json!({"questions":[{"question":"Q ?","header":"H","options":[],"multiSelect":false}]});
-        for reason in [SkipReason::Skipped, SkipReason::Dismissed] {
+        for reason in [
+            SkipReason::Skipped,
+            SkipReason::ReplyInChat,
+            SkipReason::Dismissed,
+        ] {
             let line = outbound::skip_question("r1", &input, reason);
             assert_eq!(
                 close_reason_of_response(&response_of(&line)),
@@ -104,5 +109,33 @@ mod tests {
             close_reason_of_response(&response_of(&line)),
             QuestionCloseReason::Answered
         );
+    }
+
+    /// Les trois raisons du protocole (`sdk.d.ts`, capacité
+    /// `ask_user_question_unanswered_v1`), à l'octet près dans
+    /// `annotations[q].unanswered`, et la valeur reçue de l'interface.
+    #[test]
+    fn skip_reasons_on_the_wire() {
+        let input =
+            json!({"questions":[{"question":"Q ?","header":"H","options":[],"multiSelect":true}]});
+        for (reason, wire) in [
+            (SkipReason::Skipped, "skipped"),
+            (SkipReason::ReplyInChat, "replied_in_chat"),
+            (SkipReason::Dismissed, "dismissed"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<SkipReason>(json!(wire)).unwrap(),
+                reason
+            );
+            let r = response_of(&outbound::skip_question("r1", &input, reason));
+            assert_eq!(r["behavior"], "allow");
+            assert_eq!(r["updatedInput"]["answers"], json!({}));
+            assert_eq!(
+                r["updatedInput"]["annotations"],
+                json!({"Q ?": {"unanswered": wire}})
+            );
+        }
+        assert!(serde_json::from_value::<SkipReason>(json!("reply_in_chat")).is_err());
     }
 }

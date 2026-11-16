@@ -40,11 +40,17 @@ pub enum Answer {
 }
 
 /// Raison d'une question ignorée (`annotations[q].unanswered`, `t10`).
+/// Les trois valeurs admises par la capacité `ask_user_question_unanswered_v1`
+/// (`sdk.d.ts`, `capabilities`) ; un hôte strict refuse toute autre valeur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum SkipReason {
     Skipped,
+    /// « Chat about this » : l'utilisateur répond dans la conversation.
+    /// Valeur du protocole au participe (`replied_in_chat`), d'où le `rename`.
+    #[serde(rename = "replied_in_chat")]
+    ReplyInChat,
     Dismissed,
 }
 

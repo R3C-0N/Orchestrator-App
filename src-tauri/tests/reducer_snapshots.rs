@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use orchestrator_lib::api::events::{
     AgentEvent, AgentStatus, BlockDoneKind, CoreEvent, EventBody, NoticeLevel, QuestionCloseReason,
-    SessionState, UserOrigin,
+    ResultPart, SessionState, UserOrigin,
 };
 use orchestrator_lib::api::types::SkipReason;
 use orchestrator_lib::protocol::fixture::{classify, FixtureLine};
@@ -323,6 +323,47 @@ fn t10_skip_closes_with_skipped_and_matches_driver_bytes() {
         }
     }
     assert!(checked);
+}
+
+/// `t16` à `t18` (finitions) : question multi-sélection réelle, répondue
+/// par un tableau (`Answered`), puis ignorée avec `replied_in_chat` et
+/// `dismissed` (`Skipped`) ; texte exact du `tool_result` reçu par Claude.
+#[test]
+fn t16_t18_multi_select_answer_and_skip_reasons() {
+    const SKIPPED: &str = "The user did not answer the questions.";
+    for (name, reason, expected) in [
+        (
+            "t16",
+            QuestionCloseReason::Answered,
+            "Your questions have been answered: \"Quelles couleurs ?\"=\"Rouge,Bleu\". You can now continue with these answers in mind.",
+        ),
+        ("t17", QuestionCloseReason::Skipped, SKIPPED),
+        ("t18", QuestionCloseReason::Skipped, SKIPPED),
+    ] {
+        let rep = replay(name);
+        let q = questions(&rep);
+        assert_eq!(q.len(), 1, "{name}");
+        assert_eq!(closed(&rep), vec![(q[0].clone(), reason)], "{name}");
+        let b = bodies(&rep);
+        assert!(
+            b.iter().any(|b| matches!(b,
+                EventBody::Question { questions, .. } if questions[0].multi_select)),
+            "{name} : question multi-sélection"
+        );
+        let texts: Vec<&str> = b
+            .iter()
+            .filter_map(|b| match b {
+                EventBody::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|p| match p {
+                ResultPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&expected), "{name} : {texts:?}");
+    }
 }
 
 #[test]

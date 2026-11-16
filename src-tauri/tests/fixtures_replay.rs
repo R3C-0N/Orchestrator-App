@@ -17,9 +17,10 @@ use orchestrator_lib::protocol::outbound;
 use orchestrator_lib::state::reducer::{Action, Reducer};
 use serde_json::{Map, Value};
 
-/// Captures attendues : t1, t3 à t15 (il n'y a pas de t2).
+/// Captures attendues : t1, t3 à t18 (il n'y a pas de t2).
 const FIXTURES: &[&str] = &[
     "t1", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11", "t12", "t13", "t14", "t15",
+    "t16", "t17", "t18",
 ];
 
 /// Types inconnus tolérés au rejeu : aucun. Tout ce que les captures
@@ -472,6 +473,28 @@ fn control_responses_match_driver_bytes() {
     assert_sent(
         "t10.jsonl",
         &outbound::skip_question(&id, &input, SkipReason::Skipped),
+    );
+    // t16 : multi-sélection, tableau de deux labels.
+    let (id, input) = can_use_tool("t16.jsonl", "AskUserQuestion");
+    let answers: BTreeMap<String, Answer> = [(
+        "Quelles couleurs ?".to_string(),
+        Answer::Many(vec!["Rouge".into(), "Bleu".into()]),
+    )]
+    .into();
+    assert_sent(
+        "t16.jsonl",
+        &outbound::answer_question(&id, &input, &answers, None),
+    );
+    // t17 : « Chat about this » (`replied_in_chat`) ; t18 : `dismissed`.
+    let (id, input) = can_use_tool("t17.jsonl", "AskUserQuestion");
+    assert_sent(
+        "t17.jsonl",
+        &outbound::skip_question(&id, &input, SkipReason::ReplyInChat),
+    );
+    let (id, input) = can_use_tool("t18.jsonl", "AskUserQuestion");
+    assert_sent(
+        "t18.jsonl",
+        &outbound::skip_question(&id, &input, SkipReason::Dismissed),
     );
 }
 

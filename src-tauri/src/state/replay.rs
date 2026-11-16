@@ -33,11 +33,12 @@ use crate::protocol::inbound::Inbound;
 use super::pending::close_reason_of_response;
 use super::reducer::{Action, Reducer};
 
-/// Captures rejouées en `fixtures/ui-events/` : les 13 captures réelles
+/// Captures rejouées en `fixtures/ui-events/` : les 16 captures réelles
 /// (`t2` n'existe pas). `t15`, générée (10 505 lignes), n'en fait pas partie :
 /// le mode simulé a sa propre session longue (`?mock=long`).
 pub const UI_EVENT_FIXTURES: &[&str] = &[
-    "t1", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11", "t12", "t13", "t14",
+    "t1", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11", "t12", "t13", "t14", "t16",
+    "t17", "t18",
 ];
 
 /// 2026-11-16 10:00:00 UTC, jour des captures.

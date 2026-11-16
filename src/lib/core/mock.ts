@@ -452,13 +452,15 @@ export class MockCore {
     return requestId;
   }
 
-  /** Comme `answer_question` (`t4`). */
+  /**
+   * Comme `answer_question` (`t4`). Un tableau (multi-sélection) devient
+   * dans le texte les labels joints par `,` sans espace, comme le CLI
+   * 2.1.325 (`t16`).
+   */
   answerQuestion(requestId: string, answers: Record<string, string | string[]>): void {
     const q = this.#takeQuestion(requestId);
     this.#emit({ kind: "question_closed", request_id: requestId, reason: "Answered" });
-    const parts = Object.entries(answers).map(
-      ([k, v]) => `"${k}"="${Array.isArray(v) ? v.join(", ") : v}"`,
-    );
+    const parts = Object.entries(answers).map(([k, v]) => `"${k}"="${String(v)}"`);
     this.#questionResult(
       q.toolUseId,
       `Your questions have been answered: ${parts.join(", ")}. You can now continue with these answers in mind.`,
@@ -466,7 +468,7 @@ export class MockCore {
   }
 
   /** Comme `skip_question` (`t10`). */
-  skipQuestion(requestId: string, _reason: "skipped" | "dismissed"): void {
+  skipQuestion(requestId: string, _reason: "skipped" | "replied_in_chat" | "dismissed"): void {
     const q = this.#questions.get(requestId);
     if (q && !q.canSkip) throw { kind: "unsupported", message: "ask_user_question_unanswered_v1" };
     this.#takeQuestion(requestId);

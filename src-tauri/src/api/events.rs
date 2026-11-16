@@ -303,7 +303,7 @@ pub enum QuestionCloseReason {
     /// Requête retirée par le CLI (`control_cancel_request`).
     Cancelled,
     /// Question ignorée par `skip_question` (`annotations[q].unanswered`,
-    /// raisons `skipped` et `dismissed`, `t10`).
+    /// raisons `skipped`, `replied_in_chat` et `dismissed`, `t10`).
     Skipped,
 }
 

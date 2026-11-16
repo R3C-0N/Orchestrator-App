@@ -306,18 +306,15 @@
   }
 
   /**
-   * « Chat about this ». Le TUI rend la main à la saisie pour en parler.
-   * La raison prévue par `sdk.d.ts` (`replied_in_chat`) n'existe pas dans
-   * `SkipReason` du cœur (`skipped` | `dismissed`) : choix prudent en
-   * attendant, `skip_question` avec `dismissed` (la carte est fermée sans
-   * réponse, Claude reçoit « The user did not answer the questions. » et
-   * rien n'est inventé à sa place), puis focus dans la saisie. Sans la
+   * « Chat about this ». Le TUI rend la main à la saisie pour en parler :
+   * `skip_question` avec la raison `replied_in_chat` (`sdk.d.ts`, capacité
+   * `ask_user_question_unanswered_v1`), puis focus dans la saisie. Sans la
    * capacité, l'entrée est grisée et inactive (aucune requête que le cœur
    * refuserait).
    */
   function chatAboutQuestion(): void {
     if (!store.question?.canSkip) return;
-    void replyQuestion("skip", (id) => backend.skip(id, "dismissed"));
+    void replyQuestion("skip", (id) => backend.skip(id, "replied_in_chat"));
   }
 
   async function doInterrupt(): Promise<void> {

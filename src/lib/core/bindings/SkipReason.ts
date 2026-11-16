@@ -2,5 +2,7 @@
 
 /**
  * Raison d'une question ignorée (`annotations[q].unanswered`, `t10`).
+ * Les trois valeurs admises par la capacité `ask_user_question_unanswered_v1`
+ * (`sdk.d.ts`, `capabilities`) ; un hôte strict refuse toute autre valeur.
  */
-export type SkipReason = "skipped" | "dismissed";
+export type SkipReason = "skipped" | "replied_in_chat" | "dismissed";
