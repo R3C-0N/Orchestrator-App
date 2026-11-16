@@ -18,6 +18,11 @@ Problème d'origine : l'interface terminal (TUI) de Claude Code sous Windows Ter
 6. **Formulaires par étapes.** Prototype 1 : les questions de Claude (`AskUserQuestion`) sont affichées dans une **carte minimale en style terminal** : la question et ses options en liste, choisies au clavier (↑↓, Entrée) ou à la souris, avec un champ « autre réponse » libre ; la réponse passe par `updatedInput.answers`, et la capacité `ask_user_question_unanswered_v1` sert à « ignorer ». Ce n'est pas un formulaire natif, et il n'y a pas d'aperçu HTML des options (reporté, voir section 7). Plus tard : un outil MCP « formulaire » fourni par l'app, qui remplacera le skill `formulaire-dynamique` en artefact. Conséquence : le prototype 1 doit gérer le `control_request` `can_use_tool` de `AskUserQuestion` (testé, section 4.5) ; l'outil MCP in-process nécessitera d'implémenter côté Rust le transport MCP sur le canal de contrôle (`mcp_message`), non étudié.
 7. **Permissions : tout autoriser (`bypassPermissions`).** L'app reste branchée sur `--permission-prompt-tool=stdio` pour recevoir les `AskUserQuestion` et les éventuels `can_use_tool` restants. Conséquence : le gestionnaire de `control_request` existe dès le prototype 1, avec réponse `allow` par défaut pour tout ce qui n'est pas `AskUserQuestion`. Testé (`t8`) : le mode est accepté sans `--allow-dangerously-skip-permissions`, un Bash qui écrit dans le dossier de travail part sans `can_use_tool`, et `AskUserQuestion` arrive toujours en `control_request`. Les outils MCP marqués `requires_user_interaction` et certaines demandes (`default_to_no`, `safetyCheck`) peuvent rester soumis à demande (doc, non vérifié).
 8. **Dépôt : `H:\<user>\Code\orchestrator`**, dépôt git local, branche `main`, sans remote.
+9. **Reprise d'une session : tout l'historique est affiché, relu dans le transcript.** `--resume` ne réémet pas les tours passés sur stdout (`t7`) : l'app relit `~/.claude/projects/<dossier encodé>/<session_id>.jsonl` (voir 4.6). Conséquence : un lecteur de transcript isolé dans son propre module Rust (`sessions/transcript.rs`), tolérant (une ligne ou un type inconnu est ignoré et compté, sans rien bloquer), qui passe les lignes `user`/`assistant` du fil principal au même réducteur que le flux ; en cas d'échec, reprise sans historique affiché avec un avertissement. Le format est interne et non documenté : ce lecteur est **revérifié à chaque nouvelle version du CLI** (tests sur extraits anonymisés).
+10. **Captures de référence du TUI : faites par un agent, validées par l'utilisateur.** Un agent lance Claude Code dans Windows Terminal (profil, police et taille fixés) et capture la fenêtre par script ; l'utilisateur valide ensuite les captures, et les captures ratées sont refaites. Conséquence : un script de capture versionné et une liste de 10 captures dans `docs/reference-tui/` (plan, jalon J1), avec une liste de contrôle par capture, qui sert de critère de fidélité (décision 3).
+11. **Dossier de projet : argument au lancement, sinon sélecteur des projets récents.** `<app> .` ouvre le dossier courant, `<app> <chemin>` ce dossier ; sans argument, un sélecteur liste les projets récents lus dans `~/.claude/projects` (un sous-dossier par projet, trié par date du transcript le plus récent). Conséquence : le cœur doit retrouver le chemin réel d'un dossier encodé ; l'encodage n'est pas réversible (tout caractère hors `[A-Za-z0-9]` devient `-`), donc le chemin est lu dans le champ `cwd` des lignes du transcript le plus récent ; un dossier disparu est grisé.
+12. **Version du CLI différente de 2.1.325 : avertir sans bloquer.** Un bandeau « version non testée » s'affiche (version lue dans la réponse à `initialize`) ; l'app continue. Les messages et types inconnus sont ignorés. Les mises à jour automatiques de Claude Code restent actives. Conséquence : le lecteur du flux et celui du transcript doivent être tolérants (variante `Unknown`), et les fixtures sont rejouées à chaque mise à jour du CLI pour repérer les ruptures.
+13. **Raccourcis : comme Claude Code.** Échap interrompt le tour en cours ; `/` en début de saisie ou Ctrl+K ouvre la palette ; Ctrl+C copie quand du texte est sélectionné. Conséquence : Échap ferme d'abord ce qui est ouvert (palette, carte de question, sélecteur), et n'interrompt que sinon ; Ctrl+C sans sélection ne fait rien (il n'interrompt pas, pas de signal sous Windows, voir 4.8).
 
 ## 3. Architecture
 
@@ -165,7 +170,7 @@ Réponse : `{"response":{"model":"claude-sonnet-5-5"}}`. Le tour suivant utilise
 
 ### 4.6 Reprise de session
 
-`--resume <session_id>` (aussi un nom ou le chemin d'un `.jsonl`) recharge le contexte (`t7`) et garde le même `session_id` ; `--fork-session` en crée un nouveau ; `--session-id <uuid>` impose l'id. La liste des sessions du prototype 1 se lit dans les transcripts du CLI (voir questions ouvertes).
+`--resume <session_id>` (aussi un nom ou le chemin d'un `.jsonl`) recharge le contexte (`t7`) et garde le même `session_id` ; `--fork-session` en crée un nouveau ; `--session-id <uuid>` impose l'id. La liste des sessions du prototype 1 se lit dans les transcripts du CLI, `~/.claude/projects/<dossier encodé>/<session_id>.jsonl` (constaté sur la machine). `--resume` ne réémet pas les tours passés sur stdout (`t7`) : l'historique affiché est relu dans le transcript (décision 9).
 
 ### 4.7 Skills, agents, hooks, MCP
 
@@ -201,9 +206,11 @@ Inclus :
 - traitement des permissions (`bypassPermissions` + gestionnaire `can_use_tool` branché sur `--permission-prompt-tool stdio`) ;
 - panneau des agents : couleur, état, durée, outil en cours (`task_progress.last_tool_name`) ; **bonus** : fil déroulable au clic ;
 - carte minimale en style terminal pour les questions de Claude (`AskUserQuestion`) : liste des options choisies au clavier (↑↓, Entrée) ou à la souris, champ « autre réponse » libre, action « ignorer » (`annotations[…].unanswered`) ; réponse par `updatedInput.answers` ;
-- palette de skills (Ctrl+K) alimentée d'abord par la requête `initialize` (ou à défaut une lecture de `~/.claude/skills`, `~/.claude/agents` et des plugins), complétée par `system/init` après le premier message ;
+- palette de skills (Ctrl+K, ou `/` en début de saisie, décision 13) alimentée d'abord par la requête `initialize` (ou à défaut une lecture de `~/.claude/skills`, `~/.claude/agents` et des plugins), complétée par `system/init` après le premier message ;
 - interruption et changement de modèle ;
-- reprise de session sous forme de liste simple.
+- reprise de session sous forme de liste simple, avec tout l'historique relu dans le transcript (décision 9) ;
+- ouverture d'un projet par argument ou sélecteur des projets récents (décision 11) ;
+- bandeau « version non testée » si le CLI n'est pas en 2.1.325 (décision 12).
 
 Exclus : formulaires natifs (l'outil MCP « formulaire » est l'étape 2 de la décision 6), aperçu HTML des options d'`AskUserQuestion` (voir section 7), personnalisations de look au-delà de la fidélité terminal, multi-session simultanée (non décidée).
 
@@ -220,7 +227,8 @@ Le gestionnaire de `control_request` répond `allow` par défaut à tout `can_us
 - Sous-agents imbriqués et skills forkés : décrits dans la doc, non reproduits.
 - Sous-agent d'arrière-plan qui survit au tour avec stdin ouvert : dans `t3` la fin arrive avant le `result`.
 - `request_user_dialog`, `hook_callback` et `mcp_message` (transport MCP in-process pour l'outil formulaire).
-- Lister les sessions pour la reprise : emplacement exact des transcripts `.jsonl` (la doc renvoie à https://code.claude.com/docs/en/sessions.md#where-transcripts-are-stored), à étudier.
+- Résolu : emplacement des transcripts, constaté sur la machine : `~/.claude/projects/<dossier encodé>/<session_id>.jsonl` (tout caractère hors `[A-Za-z0-9]` remplacé par `-`), plus `<session_id>/subagents/agent-*.jsonl` ; les sessions `-p` y figurent aussi (`entrypoint: "sdk-cli"`). Affichage de l'historique à la reprise : décision 9. Choix du dossier de projet : décision 11.
+- Résolu : version du CLI différente (décision 12), raccourcis (décision 13), auteur des captures de référence du TUI (décision 10).
 - Format exact de `rate_limit_event` (une seule observation) et des événements non capturés (`api_retry`, `permission_denied`).
 - Résolu : les « espaces » des noms d'agents sont des U+00A0 présents dans le frontmatter des agents (voir 4.8).
 - Un `/orchestrateur` ou autre skill lancé par l'app apparaît-il comme message `user` développé ? Non examiné en détail (`t5`).
