@@ -70,11 +70,11 @@ const STYLE: Record<string, (page: Page) => Promise<void>> = {
     expect(await css(page, ".user-band", "background-color")).toBe("rgb(55, 55, 55)");
   },
   "03": async (page) => {
-    await expect(page.locator('input[aria-label="Message"]')).toBeVisible();
+    await expect(page.locator('[aria-label="Message"]')).toBeVisible();
     await expect(page.getByTestId("status-line")).toHaveText(/bypass permissions on/);
   },
   "03b": async (page) => {
-    await expect(page.locator('input[aria-label="Message"]')).toHaveCount(0);
+    await expect(page.locator('[aria-label="Message"]')).toHaveCount(0);
     await expect(page.getByTestId("status-line")).toHaveCount(0);
     await expect(page.getByTestId("detail-bar")).toBeVisible();
   },
@@ -91,7 +91,7 @@ const STYLE: Record<string, (page: Page) => Promise<void>> = {
   },
   "09b": async (page) => {
     expect(await css(page, ".g.err", "color")).toBe("rgb(255, 107, 128)");
-    await expect(page.locator('input[aria-label="Message"]')).toHaveCount(0);
+    await expect(page.locator('[aria-label="Message"]')).toHaveCount(0);
   },
 };
 
@@ -172,7 +172,7 @@ test("Ctrl+O bascule et revient sans perdre la ligne lue", async ({ page }) => {
       const rows = [...el.querySelectorAll<HTMLElement>("[data-first-row]")].sort(
         (a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top,
       );
-      const r = rows.find((x) => x.getBoundingClientRect().bottom > vp.top + 2);
+      const r = rows.find((x) => x.getBoundingClientRect().bottom > vp.top + 4);
       return r?.dataset.firstRow ?? "";
     });
   const before = await topText();

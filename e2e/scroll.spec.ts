@@ -372,14 +372,14 @@ test("ajout d'un message utilisateur : visible < 50 ms après Entrée", async ()
   const res: number[] = [];
   for (let i = 0; i < 5; i++) {
     const text = `message de mesure ${i}`;
-    await page.locator('input[aria-label="Message"]').fill(text);
+    await page.locator('[aria-label="Message"]').fill(text);
     // Écouteurs posés avant la frappe : `keydown` donne t0, un observateur de
     // mutations voit la ligne dans l'image même où elle est insérée, puis la
     // mesure est prise après la peinture de cette image.
     await page.evaluate((text) => {
       const w = window as unknown as { __t0: number; __vis: Promise<number> };
       w.__t0 = 0;
-      document.querySelector('input[aria-label="Message"]')!.addEventListener(
+      document.querySelector('[aria-label="Message"]')!.addEventListener(
         "keydown",
         (e) => {
           if ((e as KeyboardEvent).key === "Enter") w.__t0 = performance.now();
