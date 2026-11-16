@@ -109,7 +109,7 @@ Les numéros exacts des dépendances sont fixés au jalon J0 (dernières stables
 Principes :
 
 - Le cœur **normalise** : l'interface ne voit jamais le JSON brut du CLI. Elle reçoit des `CoreEvent` déjà corrélés (fil, bloc, agent, requête).
-- Les événements passent par un **`tauri::ipc::Channel<Vec<CoreEvent>>`** ouvert par `start_session` : ordre garanti, plus rapide que `emit`. Le cœur **regroupe** les événements par lot : un lot part dès qu'il y a 16 ms d'accumulation ou 256 événements, et immédiatement quand le flux est calme (premier événement après 16 ms d'inactivité).
+- Les événements passent par un **`tauri::ipc::Channel<Vec<CoreEvent>>`** ouvert par `start_session` : ordre garanti, plus rapide que `emit`. Le cœur **regroupe** les événements par lot : un lot part dès qu'il y a 16 ms d'accumulation ou 256 événements, et immédiatement au bord avant d'une rafale : aucun lot depuis 16 ms, ou événement précédent à 5 ms ou plus (ajout de la recette J12, `4c41fd9` : à 100 `text_delta`/s, chaque delta part à son arrivée). L'écho d'un message tapé (`user_message` `Typed`) part toujours tout de suite.
 - Chaque événement porte `seq: u64` (ordre, détection de trou) et `t: u64` (ms depuis l'epoch à la lecture de la ligne, pour mesurer la latence).
 - Prototype 1 : une session à la fois (spec section 6), mais chaque commande et événement porte `session: SessionKey` (identifiant local à l'app) pour ne pas casser le contrat le jour où le multi-session arrivera.
 - Les noms ci-dessous sont en Rust (`snake_case`) ; ts-rs produit les types TS équivalents.
