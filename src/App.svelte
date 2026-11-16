@@ -6,8 +6,11 @@
   // interruption et changement de modèle.
   // J8 : carte de question `AskUserQuestion` (`QuestionCard.svelte`), à la
   // place de la saisie tant qu'une question attend.
+  // J10 : palette (`Palette.svelte`) ouverte par `/` en début de saisie ou
+  // Ctrl+K, remplie par `ready.commands` et complétée par `init`.
   import { onMount } from "svelte";
   import Conversation from "./lib/components/Conversation.svelte";
+  import { entriesFrom, filterEntries, nameColumn } from "./lib/components/Palette.svelte";
   import Prompt from "./lib/components/Prompt.svelte";
   import QuestionCard from "./lib/components/QuestionCard.svelte";
   import StatusLine from "./lib/components/StatusLine.svelte";
@@ -84,8 +87,92 @@
   const keys = new Keys();
   /** Sélecteur de modèle (Alt+P ou `/model`). */
   let pickerOpen = $state(false);
-  /** Palette (J10) : point d'accroche, aucune palette n'existe encore. */
-  let paletteOpen = $state(false);
+  // --- Palette (J10) ---------------------------------------------------------
+  //
+  // Le filtre est le texte de la saisie : `/` en début de saisie ouvre la
+  // palette, les caractères suivants filtrent (`10`) ; une espace, un saut de
+  // ligne ou l'effacement du `/` la referment. Ctrl+K l'ouvre n'importe où :
+  // le texte déjà tapé (`base`) est gardé et suivra la commande choisie, le
+  // texte tapé ensuite filtre. Échap ferme sans rien insérer.
+
+  /** Noms de `init.skills` et `init.slash_commands` (fusionnés, jamais vidés). */
+  let initNames: string[] = $state([]);
+  /** `/model` est traité par l'app (sélecteur) : toujours dans la palette. */
+  const MODEL_ENTRY = { name: "model", description: "Set the AI model for Claude Code", argument_hint: null };
+  const paletteEntries = $derived(
+    entriesFrom(
+      store.meta.commands.some((c) => c.name === "model") ? store.meta.commands : [...store.meta.commands, MODEL_ENTRY],
+      initNames,
+    ),
+  );
+  const paletteNameWidth = $derived(nameColumn(paletteEntries));
+  /** Palette ouverte par Ctrl+K, avec le texte déjà tapé à ce moment. */
+  let ctrlK: { base: string } | null = $state(null);
+  /** Saisie `/…` sur laquelle Échap a fermé la palette (elle reste fermée tant que le texte ne change pas). */
+  let slashDismissed: string | null = $state(null);
+  let paletteSel = $state(0);
+
+  /** Filtre en cours, ou `null` : palette fermée. */
+  const paletteQuery = $derived.by((): string | null => {
+    if (store.question || verbose) return null;
+    if (ctrlK) {
+      const rest = draft.startsWith(ctrlK.base) ? draft.slice(ctrlK.base.length) : draft;
+      return rest.replace(/^\//, "");
+    }
+    const m = /^\/(\S*)$/.exec(draft);
+    return m && draft !== slashDismissed ? m[1] : null;
+  });
+  const paletteItems = $derived(paletteQuery === null ? [] : filterEntries(paletteEntries, paletteQuery));
+  /** Ouverte : par Ctrl+K (même sans résultat), ou par `/` avec au moins une entrée (le menu du TUI disparaît sinon). */
+  const paletteOpen = $derived(paletteQuery !== null && (ctrlK !== null || paletteItems.length > 0));
+  // Nouveau filtre : la sélection revient en tête.
+  $effect(() => {
+    void paletteQuery;
+    paletteSel = 0;
+  });
+
+  function closePalette(): void {
+    if (ctrlK) ctrlK = null;
+    else slashDismissed = draft;
+  }
+
+  function movePalette(d: number): void {
+    const n = paletteItems.length;
+    if (n > 0) paletteSel = (paletteSel + d + n) % n;
+  }
+
+  /**
+   * Choix d'une entrée. Entrée, comme le TUI : une commande sans argument
+   * (`argument_hint` vide), ou dont le nom est déjà tapé en entier, part tout
+   * de suite ; avec argument, `/nom ` est inséré pour le taper. Tab et clic insèrent toujours `/nom `. Après
+   * Ctrl+K, le texte déjà tapé suit la commande (et rien ne part seul).
+   */
+  function choosePalette(i: number, how: "enter" | "tab" | "click"): void {
+    const e = paletteItems[i];
+    if (!e) return;
+    const tail = ctrlK?.base ?? "";
+    ctrlK = null;
+    slashDismissed = null;
+    // Nom tapé en entier (`/model`) : Entrée l'envoie tel quel, comme sans palette.
+    const typedInFull = paletteQuery === e.name;
+    if (how === "enter" && (!e.argumentHint || typedInFull) && tail === "") {
+      draft = "";
+      void submit(`/${e.name}`);
+      return;
+    }
+    draft = `/${e.name} ${tail}`;
+    prompt?.focusEnd();
+  }
+
+  /** Lot du cœur : retient les noms de `init` pour la palette, puis le magasin. */
+  function ingest(batch: CoreEvent[]): void {
+    for (const ev of batch) {
+      if (ev.kind !== "init") continue;
+      const add = [...ev.skills, ...ev.slash_commands].filter((n) => !initNames.includes(n));
+      if (add.length > 0) initNames = [...initNames, ...new Set(add)];
+    }
+    store.push(batch);
+  }
   /** Message passager à droite au-dessus de la saisie (« Set model to … »). */
   let notice: string | null = $state(null);
   let noticeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -118,9 +205,14 @@
     return !!s && !s.isCollapsed && s.toString().length > 0;
   }
 
-  /** Point d'accroche de la palette (J10) : `/` en début de saisie, Ctrl+K. */
-  function openPalette(_via: "slash" | "ctrlK"): void {
-    // J10 : ouvrir `Palette.svelte` ici (`paletteOpen = true`).
+  /** Palette (J10) : `/` en début de saisie, Ctrl+K. */
+  function openPalette(via: "slash" | "ctrlK"): void {
+    slashDismissed = null;
+    if (via === "ctrlK") {
+      if (!ctrlK) ctrlK = { base: draft.startsWith("/") ? "" : draft };
+      pickerOpen = false;
+      prompt?.focusEnd();
+    }
   }
 
   // --- Carte de question (J8) -------------------------------------------------
@@ -198,7 +290,7 @@
         break;
       case "closeOverlay":
         if (action.overlay === "picker") pickerOpen = false;
-        else paletteOpen = false;
+        else closePalette();
         prompt?.focus();
         break;
       case "skipQuestion":
@@ -403,7 +495,7 @@
         if (e.kind === "status" && e.state === "Requesting" && init) out.push(make({ ...init, kind: "init", model }));
       }
       for (const e of out) (e as { seq: number }).seq = seq++;
-      store.push(out);
+      ingest(out);
     };
 
     return {
@@ -473,7 +565,7 @@
       try {
         const info = await getLaunchInfo();
         cwd = info.cwd;
-        const started = await startSession(info.cwd, store.push);
+        const started = await startSession(info.cwd, ingest);
         // Un `exited` arrivé pendant le démarrage ne doit pas être écrasé.
         if (store.status !== "Exited") session = started.session;
       } catch (err) {
@@ -519,6 +611,9 @@
       onslash={() => openPalette("slash")}
       onpick={(m) => void applyModel(m)}
       oninputchange={() => keys.disarm()}
+      palette={paletteOpen ? { entries: paletteItems, sel: paletteSel, nameWidth: paletteNameWidth } : null}
+      onpalettemove={movePalette}
+      onpalettechoose={choosePalette}
     />
     <StatusLine {store} />
   {/if}

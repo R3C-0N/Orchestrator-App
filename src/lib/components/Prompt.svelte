@@ -10,10 +10,12 @@
   // - Entrée envoie ; Maj+Entrée insère un saut de ligne ; le collage garde
   //   les sauts de ligne (zone de texte qui grandit avec son contenu) ;
   // - ↑ sur la première ligne / ↓ sur la dernière : historique des messages ;
-  // - `/` tapé dans une saisie vide : point d'accroche de la palette (J10) ;
+  // - `/` tapé dans une saisie vide : palette (J10) ; palette ouverte : ↑↓
+  //   choisissent, Entrée envoie ou insère la commande, Tab l'insère ;
   // - sélecteur de modèle ouvert : ↑↓ choisit, Entrée valide (Échap le ferme,
   //   via le gestionnaire global).
   import type { ModelInfo } from "../core/bindings/ModelInfo";
+  import Palette, { type PaletteEntry } from "./Palette.svelte";
 
   let {
     draft = $bindable(""),
@@ -28,6 +30,9 @@
     onslash,
     onpick,
     oninputchange,
+    palette = null,
+    onpalettemove,
+    onpalettechoose,
   }: {
     draft?: string;
     disabled?: boolean;
@@ -44,6 +49,11 @@
     onslash?: () => void;
     onpick?: (model: ModelInfo) => void;
     oninputchange?: () => void;
+    /** Palette ouverte (J10) : entrées filtrées, sélection, colonne des noms. */
+    palette?: { entries: PaletteEntry[]; sel: number; nameWidth: number } | null;
+    onpalettemove?: (d: number) => void;
+    /** `enter` : envoie ou insère comme le TUI ; `tab` et `click` : insère. */
+    onpalettechoose?: (index: number, how: "enter" | "tab" | "click") => void;
   } = $props();
 
   let el: HTMLTextAreaElement | undefined = $state();
@@ -59,6 +69,14 @@
 
   export function focus(): void {
     el?.focus();
+  }
+
+  /** Focus, curseur en fin de texte (après une commande insérée par la palette). */
+  export function focusEnd(): void {
+    el?.focus();
+    queueMicrotask(() => {
+      if (el) el.selectionStart = el.selectionEnd = el.value.length;
+    });
   }
 
   export function element(): HTMLTextAreaElement | undefined {
@@ -100,6 +118,18 @@
     const plain = !e.ctrlKey && !e.altKey && !e.metaKey;
     // Composition IME : Entrée et les flèches appartiennent à l'IME.
     if (e.isComposing || e.keyCode === 229) return;
+    if (palette && plain && !e.shiftKey && palette.entries.length > 0) {
+      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        e.preventDefault();
+        onpalettemove?.(e.key === "ArrowUp" ? -1 : 1);
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        onpalettechoose?.(palette.sel, e.key === "Enter" ? "enter" : "tab");
+        return;
+      }
+    }
     if (pickerOpen && plain && !e.shiftKey && models.length > 0) {
       if (e.key === "ArrowUp" || e.key === "ArrowDown") {
         e.preventDefault();
@@ -169,7 +199,17 @@
       <div class="dim">Enter to select · ↑/↓ to navigate · Esc to cancel</div>
     </div>
   {/if}
-  <div class="hint dim" data-testid="prompt-hint">{hint ?? ""}</div>
+  {#if palette}
+    <!-- Menu `/` au-dessus de la saisie, à la place de l'indication (`10`). -->
+    <Palette
+      entries={palette.entries}
+      sel={palette.sel}
+      nameWidth={palette.nameWidth}
+      onchoose={(i) => onpalettechoose?.(i, "click")}
+    />
+  {:else}
+    <div class="hint dim" data-testid="prompt-hint">{hint ?? ""}</div>
+  {/if}
   <div class="rule" aria-hidden="true">{RULE}</div>
   <div class="line">
     <span class="g caret">❯</span>
