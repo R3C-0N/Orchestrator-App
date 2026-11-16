@@ -61,7 +61,7 @@
       "files": [
         "notes.txt"
       ],
-      "prompt": "Lis notes.txt avec l'outil Read, puis lance la commande Bash `seq 1 40 | tee nombres.txt`. Ne commente pas, reponds juste ok.",
+      "prompt": "Lis notes.txt avec l'outil Read, puis lance la commande Bash `seq 1 5 | tee nombres.txt`. Ne commente pas, reponds juste ok.",
       "steps": [
         {
           "do": "waitStop",
@@ -552,6 +552,457 @@
           "do": "capture",
           "id": "k4",
           "name": "echap-apres"
+        }
+      ]
+    },
+    {
+      "name": "echap-intervalles",
+      "extra": true,
+      "prompt": "Reponds juste ok.",
+      "steps": [
+        {
+          "do": "waitStop",
+          "count": 1,
+          "timeoutMs": 90000
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "type",
+          "text": "essai 0 ms"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "capture",
+          "id": "a000",
+          "name": "avant-echap-0ms"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "n000",
+          "name": "echap-echap-0ms-saisie-non-vide"
+        },
+        {
+          "do": "keys",
+          "send": "{BACKSPACE 30}"
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "type",
+          "text": "essai 100 ms"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "capture",
+          "id": "a100",
+          "name": "avant-echap-100ms"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 100
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "n100",
+          "name": "echap-echap-100ms-saisie-non-vide"
+        },
+        {
+          "do": "keys",
+          "send": "{BACKSPACE 30}"
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "type",
+          "text": "essai 200 ms"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "capture",
+          "id": "a200",
+          "name": "avant-echap-200ms"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 200
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "n200",
+          "name": "echap-echap-200ms-saisie-non-vide"
+        },
+        {
+          "do": "keys",
+          "send": "{BACKSPACE 30}"
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "type",
+          "text": "essai 300 ms"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "capture",
+          "id": "a300",
+          "name": "avant-echap-300ms"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 300
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "n300",
+          "name": "echap-echap-300ms-saisie-non-vide"
+        },
+        {
+          "do": "keys",
+          "send": "{BACKSPACE 30}"
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "type",
+          "text": "essai 500 ms"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "capture",
+          "id": "a500",
+          "name": "avant-echap-500ms"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "n500",
+          "name": "echap-echap-500ms-saisie-non-vide"
+        },
+        {
+          "do": "keys",
+          "send": "{BACKSPACE 30}"
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "type",
+          "text": "essai 600 ms"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "capture",
+          "id": "a600",
+          "name": "avant-echap-600ms"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 600
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "n600",
+          "name": "echap-echap-600ms-saisie-non-vide"
+        },
+        {
+          "do": "keys",
+          "send": "{BACKSPACE 30}"
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "type",
+          "text": "essai 700 ms"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "capture",
+          "id": "a700",
+          "name": "avant-echap-700ms"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 700
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "n700",
+          "name": "echap-echap-700ms-saisie-non-vide"
+        },
+        {
+          "do": "keys",
+          "send": "{BACKSPACE 30}"
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "type",
+          "text": "essai 800 ms"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "capture",
+          "id": "a800",
+          "name": "avant-echap-800ms"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 800
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "n800",
+          "name": "echap-echap-800ms-saisie-non-vide"
+        },
+        {
+          "do": "keys",
+          "send": "{BACKSPACE 30}"
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 200
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "v1",
+          "name": "echap-echap-200ms-saisie-vide-apres-tour-normal"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "v2",
+          "name": "echap-apres-v1"
+        },
+        {
+          "do": "wait",
+          "ms": 2000
+        },
+        {
+          "do": "type",
+          "text": "Lance la commande Bash `ping -n 90 127.0.0.1`, puis dis termine."
+        },
+        {
+          "do": "keys",
+          "send": "{ENTER}"
+        },
+        {
+          "do": "waitText",
+          "pattern": "\\$ ping|shell command",
+          "timeoutMs": 90000
+        },
+        {
+          "do": "wait",
+          "ms": 3000
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "waitText",
+          "pattern": "Interrupted",
+          "timeoutMs": 20000
+        },
+        {
+          "do": "wait",
+          "ms": 2500
+        },
+        {
+          "do": "capture",
+          "id": "v3",
+          "name": "tour-interrompu-avant-double-echap"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 200
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "v4",
+          "name": "echap-echap-200ms-saisie-vide-apres-tour-interrompu"
+        },
+        {
+          "do": "keys",
+          "send": "{ESC}"
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "v5",
+          "name": "echap-apres-v4"
         }
       ]
     }

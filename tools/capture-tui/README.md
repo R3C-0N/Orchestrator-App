@@ -18,7 +18,7 @@ Prérequis : Windows 11, PowerShell 7 (`pwsh`), Windows Terminal (`wt.exe`), Nod
 ```powershell
 pwsh tools/capture-tui/capture.ps1              # les 10 captures de référence
 pwsh tools/capture-tui/capture.ps1 -Only 05     # refaire une capture seule (05, ou 05,06, ou 03b)
-pwsh tools/capture-tui/capture.ps1 -Scenario ctrlc,echap   # scénarios d'observation (hors des 10)
+pwsh tools/capture-tui/capture.ps1 -Scenario ctrlc,ctrlc-tour,echap-intervalles   # scénarios d'observation (hors des 10)
 pwsh tools/capture-tui/capture.ps1 -List        # scénarios et captures, sans rien lancer
 ```
 
@@ -48,7 +48,9 @@ Les PNG ne sont pas commités : ils montrent le chemin du bac à sable, qui cont
    | `type` `text` | texte tapé tel quel (caractères spéciaux de `SendKeys` échappés) |
    | `capture` `id` `name` | écrit `id-name.png` et `id-name.uia.txt` (si `-Only` le demande) |
 
-   Une attente qui expire affiche un avertissement et le scénario continue : la capture est alors à vérifier.
+   Une attente qui expire affiche un avertissement et le scénario continue : la capture est alors à vérifier. Le journal est horodaté à la milliseconde : c'est lui qui donne l'intervalle réel entre deux touches (`echap-intervalles` mesure le double Échap à 0, 100, 200, 300, 500, 600, 700 et 800 ms, avec une capture avant et après chaque essai).
+
+   Si la session Windows est verrouillée, la fenêtre ne peut pas passer au premier plan : le script s'arrête sans envoyer de touche.
 5. Ferme la fenêtre (`WM_CLOSE`) et termine le `cmd.exe` de `run.cmd` et toute sa descendance (repérés par le chemin de `run.cmd` dans la ligne de commande), sans toucher aux autres processus `claude.exe`.
 
 ### Réglages (`scenarios.json`)

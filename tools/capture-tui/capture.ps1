@@ -129,7 +129,7 @@ public static class CapWin {
 }
 [void][CapWin]::SetProcessDPIAware()
 
-function Write-Step([string]$msg) { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $msg) }
+function Write-Step([string]$msg) { Write-Host ("[{0:HH:mm:ss.fff}] {1}" -f (Get-Date), $msg) }
 
 # --- Fenetre --------------------------------------------------------------
 function Find-Window([string]$title, [int]$timeoutMs = 20000) {
