@@ -1,6 +1,6 @@
 # Référence de fidélité : le TUI de Claude Code 2.1.325
 
-Ce dossier décrit la référence visuelle du prototype 1 : décision 3 de la spec (`docs/spec.md`), section 1.7 et jalons J1, J5, J7 et J8 du plan (`docs/plan-prototype-1.md`). Les captures ont été faites au jalon J1 (commit `64d6717`) par `tools/capture-tui/capture.ps1`.
+Ce dossier décrit la référence visuelle du prototype 1 : décision 3 de la spec (`docs/spec.md`), section 1.7 et jalons J1, J5, J7 et J8 du plan (`docs/plan-prototype-1.md`). Les captures ont été faites au jalon J1 (commit `64d6717`, puis `0bc9faa` pour la capture 03b et la mesure du double Échap) par `tools/capture-tui/capture.ps1`.
 
 ## Où sont les captures
 
@@ -31,7 +31,7 @@ Les éléments suivants sont propres au poste de capture et **ne font pas partie
 ```powershell
 pwsh tools/capture-tui/capture.ps1 -Only <n>          # ex. -Only 05, -Only 05,06, -Only 03b
 pwsh tools/capture-tui/capture.ps1                    # les 10 captures de référence (avec 03b et 09b)
-pwsh tools/capture-tui/capture.ps1 -Scenario ctrlc,echap,ctrlc-tour   # captures d'observation c*, e*, k*
+pwsh tools/capture-tui/capture.ps1 -Scenario ctrlc,ctrlc-tour,echap-intervalles   # captures d'observation c*, k*, a*, n*, v*
 pwsh tools/capture-tui/capture.ps1 -List              # liste, sans rien lancer
 ```
 
@@ -44,7 +44,7 @@ Le script cède le clavier environ une minute par scénario : les touches parten
 | 01 | `01-accueil` | logo `▐▛███▛█` orange saumon, « Claude Code v2.1.325 », modèle ; saisie vide `❯` entre deux règles `─` grises, texte d'exemple gris ; « ◐ medium · /effort » à droite au-dessus de la saisie |
 | 02 | `02-markdown-code` | message utilisateur en blanc gras sur une bande gris foncé ; réponse avec puce `●` blanche et retrait de 2 ; titres en gras sans changement de taille ; listes ; code en ligne bleu lavande ; bloc de code coloré sans cadre ; « ✻ Crunched for 6s · done 12:20 » |
 | 03 | `03-outils-tronque` | Read et Bash **regroupés** en une ligne grise « Read 1 file, ran 1 shell command », sans puce ni résultat |
-| 03b | `03b-outils-detail-ctrl-o` | la même session en **vue détaillée (Ctrl+O)** : sortie complète, « ⎿  Allowed by auto mode », heure et modèle alignés à droite, barre « Showing detailed transcript · ctrl+o to toggle · … » |
+| 03b | `03b-outils-detail-ctrl-o` | la même session en **vue détaillée (Ctrl+O)**, **entière** (de la saisie à la barre du bas) : « ● Read(<chemin absolu>) » puis « ⎿  Read 8 lines », « ● Bash(seq 1 5 \| tee nombres.txt) » puis sa sortie complète (1 à 5), « ⎿  Allowed by auto mode », heure et modèle alignés à droite avant la réponse, barre « Showing detailed transcript · ctrl+o to toggle · … » ; chaque appel est sur sa propre ligne |
 | 04 | `04-edit-diff` | « Searched for 1 pattern, read 1 file » ; `●` vert + « Update(config.py) » ; « ⎿  Added 3 lines, removed 2 lines » ; diff numéroté, fonds rouge et vert, 3 lignes de contexte |
 | 05 | `05-agents-en-cours` | « ● 2 background agents launched (↓ to manage) », sous-lignes `├` / `└`, nom de l'agent sur fond de sa couleur ; « ✻ Waiting for 2 background agents to finish » ; panneau des agents sous la ligne d'état (« ● main », « ◯ agent-bleu  description  6s · ↓ 39.0k tokens ») |
 | 06 | `06-agents-termines` | « › Message from @agent-rouge (ctrl+o to expand) » ; « ● Agent "Ping rouge" finished · 42s » ; « ✻ Worked for 53s · done 12:31 » ; le panneau des agents a disparu |
@@ -54,7 +54,7 @@ Le script cède le clavier environ une minute par scénario : les touches parten
 | 09b | `09b-erreurs-detail-ctrl-o` | les mêmes erreurs en vue détaillée : un appel par ligne, `●` rouges, « ⎿  Error: Exit code 1 » et stderr en rouge, chemin absolu de l'Edit |
 | 10 | `10-menu-slash` | menu `/` **au-dessus** de la saisie, sans cadre ; entrée choisie `❯ /loop` en bleu lavande ; descriptions alignées en colonne, repliées puis tronquées par `…` |
 
-Captures d'observation du clavier (hors des 10, scénarios `ctrlc`, `echap`, `ctrlc-tour`) :
+Captures d'observation du clavier (hors des 10, scénarios `ctrlc`, `ctrlc-tour` et `echap-intervalles`) :
 
 | Id | Fichier | Ce qu'elle montre |
 | - | - | - |
@@ -64,16 +64,23 @@ Captures d'observation du clavier (hors des 10, scénarios `ctrlc`, `echap`, `ct
 | c4 | `c4-ctrlc-saisie-non-vide-pendant-tour` | Ctrl+C pendant un tour avec « brouillon » dans la saisie : le tour est **interrompu** et la saisie **gardée** |
 | c5 | `c5-ctrlc-saisie-vide-pendant-tour` | Ctrl+C pendant un tour, saisie vide : interruption, même rendu que 08 |
 | c6 | `c6-ctrlc-apres` | état après la séquence : session utilisable, saisie vide |
-| e1 | `e1-echap-saisie-non-vide` | Échap au repos sur une saisie non vide : « Esc again to clear » à droite, au-dessus de la saisie ; le texte reste |
-| e2 | `e2-echap-echap-saisie-non-vide` | second Échap : la capture montre encore le texte et l'indication (voir « Incertain » plus bas) |
-| e3 | `e3-echap-echap-saisie-vide` | double Échap sur une saisie vide juste après la séquence : rien de visible à cet instant |
-| e4 | `e4-echap-apres` | état après la séquence |
+| a000 à a800 | `a<ms>-avant-echap-<ms>ms` (a000, a100, a200, a300, a500, a600, a700, a800) | état **avant** chaque essai de double Échap : saisie « essai <ms> ms » au repos, après un tour normal (« Reponds juste ok. ») |
+| n000 à n800 | `n<ms>-echap-echap-<ms>ms-saisie-non-vide` (mêmes intervalles) | état **après** le double Échap sur la saisie non vide, avec l'intervalle demandé entre les deux appuis. De `n000` à `n700` la saisie est **effacée** ; en `n800` elle est **gardée** (« essai 800 ms »). Intervalles réels relevés dans le journal horodaté : effacée à 736 ms, gardée à 843 ms. Un premier Échap seul affiche « Esc again to clear » sans rien effacer |
+| v1 | `v1-echap-echap-200ms-saisie-vide-apres-tour-normal` | double Échap sur une saisie **vide** après un tour normal : **menu Rewind** (« Restore the code and/or conversation to the point before… », « Enter to continue · Esc to cancel ») |
+| v2 | `v2-echap-apres-v1` | un Échap de plus : le menu Rewind se **referme**, saisie vide |
+| v3 | `v3-tour-interrompu-avant-double-echap` | état de départ : tour interrompu (« Interrupted · What should Claude do instead? »), saisie vide |
+| v4 | `v4-echap-echap-200ms-saisie-vide-apres-tour-interrompu` | double Échap sur une saisie vide après un tour **interrompu** : menu Rewind aussi |
+| v5 | `v5-echap-apres-v4` | un Échap de plus : le menu se referme |
 | k1 | `k1-tour-en-cours-saisie-vide` | indicateur pendant un tour : « ✽ Choreographing… (8s · ↓ 255 tokens) » ; appel en cours « Running ping for 90 requests to localhost · 3s » et « ⎿  $ ping … » |
 | k2 | `k2-ctrlc-saisie-vide-pendant-tour` | Ctrl+C pendant un tour : même résultat que 08 (interruption grise) |
-| k3 | `k3-echap-echap-saisie-vide-apres-tour` | double Échap sur une saisie vide après un tour : **menu Rewind** (« Restore the code and/or conversation… ») ; hors du prototype 1 |
+| k3 | `k3-echap-echap-saisie-vide-apres-tour` | double Échap sur une saisie vide après un tour : **menu Rewind** (premier relevé ; mesuré proprement en `v1` et `v4`) ; hors du prototype 1 |
 | k4 | `k4-echap-apres` | état après fermeture du menu Rewind |
 
-Incertain : en `e2`, le second Échap n'a pas effacé la saisie au moment de la capture. Soit l'intervalle entre les deux touches envoyées par `SendKeys` dépassait la fenêtre d'environ 0,5 s, soit la capture est arrivée avant le rafraîchissement. La règle retenue (un second Échap rapproché efface la saisie) vient du comportement connu du TUI ; il faudra la confirmer en refaisant la capture `-Scenario echap` avec un intervalle plus court.
+Règle du double Échap, **mesurée** (plus d'incertitude sur ce point) :
+
+- **saisie non vide** : le premier Échap affiche « Esc again to clear » sans rien effacer ; un second Échap arrivé moins d'environ 0,8 s plus tard efface la saisie (effacée à 736 ms, gardée à 843 ms) ;
+- **saisie vide** : deux appuis ouvrent le menu Rewind, après un tour normal (`v1`) comme après un tour interrompu (`v4`) ; un appui de plus le referme (`v2`, `v5`) ;
+- **dans le prototype 1, Rewind est hors périmètre** : un double Échap sur une saisie vide ne fait rien (décision 13 de la spec, jalon J7 du plan).
 
 ## Liste de contrôle de fidélité (jalon J5)
 
@@ -96,9 +103,9 @@ Messages :
 Outils :
 
 - [ ] Vue normale : appels regroupés en une ligne grise sans puce, comme « Read 1 file, ran 1 shell command », « Searched for 1 pattern, read 1 file » ou « Ran 2 shell commands » (03, 04, 09).
-- [ ] Edit et Write restent sur leur propre ligne : `●` vert + « Update(<chemin relatif>) », « Update » en gras (04).
+- [ ] Edit reste sur sa propre ligne : `●` vert + « Update(<chemin relatif>) », « Update » en gras (04). **Write n'est pas capturé** dans le TUI : libellé probable `Write(…)`, à capturer et confirmer avant J5.
 - [ ] Résultat : `  ⎿  ` (2 espaces, `⎿`, 2 espaces) en gris (04, 08, 09).
-- [ ] Ctrl+O bascule vers la vue détaillée : un appel par ligne avec sa sortie complète, heure et modèle à droite, barre « Showing detailed transcript · ctrl+o to toggle… » ; Ctrl+O revient à la vue normale (03b, 09b).
+- [ ] Ctrl+O bascule vers la vue détaillée : chaque appel sur sa ligne (`● Read(<chemin absolu>)`, `● Bash(<commande>)`) avec sa sortie complète, `⎿  Allowed by auto mode`, heure et modèle à droite, barre « Showing detailed transcript · ctrl+o to toggle… » ; Ctrl+O revient à la vue normale (03b, 09b).
 
 Diff :
 
@@ -134,4 +141,4 @@ Saisie et menu `/` :
 
 - [ ] Saisie : `❯` entre deux règles `─` pleine largeur, collée en bas (01).
 - [ ] Menu `/` au-dessus de la saisie, sans cadre ; entrée choisie `❯` en bleu lavande ; descriptions alignées en colonne, repliées puis tronquées par `…` (10).
-- [ ] Indications clavier : « Esc again to clear » à droite au-dessus de la saisie (e1) ; pas de « Press Ctrl-C again to exit » dans l'app (choix du prototype 1, décision 13).
+- [ ] Indications clavier : « Esc again to clear » à droite au-dessus de la saisie, sans effacer (`a*`, `n*`) ; second Échap en moins d'environ 0,8 s : saisie effacée (`n000` à `n700`), gardée au-delà (`n800`) ; double Échap sur saisie vide : rien dans l'app (Rewind hors périmètre, `v1`, `v4`) ; pas de « Press Ctrl-C again to exit » dans l'app (choix du prototype 1, décision 13).
