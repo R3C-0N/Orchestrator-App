@@ -86,8 +86,12 @@ impl Reducer {
         self.initialize_ids.push(request_id.to_string());
     }
 
-    /// Change d'état et émet `status` si l'état change.
+    /// Change d'état et émet `status` si l'état change. `Exited` est terminal :
+    /// plus aucun changement d'état n'est émis ensuite.
     pub fn set_state(&mut self, st: SessionState, out: &mut Vec<Action>) {
+        if self.state == Some(SessionState::Exited) {
+            return;
+        }
         if self.state != Some(st) {
             self.state = Some(st);
             out.push(Action::Emit(EventBody::Status { state: st }));
@@ -99,6 +103,27 @@ impl Reducer {
             self.state,
             Some(SessionState::Requesting | SessionState::Streaming | SessionState::Interrupting)
         )
+    }
+
+    /// Début d'une interruption : passe en `Interrupting` seulement pendant un
+    /// tour (`Requesting` ou `Streaming`). Renvoie l'état quitté, à restaurer si
+    /// l'interruption échoue ; `None` si l'état n'a pas changé.
+    pub fn begin_interrupt(&mut self, out: &mut Vec<Action>) -> Option<SessionState> {
+        match self.state {
+            Some(prev @ (SessionState::Requesting | SessionState::Streaming)) => {
+                self.set_state(SessionState::Interrupting, out);
+                Some(prev)
+            }
+            _ => None,
+        }
+    }
+
+    /// Échec ou délai de l'interruption : revient à `prev` si l'état est
+    /// toujours `Interrupting` (un `result` arrivé entre-temps l'emporte).
+    pub fn abort_interrupt(&mut self, prev: SessionState, out: &mut Vec<Action>) {
+        if self.state == Some(SessionState::Interrupting) {
+            self.set_state(prev, out);
+        }
     }
 
     fn check_version(&mut self, version: &str, out: &mut Vec<Action>) {

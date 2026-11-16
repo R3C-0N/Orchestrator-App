@@ -35,6 +35,28 @@ pub struct LaunchOptions {
     pub extra_args: Vec<String>,
 }
 
+/// Valide les valeurs venues de l'interface avant de les passer en arguments :
+/// `resume` doit être un UUID canonique (`8-4-4-4-12`) ; `model` ne doit pas
+/// commencer par `-` (pas d'injection d'option) ni contenir d'espace ou de
+/// caractère de contrôle.
+pub fn validate_launch_options(opts: &LaunchOptions) -> Result<(), String> {
+    if let Some(r) = &opts.resume {
+        let canonical = r.len() == 36 && r.as_bytes()[8] == b'-';
+        if !canonical || uuid::Uuid::try_parse(r).is_err() {
+            return Err(format!("resume doit être un UUID de session : {r:?}"));
+        }
+    }
+    if let Some(m) = &opts.model {
+        if m.is_empty() || m.starts_with('-') {
+            return Err(format!("modèle invalide : {m:?}"));
+        }
+        if m.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(format!("modèle invalide (espace ou contrôle) : {m:?}"));
+        }
+    }
+    Ok(())
+}
+
 pub fn build_args(opts: &LaunchOptions) -> Vec<String> {
     let mut args: Vec<String> = BASE_ARGS.iter().map(|s| s.to_string()).collect();
     if let Some(r) = &opts.resume {
@@ -250,5 +272,50 @@ mod tests {
              --permission-mode bypassPermissions --permission-prompt-tool stdio"
         ));
         assert!(joined.ends_with("--resume abc --model haiku"));
+    }
+
+    fn opts(resume: Option<&str>, model: Option<&str>) -> LaunchOptions {
+        LaunchOptions {
+            resume: resume.map(str::to_string),
+            model: model.map(str::to_string),
+            extra_args: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_uuid_resume_and_model_aliases() {
+        assert!(validate_launch_options(&opts(None, None)).is_ok());
+        assert!(validate_launch_options(&opts(
+            Some("77cbd82d-c401-4ae6-a84e-8439cd39aecd"),
+            Some("haiku")
+        ))
+        .is_ok());
+        assert!(validate_launch_options(&opts(None, Some("claude-sonnet-5-5"))).is_ok());
+        assert!(validate_launch_options(&opts(None, Some("opus[1m]"))).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_option_injection_and_bad_resume() {
+        for bad in [
+            "--dangerously-skip-permissions",
+            "-p",
+            "abc",
+            "",
+            "77cbd82dc4014ae6a84e8439cd39aecd", // UUID sans tirets
+            "{77cbd82d-c401-4ae6-a84e-8439cd39aecd}", // accolades
+            "urn:uuid:77cbd82d-c401-4ae6-a84e-8439cd39aecd",
+            "C:\\x\\session.jsonl",
+        ] {
+            assert!(
+                validate_launch_options(&opts(Some(bad), None)).is_err(),
+                "resume {bad:?} doit être refusé"
+            );
+        }
+        for bad in ["-x", "--model", "", "haiku --bare", "haiku\n"] {
+            assert!(
+                validate_launch_options(&opts(None, Some(bad))).is_err(),
+                "model {bad:?} doit être refusé"
+            );
+        }
     }
 }

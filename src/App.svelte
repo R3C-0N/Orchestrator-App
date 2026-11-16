@@ -19,6 +19,8 @@
 
   let rows: Row[] = $state([]);
   let session: SessionKey | null = $state(null);
+  // Vrai dès qu'un `exited` est reçu, même avant le retour de start_session.
+  let exited = false;
   let cwd = $state("");
   let status = $state("démarrage…");
   let banner: string | null = $state(null);
@@ -134,6 +136,7 @@
             level: "error",
             text: `claude.exe s'est arrêté (code ${ev.code ?? "?"})`,
           });
+          exited = true;
           session = null;
           break;
         default:
@@ -173,7 +176,8 @@
       const info = await getLaunchInfo();
       cwd = info.cwd;
       const started = await startSession(info.cwd, onEvents);
-      session = started.session;
+      // Un `exited` arrivé pendant le démarrage ne doit pas être écrasé.
+      if (!exited) session = started.session;
     } catch (err) {
       status = "échec";
       push({ id: "start", kind: "info", level: "error", text: describeError(err) });

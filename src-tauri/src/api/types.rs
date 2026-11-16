@@ -105,6 +105,8 @@ pub enum CoreError {
     SpawnFailed(String),
     #[error("dossier de travail invalide : {0}")]
     BadCwd(String),
+    #[error("argument invalide : {0}")]
+    InvalidArgument(String),
     #[error("aucune session en cours")]
     NotRunning,
     #[error("une question attend une réponse")]

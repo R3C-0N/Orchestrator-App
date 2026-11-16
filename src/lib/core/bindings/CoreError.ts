@@ -3,4 +3,4 @@
 /**
  * Erreurs des commandes, sérialisées `{ kind, message? }`.
  */
-export type CoreError = { "kind": "claude_not_found", "message": string } | { "kind": "spawn_failed", "message": string } | { "kind": "bad_cwd", "message": string } | { "kind": "not_running" } | { "kind": "question_pending" } | { "kind": "timeout", "message": string } | { "kind": "rejected", "message": string } | { "kind": "unknown_request", "message": string } | { "kind": "unsupported", "message": string } | { "kind": "io", "message": string } | { "kind": "transcript_format", "message": string };
+export type CoreError = { "kind": "claude_not_found", "message": string } | { "kind": "spawn_failed", "message": string } | { "kind": "bad_cwd", "message": string } | { "kind": "invalid_argument", "message": string } | { "kind": "not_running" } | { "kind": "question_pending" } | { "kind": "timeout", "message": string } | { "kind": "rejected", "message": string } | { "kind": "unknown_request", "message": string } | { "kind": "unsupported", "message": string } | { "kind": "io", "message": string } | { "kind": "transcript_format", "message": string };

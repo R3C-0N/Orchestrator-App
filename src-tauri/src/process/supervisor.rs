@@ -19,7 +19,9 @@ use crate::api::events::{
 };
 use crate::api::types::{Answers, CoreError, ExitInfo, InterruptAck, SessionKey, SkipReason};
 use crate::process::locate::display_path;
-use crate::process::spawn::{build_args, spawn_claude, Job, LaunchOptions};
+use crate::process::spawn::{
+    build_args, spawn_claude, validate_launch_options, Job, LaunchOptions,
+};
 use crate::protocol::outbound;
 use crate::state::batcher::{run_batcher, Sink};
 use crate::state::reducer::{Action, Reducer, CAP_UNANSWERED};
@@ -27,6 +29,8 @@ use crate::state::reducer::{Action, Reducer, CAP_UNANSWERED};
 pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 pub const STOP_GRACE: Duration = Duration::from_secs(3);
+/// Attente maximale de la fin de lecture de stderr après un échec de démarrage.
+pub const STDERR_DRAIN: Duration = Duration::from_secs(1);
 const STDERR_KEEP: usize = 200;
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
@@ -70,6 +74,7 @@ pub struct Session {
     job: Job,
     exit_rx: watch::Receiver<Option<Option<i32>>>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    stderr_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     next_id: AtomicU64,
 }
 
@@ -85,6 +90,7 @@ impl Session {
         if !cwd.is_dir() {
             return Err(CoreError::BadCwd(display_path(cwd)));
         }
+        validate_launch_options(&opts).map_err(CoreError::InvalidArgument)?;
         let args = build_args(&opts);
         let mut spawned =
             spawn_claude(exe, cwd, &args).map_err(|e| CoreError::SpawnFailed(e.to_string()))?;
@@ -126,7 +132,7 @@ impl Session {
 
         // stderr : gardé en mémoire (200 lignes) et relayé.
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
-        {
+        let stderr_task = {
             let tail = stderr_tail.clone();
             let em = emitter.clone();
             tokio::spawn(async move {
@@ -149,8 +155,8 @@ impl Session {
                         }
                     }
                 }
-            });
-        }
+            })
+        };
 
         let reducer = Arc::new(Mutex::new(Reducer::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -221,12 +227,17 @@ impl Session {
                     },
                     t,
                 );
-                em.emit(
-                    EventBody::Status {
-                        state: SessionState::Exited,
-                    },
-                    t,
-                );
+                // Par le réducteur : `Exited` y devient terminal.
+                let mut out = Vec::new();
+                reducer
+                    .lock()
+                    .unwrap()
+                    .set_state(SessionState::Exited, &mut out);
+                for a in out {
+                    if let Action::Emit(b) = a {
+                        em.emit(b, t);
+                    }
+                }
                 let _ = exit_tx.send(Some(code));
             });
         }
@@ -243,6 +254,7 @@ impl Session {
             job: spawned.job,
             exit_rx,
             stderr_tail,
+            stderr_task: Mutex::new(Some(stderr_task)),
             next_id: AtomicU64::new(1),
         });
 
@@ -255,8 +267,14 @@ impl Session {
         {
             Ok(_) => Ok(session),
             Err(e) => {
-                let tail = session.stderr_tail();
+                // Tuer l'arbre ferme stderr ; on laisse la tâche de lecture
+                // vider ce qui reste avant de construire le message d'erreur.
                 session.job.terminate();
+                let task = session.stderr_task.lock().unwrap().take();
+                if let Some(task) = task {
+                    let _ = tokio::time::timeout(STDERR_DRAIN, task).await;
+                }
+                let tail = session.stderr_tail();
                 let detail = if tail.is_empty() {
                     String::new()
                 } else {
@@ -353,25 +371,41 @@ impl Session {
     }
 
     fn set_state(&self, st: SessionState, t: u64) {
+        self.with_reducer(t, |r, out| r.set_state(st, out));
+    }
+
+    /// Exécute `f` sous le verrou du réducteur et émet les événements produits.
+    fn with_reducer<R>(&self, t: u64, f: impl FnOnce(&mut Reducer, &mut Vec<Action>) -> R) -> R {
         let mut out = Vec::new();
-        self.reducer.lock().unwrap().set_state(st, &mut out);
+        let res = f(&mut self.reducer.lock().unwrap(), &mut out);
         for a in out {
             if let Action::Emit(b) = a {
                 self.emitter.emit(b, t);
             }
         }
+        res
     }
 
     pub async fn interrupt(&self, cancel_queued: bool) -> Result<InterruptAck, CoreError> {
-        self.set_state(SessionState::Interrupting, now_ms());
+        // `Interrupting` seulement pendant un tour ; rien après `Exited`.
+        let prev = self.with_reducer(now_ms(), |r, out| r.begin_interrupt(out));
         let mut extra = Map::new();
         if cancel_queued {
             extra.insert("cancel_queued".into(), json!(true));
         }
         let id = self.new_request_id("int");
-        let v = self
+        let res = self
             .control_with_id(&id, "interrupt", extra, CONTROL_TIMEOUT)
-            .await?;
+            .await;
+        let v = match res {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(prev) = prev {
+                    self.with_reducer(now_ms(), |r, out| r.abort_interrupt(prev, out));
+                }
+                return Err(e);
+            }
+        };
         Ok(InterruptAck {
             still_queued: v
                 .get("still_queued")
@@ -408,16 +442,11 @@ impl Session {
         answers: &Answers,
         response: Option<&str>,
     ) -> Result<(), CoreError> {
-        let input = self
-            .reducer
-            .lock()
-            .unwrap()
-            .questions
-            .remove(request_id)
-            .ok_or_else(|| CoreError::UnknownRequest(request_id.into()))?;
-        self.write(outbound::answer_question(
-            request_id, &input, answers, response,
-        ))?;
+        send_then_forget_question(&self.reducer, request_id, |input| {
+            self.write(outbound::answer_question(
+                request_id, input, answers, response,
+            ))
+        })?;
         self.emitter.emit(
             EventBody::QuestionClosed {
                 request_id: request_id.into(),
@@ -429,16 +458,19 @@ impl Session {
     }
 
     pub fn skip_question(&self, request_id: &str, reason: SkipReason) -> Result<(), CoreError> {
-        let mut r = self.reducer.lock().unwrap();
-        if !r.capabilities.iter().any(|c| c == CAP_UNANSWERED) {
+        let supported = self
+            .reducer
+            .lock()
+            .unwrap()
+            .capabilities
+            .iter()
+            .any(|c| c == CAP_UNANSWERED);
+        if !supported {
             return Err(CoreError::Unsupported(CAP_UNANSWERED.into()));
         }
-        let input = r
-            .questions
-            .remove(request_id)
-            .ok_or_else(|| CoreError::UnknownRequest(request_id.into()))?;
-        drop(r);
-        self.write(outbound::skip_question(request_id, &input, reason))?;
+        send_then_forget_question(&self.reducer, request_id, |input| {
+            self.write(outbound::skip_question(request_id, input, reason))
+        })?;
         self.emitter.emit(
             EventBody::QuestionClosed {
                 request_id: request_id.into(),
@@ -478,6 +510,25 @@ impl Session {
     }
 }
 
+/// Répond à une question en attente : la réponse est écrite sur stdin sous le
+/// verrou du réducteur (deux réponses simultanées sont impossibles), et la
+/// question n'est retirée de la table qu'après un envoi réussi. En cas d'échec,
+/// elle reste en attente et peut recevoir une nouvelle réponse.
+pub(crate) fn send_then_forget_question(
+    reducer: &Mutex<Reducer>,
+    request_id: &str,
+    send: impl FnOnce(&Value) -> Result<(), CoreError>,
+) -> Result<(), CoreError> {
+    let mut r = reducer.lock().unwrap();
+    let input = r
+        .questions
+        .get(request_id)
+        .ok_or_else(|| CoreError::UnknownRequest(request_id.into()))?;
+    send(input)?;
+    r.questions.remove(request_id);
+    Ok(())
+}
+
 fn apply_actions(
     actions: Vec<Action>,
     em: &Emitter,
@@ -499,5 +550,101 @@ fn apply_actions(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reducer_with_question(id: &str) -> Mutex<Reducer> {
+        let mut r = Reducer::new();
+        r.handle(&json!({
+            "type": "control_request",
+            "request_id": id,
+            "request": {"subtype": "can_use_tool", "tool_name": "AskUserQuestion",
+                        "input": {"questions": [{"question": "Q ?", "header": "H",
+                                  "options": [], "multiSelect": false}]}}
+        }));
+        assert!(r.questions.contains_key(id));
+        Mutex::new(r)
+    }
+
+    #[test]
+    fn failed_send_keeps_the_question_pending() {
+        let r = reducer_with_question("q1");
+        let err = send_then_forget_question(&r, "q1", |_| Err(CoreError::NotRunning));
+        assert_eq!(err, Err(CoreError::NotRunning));
+        assert!(
+            r.lock().unwrap().questions.contains_key("q1"),
+            "question gardée"
+        );
+        // Une nouvelle tentative réussie la retire.
+        let mut seen = None;
+        send_then_forget_question(&r, "q1", |input| {
+            seen = Some(input.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            seen.unwrap()["questions"].is_array(),
+            "input transmis à l'envoi"
+        );
+        assert!(!r.lock().unwrap().questions.contains_key("q1"));
+        // Déjà répondue : requête inconnue, rien n'est envoyé.
+        let again = send_then_forget_question(&r, "q1", |_| panic!("ne doit pas envoyer"));
+        assert_eq!(again, Err(CoreError::UnknownRequest("q1".into())));
+    }
+
+    fn status_events(out: &[Action]) -> Vec<SessionState> {
+        out.iter()
+            .filter_map(|a| match a {
+                Action::Emit(EventBody::Status { state }) => Some(*state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interrupt_only_during_a_turn_and_restores_on_failure() {
+        let mut r = Reducer::new();
+        let mut out = Vec::new();
+        // Hors tour (Idle) : pas de changement d'état.
+        r.set_state(SessionState::Idle, &mut out);
+        out.clear();
+        assert_eq!(r.begin_interrupt(&mut out), None);
+        assert!(status_events(&out).is_empty());
+
+        // Pendant un tour : Interrupting, puis retour à Streaming si échec.
+        r.set_state(SessionState::Streaming, &mut out);
+        out.clear();
+        let prev = r.begin_interrupt(&mut out);
+        assert_eq!(prev, Some(SessionState::Streaming));
+        assert_eq!(status_events(&out), vec![SessionState::Interrupting]);
+        out.clear();
+        r.abort_interrupt(prev.unwrap(), &mut out);
+        assert_eq!(status_events(&out), vec![SessionState::Streaming]);
+
+        // Un `result` arrivé avant l'échec l'emporte : pas de retour arrière.
+        let prev = r.begin_interrupt(&mut out).unwrap();
+        r.handle(&json!({"type": "result", "subtype": "error_during_execution"}));
+        out.clear();
+        r.abort_interrupt(prev, &mut out);
+        assert!(status_events(&out).is_empty());
+        assert_eq!(r.state, Some(SessionState::Idle));
+    }
+
+    #[test]
+    fn nothing_after_exited() {
+        let mut r = Reducer::new();
+        let mut out = Vec::new();
+        r.set_state(SessionState::Streaming, &mut out);
+        r.set_state(SessionState::Exited, &mut out);
+        out.clear();
+        assert_eq!(r.begin_interrupt(&mut out), None);
+        r.set_state(SessionState::Interrupting, &mut out);
+        r.set_state(SessionState::Idle, &mut out);
+        assert!(status_events(&out).is_empty(), "aucun status après Exited");
+        assert_eq!(r.state, Some(SessionState::Exited));
     }
 }
