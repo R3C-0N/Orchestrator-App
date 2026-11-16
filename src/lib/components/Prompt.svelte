@@ -11,7 +11,8 @@
   //   les sauts de ligne (zone de texte qui grandit avec son contenu) ;
   // - ↑ sur la première ligne / ↓ sur la dernière : historique des messages ;
   // - `/` tapé dans une saisie vide : palette (J10) ; palette ouverte : ↑↓
-  //   choisissent, Entrée envoie ou insère la commande, Tab l'insère ;
+  //   choisissent, Entrée envoie ou insère la commande, Tab l'insère ; sans
+//   correspondance, Entrée et Tab ne font rien ;
   // - sélecteur de modèle ouvert : ↑↓ choisit, Entrée valide (Échap le ferme,
   //   via le gestionnaire global).
   import type { ModelInfo } from "../core/bindings/ModelInfo";
@@ -118,6 +119,12 @@
     const plain = !e.ctrlKey && !e.altKey && !e.metaKey;
     // Composition IME : Entrée et les flèches appartiennent à l'IME.
     if (e.isComposing || e.keyCode === 229) return;
+    // Palette ouverte sans correspondance (Ctrl+K) : Entrée et Tab ne font
+    // rien ; le filtre tapé n'est jamais envoyé comme message.
+    if (palette && plain && !e.shiftKey && palette.entries.length === 0 && (e.key === "Enter" || e.key === "Tab")) {
+      e.preventDefault();
+      return;
+    }
     if (palette && plain && !e.shiftKey && palette.entries.length > 0) {
       if (e.key === "ArrowUp" || e.key === "ArrowDown") {
         e.preventDefault();

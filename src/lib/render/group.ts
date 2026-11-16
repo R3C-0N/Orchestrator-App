@@ -10,6 +10,8 @@
 // - un groupe sans résultat suivi d'une interruption devient « No result
 //   recorded for N call » (`08`).
 // Vue détaillée (Ctrl+O, `03b`, `09b`) : un appel par ligne, sortie complète.
+// Dans les deux vues, un appel `AskUserQuestion` sans résultat dans un tour
+// en cours n'est pas affiché : la carte de question le remplace (`07`).
 //
 // Les objets produits sont réutilisés d'un calcul à l'autre tant que leurs
 // lignes sources sont les mêmes objets (`rows` est immuable par ligne) :
@@ -26,7 +28,8 @@ export type Item =
   | { kind: "agentDone"; key: string; row: Extract<Row, { kind: "agentDone" }> }
   | { kind: "turn"; key: string; row: Extract<Row, { kind: "turn" }> }
   | { kind: "interrupted"; key: string; row: Extract<Row, { kind: "interrupted" }>; attached: boolean }
-  | { kind: "notice"; key: string; row: Extract<Row, { kind: "notice" }> };
+  | { kind: "notice"; key: string; row: Extract<Row, { kind: "notice" }> }
+  | { kind: "plain"; key: string; row: Extract<Row, { kind: "plain" }> };
 
 /** Catégories regroupables, dans l'ordre où le TUI les nomme. */
 type Cat = "search" | "read" | "bash" | "fetch" | "web" | "list";
@@ -75,6 +78,11 @@ export function groupLabel(rows: readonly { name: string }[]): string {
   const parts: string[] = [];
   for (const [c, n] of counts) parts.push(PHRASE[c](n)[parts.length === 0 ? 0 : 1]);
   return parts.join(", ");
+}
+
+/** Appel `AskUserQuestion` encore sans résultat (question ouverte ou sur le point de l'être). */
+export function isPendingQuestion(r: { name: string; result: unknown }): boolean {
+  return r.name === "AskUserQuestion" && r.result === null;
 }
 
 /** Résultat d'un appel coupé par une interruption (« [Request interrupted by user for tool use] »). */
@@ -133,6 +141,13 @@ export class ItemCache {
           i++;
           break;
         case "tool": {
+          // Question en attente (`07`) : le TUI n'affiche pas l'appel, seule
+          // la carte compte. Il réapparaît avec son résultat, ou s'il reste
+          // sans réponse dans un tour clos.
+          if (isPendingQuestion(r) && closedAfter[i + 1] === 0) {
+            i++;
+            break;
+          }
           if (!verbose && isGroupable(r.name)) {
             let j = i;
             const g: ToolCallRow[] = [];
@@ -187,6 +202,10 @@ export class ItemCache {
         }
         case "notice":
           keep({ kind: "notice", key: v + r.id, row: r }, (o) => o.row === r);
+          i++;
+          break;
+        case "plain":
+          keep({ kind: "plain", key: v + r.id, row: r }, (o) => o.row === r);
           i++;
           break;
       }

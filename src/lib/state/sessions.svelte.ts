@@ -171,13 +171,24 @@ export class SessionList extends PickerList<SessionSummary> {
 
 // --- reprise -----------------------------------------------------------------
 
+/** Texte de la ligne « début omis » d'après les compteurs de `load_history`, ou `null`. */
+export function historyCutText(h: Pick<HistoryLoaded, "omitted_lines" | "dropped_events">): string | null {
+  if (h.omitted_lines > 0) return `Début de l'historique omis (${h.omitted_lines} lignes)`;
+  if (h.dropped_events > 0) return `Début de l'historique omis (${h.dropped_events} événements)`;
+  return null;
+}
+
 /**
  * Applique l'historique relu au magasin d'une session, **avant** les
  * événements vivants (appeler dès le retour de `start_session`). Les `seq`
  * de l'historique repartent de 0 : le compteur de trous n'en tient pas compte
- * et le dernier `seq` vivant est rétabli.
+ * et le dernier `seq` vivant est rétabli. Historique tronqué : une ligne
+ * grise « Début de l'historique omis (…) » le précède dans le fil (elle
+ * défile avec lui).
  */
 export function applyHistory(store: SessionStore, h: HistoryLoaded): void {
+  const cut = historyCutText(h);
+  if (cut) store.addPlain(cut);
   if (h.events.length === 0) return;
   const lastSeq = store.lastSeq;
   const gaps = store.gaps;

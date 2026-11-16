@@ -82,18 +82,10 @@
   let launchError: string | null = $state(null);
   const selectorOpen = $derived(phase !== "start");
   /**
-   * Historique repris tronqué (notice Info `history_truncated` du cœur,
-   * rangée dans `infos`) : ligne grise discrète en tête de la conversation.
+   * Dernier démarrage en échec (`start_session`, ou reprise) : l'écran
+   * propose de réessayer ou de revenir aux sélecteurs.
    */
-  let historyCut: string | null = $state(null);
-
-  /** Texte de la ligne « début omis » d'après les compteurs de `load_history`. */
-  function historyCutText(h: { omitted_lines: number; dropped_events: number } | null): string | null {
-    if (!h) return null;
-    if (h.omitted_lines > 0) return `Début de l'historique omis (${h.omitted_lines} lignes)`;
-    if (h.dropped_events > 0) return `Début de l'historique omis (${h.dropped_events} événements)`;
-    return null;
-  }
+  let startFailed: { path: string; resumeId: string | null } | null = $state(null);
   let mock: MockCore | null = null;
   let conversation: Conversation | undefined = $state();
   let prompt: Prompt | undefined = $state();
@@ -164,18 +156,22 @@
   );
   const paletteNameWidth = $derived(nameColumn(paletteEntries));
   /** Palette ouverte par Ctrl+K, avec le texte déjà tapé à ce moment. */
-  let ctrlK: { base: string } | null = $state(null);
+  let ctrlK = $state<{ base: string } | null>(null);
   /** Saisie `/…` sur laquelle Échap a fermé la palette (elle reste fermée tant que le texte ne change pas). */
   let slashDismissed: string | null = $state(null);
   let paletteSel = $state(0);
 
+  /**
+   * Texte déjà tapé avant Ctrl+K et encore présent en tête de la saisie. Si
+   * l'utilisateur l'a effacé (ou modifié), il n'y a plus de `base` : toute la
+   * saisie devient le filtre, et rien ne sera recollé après la commande.
+   */
+  const ctrlKBase = $derived(ctrlK && draft.startsWith(ctrlK.base) ? ctrlK.base : "");
+
   /** Filtre en cours, ou `null` : palette fermée. */
   const paletteQuery = $derived.by((): string | null => {
     if (store.question || verbose) return null;
-    if (ctrlK) {
-      const rest = draft.startsWith(ctrlK.base) ? draft.slice(ctrlK.base.length) : draft;
-      return rest.replace(/^\//, "");
-    }
+    if (ctrlK) return draft.slice(ctrlKBase.length).replace(/^\//, "");
     const m = /^\/(\S*)$/.exec(draft);
     return m && draft !== slashDismissed ? m[1] : null;
   });
@@ -207,7 +203,7 @@
   function choosePalette(i: number, how: "enter" | "tab" | "click"): void {
     const e = paletteItems[i];
     if (!e) return;
-    const tail = ctrlK?.base ?? "";
+    const tail = ctrlKBase;
     ctrlK = null;
     slashDismissed = null;
     // Nom tapé en entier (`/model`) : Entrée l'envoie tel quel, comme sans palette.
@@ -376,8 +372,12 @@
       selector: selectorOpen,
     });
     // Sélecteur de projet ou de session : ses touches lui reviennent, et
-    // aucun raccourci de la saisie (palette, modèle) ne s'applique.
-    if (selectorOpen && action.type !== "copy" && action.type !== "toggleVerbose") return;
+    // aucun raccourci (palette, vue détaillée, modèle) ne s'applique ;
+    // `decide` les rend sans effet (`none`), le navigateur ne les reçoit pas.
+    if (selectorOpen) {
+      if (action.type === "none") e.preventDefault();
+      return;
+    }
     if (action.type === "pass") {
       // Carte de question : la frappe est à elle (chiffres, champ libre).
       if (store.question) {
@@ -399,7 +399,7 @@
 
   // --- Envoi ----------------------------------------------------------------
 
-  /** Messages envoyés depuis cette saisie (historique ↑↓). */
+  /** Messages envoyés depuis cette saisie (historique ↑↓), vidés à chaque changement de magasin. */
   const sent: string[] = [];
 
   /** Historique : messages du fil (reprise comprise), puis ceux envoyés ici. */
@@ -627,18 +627,40 @@
 
   // --- Projets et sessions (J11) -------------------------------------------------
 
-  /** Nouvelle session dans `path`. */
-  async function startNew(path: string): Promise<void> {
+  /**
+   * Magasin neuf pour une autre session : tout ce qui appartenait à la
+   * précédente est oublié (saisie, historique ↑↓ des envois, noms de `init`
+   * pour la palette, palette et sélecteur de modèle, agents dépliés, erreur
+   * de démarrage).
+   */
+  function switchStore(path: string): SessionStore {
     phase = "start";
     cwd = path;
-    historyCut = null;
-    const s = store;
+    const s = newStore();
+    store = s;
+    draft = "";
+    sent.length = 0;
+    initNames = [];
+    ctrlK = null;
+    slashDismissed = null;
+    pickerOpen = false;
+    agentsOpen = [];
+    startError = null;
+    startFailed = null;
+    return s;
+  }
+
+  /** Nouvelle session dans `path`, sur un magasin neuf. */
+  async function startNew(path: string): Promise<void> {
+    const s = switchStore(path);
     try {
       const started = await startSession(path, s.push);
       // Un `exited` arrivé pendant le démarrage ne doit pas être écrasé.
       if (s === store && s.status !== "Exited") session = started.session;
     } catch (err) {
+      if (s !== store) return;
       startError = describeError(err);
+      startFailed = { path, resumeId: null };
     }
   }
 
@@ -646,26 +668,39 @@
    * Reprise de la session `id` du projet choisi : magasin neuf, puis
    * `stop_session`, `start_session --resume`, `load_history`
    * (`resumeSession`). Un historique illisible donne le bandeau
-   * `history_unavailable`, et la session continue.
+   * `history_unavailable`, et la session continue ; un historique tronqué,
+   * la ligne « Début de l'historique omis » en tête du fil.
    */
   async function resume(path: string, id: string): Promise<void> {
-    phase = "start";
-    cwd = path;
-    const s = newStore();
-    store = s;
-    draft = "";
-    agentsOpen = [];
+    const s = switchStore(path);
     const current = session;
     session = null;
-    historyCut = null;
     try {
-      const { started, history } = await resumeSession({ startSession, stopSession }, { current, cwd: path, sessionId: id, store: s });
+      const { started } = await resumeSession({ startSession, stopSession }, { current, cwd: path, sessionId: id, store: s });
       if (s !== store) return;
-      historyCut = historyCutText(history);
       if (s.status !== "Exited") session = started.session;
     } catch (err) {
+      if (s !== store) return;
       startError = describeError(err);
+      startFailed = { path, resumeId: id };
     }
+  }
+
+  /** Après un échec de démarrage : même demande, magasin neuf. */
+  function retryStart(): void {
+    const f = startFailed;
+    if (!f) return;
+    if (f.resumeId) void resume(f.path, f.resumeId);
+    else void startNew(f.path);
+  }
+
+  /** Après un échec de démarrage : retour au sélecteur des sessions du projet. */
+  function backToSelectors(): void {
+    const f = startFailed;
+    startFailed = null;
+    startError = null;
+    projectPath = f?.path ?? projectPath;
+    phase = projectPath ? "sessions" : "projects";
   }
 </script>
 
@@ -699,8 +734,12 @@
           oncancel={() => (phase = "projects")}
         />
       {:else}
-        {#if historyCut}
-          <div class="history-cut term" data-testid="history-cut">{`  ⎿  ${historyCut}`}</div>
+        {#if startFailed}
+          <!-- Échec du démarrage (plan 1.9) : réessayer, ou revenir aux sélecteurs. -->
+          <div class="start-failed term" data-testid="start-failed">
+            <button data-testid="start-retry" onclick={retryStart}>Réessayer</button>
+            <button data-testid="start-back" onclick={backToSelectors}>Revenir aux sélecteurs</button>
+          </div>
         {/if}
         <Conversation {store} {verbose} bind:this={conversation} />
         <!-- Vue détaillée (Ctrl+O) : la barre « Showing detailed transcript » de la
@@ -764,12 +803,22 @@
     display: flex;
     flex-direction: column;
   }
-  .history-cut {
+  .start-failed {
     flex: none;
-    color: var(--t-dim);
-    white-space: pre;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    display: flex;
+    gap: 2ch;
+    padding: var(--t-lh) 1ch 0;
+  }
+  .start-failed button {
+    background: var(--t-bg);
+    color: var(--t-fg);
+    border: 1px solid #555;
+    font: inherit;
+    padding: 0 1ch;
+    cursor: pointer;
+  }
+  .start-failed button:focus-visible {
+    outline: 1px solid var(--t-fg);
   }
   .banner {
     padding: 0 1ch;

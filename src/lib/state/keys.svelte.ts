@@ -18,6 +18,11 @@
 //   843 ms) ; saisie vide → rien (Rewind hors du prototype 1, `v1`, `v4`).
 // - Ctrl+K, et `/` en début de saisie (voir `Prompt.svelte`) : palette (J10).
 // - Ctrl+O : vue détaillée (J5). Alt+P : sélecteur de modèle (comme le TUI).
+// - Carte de question ouverte : Ctrl+C copie une sélection ou interrompt le
+//   tour, mais n'efface jamais la saisie cachée derrière la carte.
+// - Sélecteur de projet ou de session ouvert (J11) : ses touches lui
+//   reviennent ; Ctrl+C ne fait que copier ; Ctrl+K, Ctrl+O et Alt+P sont
+//   sans effet (aucune conversation ni saisie derrière).
 
 /** Délai du double Échap qui efface la saisie (mesuré : 736 ms effacée, 843 ms gardée). */
 export const ESC_CLEAR_MS = 800;
@@ -110,9 +115,20 @@ export function decide(k: KeyInput, ctx: KeyContext, armedAt: number | null): Ke
 
   if (onlyCtrl && isLetter(k, "c")) {
     if (ctx.hasSelection) return { type: "copy" };
+    if (ctx.selector) return { type: "none" };
     if (ctx.busy) return ctx.interrupting ? { type: "none" } : { type: "interrupt" };
+    // La saisie est cachée par la carte : ne pas l'effacer sans la montrer.
+    if (ctx.question) return { type: "none" };
     if (ctx.draft.length > 0) return { type: "clear" };
     return { type: "none" };
+  }
+
+  // Sélecteur ouvert : pas de palette, de vue détaillée ni de modèle.
+  if (ctx.selector) {
+    const shortcut =
+      (onlyCtrl && (isLetter(k, "k") || isLetter(k, "o"))) ||
+      (k.alt && !k.ctrl && !k.shift && !k.meta && isLetter(k, "p"));
+    return shortcut ? { type: "none" } : { type: "pass" };
   }
 
   if (plain && k.key === "Escape") {

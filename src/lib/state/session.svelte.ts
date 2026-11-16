@@ -63,6 +63,12 @@ export type TurnResultRow = {
 };
 export type NoticeRow = { kind: "notice"; id: string; level: NoticeLevel; code: string; message: string };
 export type InterruptedRow = { kind: "interrupted"; id: string; text: string };
+/**
+ * Ligne grise de l'app dans le fil, sans puce : « ⎿  Début de l'historique
+ * omis (N lignes) » en tête d'un historique repris tronqué. Elle défile avec
+ * le reste du fil.
+ */
+export type PlainTextRow = { kind: "plain"; id: string; text: string };
 
 export type Row =
   | UserRow
@@ -72,7 +78,8 @@ export type Row =
   | AgentDoneRow
   | TurnResultRow
   | NoticeRow
-  | InterruptedRow;
+  | InterruptedRow
+  | PlainTextRow;
 
 /** `id` : unique dans la session (clé d'affichage), `seq` : événement source ou -1. */
 export type Notice = { id: number; level: NoticeLevel; code: string; message: string; seq: number };
@@ -224,6 +231,11 @@ export class SessionStore {
       if (threadTouched) this.threadsRev++;
     }
     this.onApplied?.({ deltaTs, count: events.length });
+  }
+
+  /** Ligne grise de l'app à la suite du fil (`PlainTextRow`), hors application d'un lot. */
+  addPlain(text: string): void {
+    this.rows = [...this.rows, { kind: "plain", id: `p${this.#idn++}`, text }];
   }
 
   /** Bandeau en tête de la conversation (erreur locale de l'interface, par exemple). */

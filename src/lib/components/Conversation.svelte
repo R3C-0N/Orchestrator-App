@@ -12,6 +12,12 @@
   //   il revient dès qu'il redescend au bas.
   // - La bascule de vue garde la position de lecture : la ligne source en
   //   haut de la vue reste en haut après la bascule.
+  // - Le bas n'est jamais atteint par `scrollToIndex` de virtua : celui-ci
+  //   reste actif tant que des tailles changent à moins de 150 ms d'écart
+  //   (il refait `scrollTo(cible)` à chaque mesure, `virtua/lib/core`, `m`)
+  //   et aucun geste ne l'annule ; pendant un streaming, la ligne vivante
+  //   grandit sans arrêt et il ramenait la liste en bas contre la molette.
+  //   Le recollage est direct (`toBottom`) et chaque essai revérifie `sticky`.
   import { tick } from "svelte";
   import { VList } from "virtua/svelte";
   import { ItemCache, firstRowId, itemIndexOfRow, type Item } from "../render/group";
@@ -95,10 +101,31 @@
 
   let root: HTMLElement | undefined;
 
-  /** Après un changement des données : virtua place la dernière ligne (hauteurs estimées comprises). */
+  /**
+   * Recolle en bas, tout de suite, puis après le rendu Svelte (microtâche :
+   * virtua applique la nouvelle hauteur totale) et à l'image suivante (les
+   * lignes montées entre-temps ne sont mesurées qu'alors). Chaque essai
+   * revérifie `sticky` : un geste de l'utilisateur entre deux essais gagne.
+   */
+  function toBottom() {
+    const el = root?.querySelector<HTMLElement>(".vlist");
+    if (!el) return;
+    const go = () => {
+      if (sticky && el.scrollHeight - el.clientHeight - el.scrollTop > 0.5) el.scrollTop = el.scrollHeight;
+    };
+    go();
+    tick().then(go);
+    requestAnimationFrame(go);
+  }
+
+  /**
+   * Après un changement des données : recollage direct. Les hauteurs encore
+   * estimées des nouvelles lignes sont corrigées à leur mesure
+   * (`followResize`).
+   */
   function follow() {
-    if (!sticky || !list || items.length === 0) return;
-    if (distanceFromBottom() > 0.5) list.scrollToIndex(items.length - 1, { align: "end" });
+    if (!sticky || items.length === 0) return;
+    if (distanceFromBottom() > 0.5) toBottom();
   }
 
   /**
@@ -113,28 +140,22 @@
       if (!pointerDown && performance.now() >= intentUntil && distanceFromBottom() <= BOTTOM_EPS) sticky = true;
       return;
     }
-    const el = root?.querySelector<HTMLElement>(".vlist");
-    if (!el) return;
-    const toBottom = () => {
-      if (sticky && el.scrollHeight - el.clientHeight - el.scrollTop > 0.5) el.scrollTop = el.scrollHeight;
-    };
+    // Défilement de l'élément lui-même ; la microtâche passe avant la
+    // peinture, l'essai de l'image suivante borne l'écart à une image.
     toBottom();
-    // virtua applique la nouvelle hauteur totale au prochain rendu Svelte
-    // (microtâche) : on recommence après, toujours avant la peinture.
-    tick().then(toBottom);
-    // Les lignes montées pendant ce rappel ne sont mesurées par virtua qu'à
-    // l'image suivante : dernière correction à ce moment-là (écart borné à une image).
-    requestAnimationFrame(toBottom);
   }
 
   export function scrollToTop() {
     sticky = false;
-    list?.scrollToIndex(0, { align: "start" });
+    // Décalage 0 : exact sans mesure, pas besoin de `scrollToIndex` (qui
+    // resterait actif pendant un streaming, voir l'en-tête).
+    const el = root?.querySelector<HTMLElement>(".vlist");
+    if (el) el.scrollTop = 0;
   }
 
   export function scrollToBottom() {
     sticky = true;
-    list?.scrollToIndex(items.length - 1, { align: "end" });
+    toBottom();
   }
 
   export function isSticky() {
@@ -208,7 +229,7 @@
     requestAnimationFrame(() => {
       if (!list) return;
       if (sticky || a === null) {
-        if (items.length) list.scrollToIndex(items.length - 1, { align: "end" });
+        toBottom();
         return;
       }
       const j = itemIndexOfRow(items, a);
@@ -307,7 +328,8 @@
       </VList>
     </div>
   {/key}
-  {#if busy && turnSince > 0}
+  <!-- Question ouverte (`07`) : la carte remplace l'indicateur de tour. -->
+  {#if busy && turnSince > 0 && !store.question}
     <div class="indicator-line">
       <TurnIndicator since={turnSince} chars={turnChars} thoughtMs={store.thinkingMs} />
     </div>
