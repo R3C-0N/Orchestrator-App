@@ -12,7 +12,7 @@
   // - ↑ sur la première ligne / ↓ sur la dernière : historique des messages ;
   // - `/` tapé dans une saisie vide : palette (J10) ; palette ouverte : ↑↓
   //   choisissent, Entrée envoie ou insère la commande, Tab l'insère ; sans
-//   correspondance, Entrée et Tab ne font rien ;
+  //   correspondance, Entrée et Tab ne font rien ;
   // - sélecteur de modèle ouvert : ↑↓ choisit, Entrée valide (Échap le ferme,
   //   via le gestionnaire global).
   import type { ModelInfo } from "../core/bindings/ModelInfo";

@@ -12,7 +12,7 @@
   //   il revient dès qu'il redescend au bas.
   // - La bascule de vue garde la position de lecture : la ligne source en
   //   haut de la vue reste en haut après la bascule.
-  // - Le bas n'est jamais atteint par `scrollToIndex` de virtua : celui-ci
+  // - Aucun défilement par `scrollToIndex` de virtua (bas, haut, bascule) : celui-ci
   //   reste actif tant que des tailles changent à moins de 150 ms d'écart
   //   (il refait `scrollTo(cible)` à chaque mesure, `virtua/lib/core`, `m`)
   //   et aucun geste ne l'annule ; pendant un streaming, la ligne vivante
@@ -36,7 +36,7 @@
   let { store, verbose = false }: { store: SessionStore; verbose?: boolean } = $props();
 
   const cache = new ItemCache();
-  const items: Item[] = $derived(cache.build(store.rows, verbose));
+  const items: Item[] = $derived(cache.build(store.rows, verbose, store.question?.toolUseId ?? null));
 
   let list: VList<Item> | undefined = $state();
   /** Collé en bas (suivi du streaming). */
@@ -146,7 +146,9 @@
   }
 
   export function scrollToTop() {
-    sticky = false;
+    // Même règle que `gestureUp` : on ne décroche que s'il y a de quoi
+    // défiler (sinon aucun `scroll` ne rétablirait le collage).
+    if (canScroll()) sticky = false;
     // Décalage 0 : exact sans mesure, pas besoin de `scrollToIndex` (qui
     // resterait actif pendant un streaming, voir l'en-tête).
     const el = root?.querySelector<HTMLElement>(".vlist");
@@ -235,10 +237,18 @@
       const j = itemIndexOfRow(items, a);
       if (j >= 0) {
         markIntent(400);
-        list.scrollToIndex(j, { align: "start" });
+        // Défilement direct au décalage de l'item (pas de `scrollToIndex`,
+        // qui resterait actif pendant un streaming et ramènerait la vue sur
+        // la ligne j contre la molette, voir l'en-tête).
+        const el0 = root?.querySelector<HTMLElement>(".vlist");
+        if (el0) el0.scrollTop = list.getItemOffset(j);
         // La nouvelle liste n'a que des hauteurs estimées : une fois les
-        // lignes mesurées, on recale l'item en haut (quelques images).
+        // lignes mesurées, on recale l'item en haut. Tant qu'il n'est pas
+        // rendu, son décalage (que virtua affine à chaque mesure) sert de
+        // cible. Au plus 10 images, puis plus rien : un geste ultérieur de
+        // l'utilisateur n'est jamais contré.
         let n = 0;
+        let aligned = 0;
         const settle = () => {
           const el = root?.querySelector<HTMLElement>(".vlist");
           const it = el?.querySelector<HTMLElement>(`[data-index="${j}"]`);
@@ -247,9 +257,14 @@
             if (Math.abs(d) > 0.5) {
               markIntent(200);
               el.scrollTop += d;
-            }
+              aligned = 0;
+            } else aligned++;
+          } else if (el && list) {
+            markIntent(200);
+            el.scrollTop = list.getItemOffset(j);
+            aligned = 0;
           }
-          if (++n < 4) requestAnimationFrame(settle);
+          if (++n < 10 && aligned < 2) requestAnimationFrame(settle);
         };
         requestAnimationFrame(settle);
       }

@@ -10,8 +10,9 @@
 // - un groupe sans résultat suivi d'une interruption devient « No result
 //   recorded for N call » (`08`).
 // Vue détaillée (Ctrl+O, `03b`, `09b`) : un appel par ligne, sortie complète.
-// Dans les deux vues, un appel `AskUserQuestion` sans résultat dans un tour
-// en cours n'est pas affiché : la carte de question le remplace (`07`).
+// Dans les deux vues, l'appel `AskUserQuestion` dont la carte est ouverte
+// n'est pas affiché : la carte le remplace (`07`). Sans carte (historique
+// repris, processus arrêté), il reste visible.
 //
 // Les objets produits sont réutilisés d'un calcul à l'autre tant que leurs
 // lignes sources sont les mêmes objets (`rows` est immuable par ligne) :
@@ -80,9 +81,12 @@ export function groupLabel(rows: readonly { name: string }[]): string {
   return parts.join(", ");
 }
 
-/** Appel `AskUserQuestion` encore sans résultat (question ouverte ou sur le point de l'être). */
-export function isPendingQuestion(r: { name: string; result: unknown }): boolean {
-  return r.name === "AskUserQuestion" && r.result === null;
+/**
+ * Appel `AskUserQuestion` dont la carte est ouverte : sans résultat, et
+ * `tool_use_id` égal à celui de la question en attente du magasin.
+ */
+export function isOpenQuestion(r: { name: string; result: unknown; toolUseId: string }, openQuestion: string | null): boolean {
+  return openQuestion !== null && r.name === "AskUserQuestion" && r.result === null && r.toolUseId === openQuestion;
 }
 
 /** Résultat d'un appel coupé par une interruption (« [Request interrupted by user for tool use] »). */
@@ -100,7 +104,8 @@ function sameRows<T>(a: readonly T[], b: readonly T[]): boolean {
 export class ItemCache {
   #prev = new Map<string, Item>();
 
-  build(rows: readonly Row[], verbose: boolean): Item[] {
+  /** `openQuestion` : `tool_use_id` de la question dont la carte est ouverte, ou `null`. */
+  build(rows: readonly Row[], verbose: boolean, openQuestion: string | null = null): Item[] {
     const prev = this.#prev;
     const next = new Map<string, Item>();
     const out: Item[] = [];
@@ -141,10 +146,10 @@ export class ItemCache {
           i++;
           break;
         case "tool": {
-          // Question en attente (`07`) : le TUI n'affiche pas l'appel, seule
-          // la carte compte. Il réapparaît avec son résultat, ou s'il reste
-          // sans réponse dans un tour clos.
-          if (isPendingQuestion(r) && closedAfter[i + 1] === 0) {
+          // Carte de question ouverte (`07`) : le TUI n'affiche pas l'appel,
+          // seule la carte compte. Il réapparaît avec son résultat, ou dès
+          // que la carte se ferme sans réponse.
+          if (isOpenQuestion(r, openQuestion)) {
             i++;
             break;
           }

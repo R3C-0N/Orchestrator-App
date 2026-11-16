@@ -63,7 +63,9 @@
     const s = new SessionStore();
     const push = s.push;
     s.push = (batch) => {
-      noteInit(batch);
+      // Lot d'un ancien magasin (session remplacée) : ses noms ne vont pas
+      // dans la palette de la session affichée.
+      if (s === store) noteInit(batch);
       push(batch);
     };
     s.onApplied = ({ deltaTs }) => {
