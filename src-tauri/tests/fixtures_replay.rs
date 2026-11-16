@@ -571,8 +571,10 @@ fn production_path_replays_like_value_path() {
         prod.expect_initialize("init-1");
         reference.expect_initialize("init-1");
         for (i, l) in cli.iter().enumerate() {
-            let a = prod.handle_inbound(&Inbound::from_line(l).unwrap());
-            let b = reference.handle(&serde_json::from_str::<Value>(l).unwrap());
+            // Horodatage fixe des deux côtés : le test ne dépend pas de l'horloge.
+            const T: u64 = 1_700_000_000_000;
+            let a = prod.handle_inbound_at(&Inbound::from_line(l).unwrap(), T);
+            let b = reference.handle_at(&serde_json::from_str::<Value>(l).unwrap(), T);
             assert_eq!(a, b, "{name} ligne CLI {}", i + 1);
         }
         assert_eq!(prod.unknown_count, reference.unknown_count, "{name}");

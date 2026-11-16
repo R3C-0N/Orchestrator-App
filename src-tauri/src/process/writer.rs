@@ -10,6 +10,7 @@ use std::io;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tracing::{error, warn};
 
 /// Écrit une ligne suivie de `\n`, puis vide le tampon. Une ligne contenant
 /// déjà un saut de ligne est refusée : elle casserait le découpage du CLI.
@@ -34,8 +35,8 @@ pub async fn write_line<W: AsyncWrite + Unpin>(w: &mut W, line: &str) -> io::Res
 /// fermer stdin : c'est un bogue de l'appelant, pas une panne du tuyau. Une
 /// erreur d'écriture est journalisée avant l'arrêt de la tâche.
 ///
-/// Journal : `eprintln!` faute de façade de journalisation dans le crate ;
-/// à brancher sur le journal de J6 (`logging.rs`).
+/// Journal : `tracing` (`warn!` pour une ligne rejetée, `error!` pour une
+/// erreur d'écriture), branché sur `logging.rs`.
 pub fn spawn_writer<W>(w: W) -> (mpsc::UnboundedSender<String>, JoinHandle<io::Result<()>>)
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -45,7 +46,7 @@ where
         let mut w = w;
         while let Some(line) = rx.recv().await {
             if line.contains('\n') {
-                eprintln!(
+                warn!(
                     "[writer] ligne rejetée (saut de ligne interne, {} octets) : {}",
                     line.len(),
                     line.chars().take(200).collect::<String>()
@@ -53,7 +54,7 @@ where
                 continue;
             }
             if let Err(e) = write_line(&mut w, &line).await {
-                eprintln!("[writer] écriture sur stdin impossible, arrêt de l'écrivain : {e}");
+                error!("[writer] écriture sur stdin impossible, arrêt de l'écrivain : {e}");
                 return Err(e);
             }
         }
