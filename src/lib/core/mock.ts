@@ -280,6 +280,7 @@ export class MockCore {
   #pending: CoreEvent[] = [];
   #flushTimer: ReturnType<typeof setTimeout> | null = null;
   #lastSent = 0;
+  #lastEvent = -Infinity;
   #streamTimer: ReturnType<typeof setTimeout> | null = null;
   #turn = 0;
   #r: () => number;
@@ -495,18 +496,28 @@ export class MockCore {
     this.streamReply(160);
   }
 
-  /** Regroupement du cœur : 16 ms ou 256 événements ; immédiat si calme. */
+  /**
+   * Regroupement du cœur (`state/batcher.rs`) : 256 événements, ou échéance
+   * 16 ms après le dernier lot ; immédiat au bord avant d'une rafale (aucun
+   * lot depuis 16 ms, ou événement précédent à 5 ms ou plus) et pour l'écho
+   * d'un message tapé.
+   */
   #emit(body: EventBody): void {
     const now = performance.now();
     const ev = this.factory.make(body, performance.timeOrigin + now);
-    if (this.#pending.length === 0 && now - this.#lastSent >= 16) {
+    // Écho d'un message tapé : jamais retenu (comme `urgent` du cœur).
+    const typed = body.kind === "user_message" && body.origin === "Typed";
+    const leadingEdge = now - this.#lastSent >= 16 || now - this.#lastEvent >= 5 || typed;
+    this.#lastEvent = now;
+    if (this.#pending.length === 0 && leadingEdge) {
       this.#lastSent = now;
       this.#onEvents?.([ev]);
       return;
     }
     this.#pending.push(ev);
-    if (this.#pending.length >= 256) this.#flush();
-    else if (!this.#flushTimer) this.#flushTimer = setTimeout(() => this.#flush(), 16);
+    if (this.#pending.length >= 256 || typed) this.#flush();
+    else if (!this.#flushTimer)
+      this.#flushTimer = setTimeout(() => this.#flush(), Math.max(0, this.#lastSent + 16 - now));
   }
 
   #flush(): void {

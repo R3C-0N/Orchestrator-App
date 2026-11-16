@@ -54,3 +54,7 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+# Temps simulé (`start_paused`) pour les tests du regroupeur de lots.
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
