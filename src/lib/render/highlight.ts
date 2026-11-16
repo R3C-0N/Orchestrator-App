@@ -131,6 +131,8 @@ export function languageForPath(path: string | null | undefined): string | null 
 
 /** HTML coloré (échappé) ; texte simplement échappé si le langage est inconnu. */
 export function highlight(code: string, lang: string | null): string {
+  // Fins de ligne Windows : un retour chariot resterait visible dans le rendu.
+  code = code.replace(/\r\n?/g, "\n");
   const l = knownLanguage(lang);
   if (!l) return escapeHtml(code);
   try {

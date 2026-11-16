@@ -196,7 +196,9 @@
       anchor = null;
       return;
     }
-    const i = list.findItemIndex(list.getScrollOffset());
+    // Premier item vraiment visible : un item dont il ne reste que quelques
+    // pixels en haut ne compte pas comme « la ligne lue ».
+    const i = list.findItemIndex(list.getScrollOffset() + 4);
     anchor = shown[i] ? firstRowId(shown[i]) : null;
   });
 
@@ -213,6 +215,22 @@
       if (j >= 0) {
         markIntent(400);
         list.scrollToIndex(j, { align: "start" });
+        // La nouvelle liste n'a que des hauteurs estimées : une fois les
+        // lignes mesurées, on recale l'item en haut (quelques images).
+        let n = 0;
+        const settle = () => {
+          const el = root?.querySelector<HTMLElement>(".vlist");
+          const it = el?.querySelector<HTMLElement>(`[data-index="${j}"]`);
+          if (el && it) {
+            const d = it.getBoundingClientRect().top - el.getBoundingClientRect().top;
+            if (Math.abs(d) > 0.5) {
+              markIntent(200);
+              el.scrollTop += d;
+            }
+          }
+          if (++n < 4) requestAnimationFrame(settle);
+        };
+        requestAnimationFrame(settle);
       }
     });
   }
@@ -263,6 +281,7 @@
             class:attached={item.kind === "interrupted" && item.attached}
             data-row-kind={item.kind}
             data-index={index}
+            data-first-row={firstRowId(item)}
           >
             {#if item.kind === "user"}
               <UserRow row={item.row} />
@@ -290,11 +309,14 @@
   {/key}
   {#if busy && turnSince > 0}
     <div class="indicator-line">
-      <TurnIndicator since={turnSince} chars={turnChars} />
+      <TurnIndicator since={turnSince} chars={turnChars} thoughtMs={store.thinkingMs} />
     </div>
   {/if}
   {#if verbose}
-    <div class="detail-bar">
+    <!-- Barre du TUI (03b) : « … · v to open in notepad · ? for shortcuts »
+         n'est pas repris, l'app n'a ni export vers le Bloc-notes ni aide des
+         raccourcis. -->
+    <div class="detail-bar" data-testid="detail-bar">
       <span>Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll</span>
       <span>verbose</span>
     </div>

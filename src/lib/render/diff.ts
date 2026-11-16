@@ -4,10 +4,16 @@
 // l'ancien fichier, ajouts dans le nouveau.
 //
 // Source, par ordre de préférence :
-// 1. `tool_use_result.structuredPatch` (forme relevée dans `t13`) ;
-// 2. `tool_use_result.originalFile` + `old_string`/`new_string` : diff
+// 1. `tool_use_result.structuredPatch` (forme relevée dans `t13`), pour
+//    Edit, MultiEdit et Write (écrasement d'un fichier existant) ;
+// 2. `tool_use_result.originalFile` + les remplacements de l'entrée
+//    (`old_string`/`new_string`, ou `edits[]` d'un MultiEdit) : diff
 //    recalculé avec jsdiff, 3 lignes de contexte, vrais numéros ;
-// 3. `old_string`/`new_string` seuls : diff sans contexte, numéros relatifs.
+// 3. les remplacements seuls : on ne connaît pas leur place dans le
+//    fichier. Affichage choisi : les lignes `-` et `+` **sans numéro**
+//    (colonne des numéros laissée vide), plutôt que des numéros relatifs
+//    qui laisseraient croire à une position dans le fichier.
+// Les fins de ligne CRLF sont ramenées à LF avant tout calcul.
 
 import { diffWordsWithSpace, structuredPatch } from "diff";
 import { escapeHtml, highlightLines, languageForPath } from "./highlight";
@@ -15,7 +21,8 @@ import { escapeHtml, highlightLines, languageForPath } from "./highlight";
 export type Hunk = { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] };
 
 export type DiffLine =
-  | { kind: " " | "-" | "+"; no: number; html: string }
+  /** `no` : numéro dans l'ancien (`-`) ou le nouveau fichier ; `null` si inconnu. */
+  | { kind: " " | "-" | "+"; no: number | null; html: string }
   | { kind: "gap" };
 
 export type EditDiff = {
@@ -52,26 +59,63 @@ function hunksFrom(x: unknown): Hunk[] | null {
   return out;
 }
 
-/** Hunks d'un Edit, d'après son entrée et le `tool_use_result` (`meta`). */
-export function editHunks(input: unknown, meta: unknown): Hunk[] {
+const lf = (x: string) => x.replace(/\r\n?/g, "\n");
+
+type Repl = { old: string; new: string; all: boolean };
+
+/** Remplacements de l'entrée : `edits[]` (MultiEdit) ou `old_string`/`new_string`. */
+function replacements(inp: Obj, m: Obj): Repl[] {
+  if (Array.isArray(inp.edits)) {
+    return inp.edits.filter(isObj).map((e) => ({
+      old: lf(str(e.old_string) ?? ""),
+      new: lf(str(e.new_string) ?? ""),
+      all: e.replace_all === true,
+    }));
+  }
+  const old = str(m.oldString) ?? str(inp.old_string);
+  const nw = str(m.newString) ?? str(inp.new_string);
+  if (old === null && nw === null) return [];
+  return [{ old: lf(old ?? ""), new: lf(nw ?? ""), all: inp.replace_all === true || m.replaceAll === true }];
+}
+
+export type Patch = { hunks: Hunk[]; numbered: boolean };
+
+/** Hunks d'un Edit, MultiEdit ou Write, d'après son entrée et le `tool_use_result` (`meta`). */
+export function editPatch(input: unknown, meta: unknown): Patch {
   const inp = isObj(input) ? input : {};
   const m = isObj(meta) ? meta : {};
   const patch = hunksFrom(m.structuredPatch);
-  if (patch && patch.length > 0) return patch;
-  const oldS = str(m.oldString) ?? str(inp.old_string) ?? "";
-  const newS = str(m.newString) ?? str(inp.new_string) ?? "";
-  const original = str(m.originalFile);
-  if (original !== null && oldS && original.includes(oldS)) {
-    const replaced =
-      inp.replace_all === true || m.replaceAll === true
-        ? original.split(oldS).join(newS)
-        : original.replace(oldS, () => newS);
-    return structuredPatch("a", "b", original, replaced, "", "", { context: 3 }).hunks;
+  if (patch && patch.length > 0) {
+    return { hunks: patch.map((h) => ({ ...h, lines: h.lines.map((l) => l.replace(/\r$/, "")) })), numbered: true };
   }
-  if (!oldS && !newS) return [];
-  const a = oldS.endsWith("\n") ? oldS : oldS + "\n";
-  const b = newS.endsWith("\n") ? newS : newS + "\n";
-  return structuredPatch("a", "b", a, b, "", "", { context: 3 }).hunks;
+  const repl = replacements(inp, m);
+  const originalRaw = str(m.originalFile);
+  if (originalRaw !== null && repl.length > 0) {
+    const original = lf(originalRaw);
+    let after = original;
+    let ok = true;
+    for (const r of repl) {
+      if (!r.old || !after.includes(r.old)) {
+        ok = false;
+        break;
+      }
+      after = r.all ? after.split(r.old).join(r.new) : after.replace(r.old, () => r.new);
+    }
+    if (ok) return { hunks: structuredPatch("a", "b", original, after, "", "", { context: 3 }).hunks, numbered: true };
+  }
+  const hunks: Hunk[] = [];
+  for (const r of repl) {
+    if (!r.old && !r.new) continue;
+    const a = r.old === "" || r.old.endsWith("\n") ? r.old : r.old + "\n";
+    const b = r.new === "" || r.new.endsWith("\n") ? r.new : r.new + "\n";
+    hunks.push(...structuredPatch("a", "b", a, b, "", "", { context: 3 }).hunks);
+  }
+  return { hunks, numbered: false };
+}
+
+/** Hunks seuls (voir `editPatch`). */
+export function editHunks(input: unknown, meta: unknown): Hunk[] {
+  return editPatch(input, meta).hunks;
 }
 
 /**
@@ -134,7 +178,7 @@ function wordRanges(a: string, b: string): { del: [number, number][]; add: [numb
 }
 
 /** Lignes prêtes à afficher (HTML échappé, coloration du langage du fichier). */
-export function buildDiff(hunks: Hunk[], path: string | null): EditDiff {
+export function buildDiff(hunks: Hunk[], path: string | null, numbered = true): EditDiff {
   const lang = languageForPath(path);
   let added = 0;
   let removed = 0;
@@ -163,27 +207,31 @@ export function buildDiff(hunks: Hunk[], path: string | null): EditDiff {
         const adds = body.slice(j, e).map((x) => x.slice(1));
         dels.forEach((d, q) => {
           const r = q < adds.length ? wordRanges(d, adds[q]).del : [];
-          lines.push({ kind: "-", no: o++, html: markRanges(escapeHtml(d), r) });
+          lines.push({ kind: "-", no: numbered ? o : null, html: markRanges(escapeHtml(d), r) });
+          o++;
           removed++;
         });
         adds.forEach((a, q) => {
           const r = q < dels.length ? wordRanges(dels[q], a).add : [];
-          lines.push({ kind: "+", no: n++, html: markRanges(colored[ci++] ?? escapeHtml(a), r) });
+          lines.push({ kind: "+", no: numbered ? n : null, html: markRanges(colored[ci++] ?? escapeHtml(a), r) });
+          n++;
           added++;
         });
         i = e - 1;
       } else if (k === "+") {
-        lines.push({ kind: "+", no: n++, html: colored[ci++] ?? escapeHtml(l.slice(1)) });
+        lines.push({ kind: "+", no: numbered ? n : null, html: colored[ci++] ?? escapeHtml(l.slice(1)) });
+        n++;
         added++;
       } else {
-        lines.push({ kind: " ", no: n, html: colored[ci++] ?? escapeHtml(l.slice(1)) });
+        lines.push({ kind: " ", no: numbered ? n : null, html: colored[ci++] ?? escapeHtml(l.slice(1)) });
         o++;
         n++;
       }
       maxNo = Math.max(maxNo, o - 1, n - 1);
     }
   });
-  return { added, removed, gutter: String(maxNo).length + 1, lines };
+  // Sans numéros : colonne vide de 3 (la largeur du cas courant, `04`).
+  return { added, removed, gutter: numbered ? String(maxNo).length + 1 : 3, lines };
 }
 
 /** « Added 3 lines, removed 2 lines » en HTML (nombres en gras, `04`). */
@@ -205,7 +253,8 @@ const cache = new WeakMap<object, EditDiff>();
 export function diffForRow(row: { input: unknown; result: { meta: unknown } | null }, path: string | null): EditDiff {
   const hit = cache.get(row);
   if (hit) return hit;
-  const d = buildDiff(editHunks(row.input, row.result?.meta ?? null), path);
+  const p = editPatch(row.input, row.result?.meta ?? null);
+  const d = buildDiff(p.hunks, path, p.numbered);
   cache.set(row, d);
   return d;
 }

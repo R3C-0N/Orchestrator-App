@@ -96,6 +96,37 @@ function table(t: Tokens.Table): string {
   return `<div class="md-table">${out.join("\n")}</div>`;
 }
 
+/**
+ * Chaînes à substitutions (f-strings Python, gabarits JS) comme le TUI
+ * (`02` : dans `f"Bonjour, {nom} !"`, seul `f"Bonjour, ` est rouge, la
+ * suite à partir de la première substitution garde la couleur du texte).
+ */
+function ansiStrings(html: string): string {
+  const OPEN = '<span class="hljs-string">';
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const k = html.indexOf(OPEN, i);
+    if (k < 0) return out + html.slice(i);
+    out += html.slice(i, k);
+    // Fin de la chaîne : `</span>` de même profondeur.
+    let depth = 1;
+    let j = k + OPEN.length;
+    const re = /<span[^>]*>|<\/span>/g;
+    re.lastIndex = j;
+    let m: RegExpExecArray | null;
+    while (depth > 0 && (m = re.exec(html))) {
+      depth += m[0] === "</span>" ? -1 : 1;
+      j = re.lastIndex;
+    }
+    const inner = html.slice(k + OPEN.length, j - "</span>".length);
+    const sub = inner.indexOf('<span class="hljs-subst">');
+    if (sub < 0) out += html.slice(k, j);
+    else out += OPEN + inner.slice(0, sub) + "</span>" + inner.slice(sub).replace(/<span[^>]*>|<\/span>/g, "");
+    i = j;
+  }
+}
+
 function block(t: Token, tight: boolean): string {
   switch (t.type) {
     case "heading":
@@ -111,7 +142,7 @@ function block(t: Token, tight: boolean): string {
     case "code": {
       const c = t as Tokens.Code;
       const lang = knownLanguage(c.lang);
-      return `<pre class="md-pre hl-ansi">${highlight(c.text, lang)}</pre>`;
+      return `<pre class="md-pre hl-ansi">${ansiStrings(highlight(c.text, lang))}</pre>`;
     }
     case "blockquote":
       return `<div class="md-quote">${blocks((t as Tokens.Blockquote).tokens, tight)}</div>`;
@@ -135,14 +166,14 @@ function blocks(tokens: Token[], tight = false): string {
 }
 
 function sanitize(html: string): string {
-  // DOMPurify a besoin d'un DOM ; sans DOM (tests Node), le rendu reste sûr :
-  // tout le texte est échappé et seules des balises connues sont émises.
-  return DOMPurify.isSupported ? DOMPurify.sanitize(html) : html;
+  // DOMPurify a besoin d'un DOM. Sans DOM, on ne fait confiance à aucun
+  // HTML : tout est échappé et s'affiche en texte (jamais de balise active).
+  return DOMPurify.isSupported ? DOMPurify.sanitize(html) : escapeHtml(html);
 }
 
 /** HTML d'un texte markdown (sans cache). */
 export function renderMarkdown(text: string): string {
-  const tokens = Lexer.lex(text, { gfm: true, breaks: false });
+  const tokens = Lexer.lex(text.replace(/\r\n?/g, "\n"), { gfm: true, breaks: false });
   return sanitize(blocks(tokens));
 }
 

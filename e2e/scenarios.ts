@@ -24,8 +24,8 @@ export type Scenario = {
 const SANDBOX = "C:\\projets\\demo";
 
 /** Heure locale du jour de capture (le TUI affiche l'heure locale). */
-function at(h: number, m: number, s = 0): number {
-  return new Date(2026, 10, 16, h, m, s).getTime();
+function at(h: number, m: number, s = 0, ms = 0): number {
+  return new Date(2026, 10, 16, h, m, s, ms).getTime();
 }
 
 class Builder {
@@ -135,6 +135,16 @@ class Builder {
       tool_uses: null,
       summary: a.summary ?? null,
     });
+    return this;
+  }
+
+  /** Bloc Thinking (vide, comme le CLI) entre `from` et `to`. */
+  thinking(from: number, to: number): this {
+    const msg = `msg_${this.#msg++}`;
+    this.#t = from;
+    this.#push({ kind: "block_start", thread: "main", msg, index: 0, block: { type: "Thinking" } }, 0);
+    this.#t = to;
+    this.#push({ kind: "block_done", thread: "main", msg, index: 0, block: { type: "Thinking", empty: true } }, 0);
     return this;
   }
 
@@ -376,9 +386,10 @@ function s09(verbose: boolean): Scenario {
       { text: "Exit code 1\nmkdir: cannot create directory 'dossier-absent/sous-dossier': No such file or directory", isError: true },
     )
     .tool("Bash", { command: "exit 3", description: "Sortir avec le code 3" }, { text: "Exit code 3", isError: true })
-    .setTime(at(12, 28, 58))
+    // Horodatage de la réponse : 12:29 (« 12:29 PM claude-haiku-5-5 », 09b).
+    .setTime(at(12, 28, 59, 600))
     .text(ANSWER_09)
-    .turn(23000, at(12, 29, 0));
+    .turn(23000, at(12, 29, 2));
   return { id: verbose ? "09b" : "09", ref: verbose ? "09b-erreurs-detail-ctrl-o" : "09-erreurs", verbose, steps: b.steps };
 }
 
@@ -392,6 +403,8 @@ function sK1(): Scenario {
     .user("Lance la commande Bash `ping -n 90 127.0.0.1`, puis dis termine.")
     .status("Requesting")
     .status("Streaming")
+    // Réflexion d'une seconde : « thought for 1s » (k1).
+    .thinking(now - 7000, now - 6000)
     .tool("Bash", { command: "ping -n 90 127.0.0.1", description: "Ping for 90 requests to localhost" }, undefined, now - 3000);
   return { id: "k1", ref: "k1-tour-en-cours-saisie-vide", verbose: false, steps: b.steps, relative: true, settleMs: 1200 };
 }

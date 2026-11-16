@@ -23,7 +23,7 @@
       <div class="dl gap"><span class="no">{"".padStart(diff.gutter)}</span> <span class="dim">…</span></div>
     {:else}
       <div class="dl {l.kind === '-' ? 'del' : l.kind === '+' ? 'add' : 'ctx'}"><span class="no"
-          >{String(l.no).padStart(diff.gutter)}</span
+          >{(l.no === null ? "" : String(l.no)).padStart(diff.gutter)}</span
         > <span class="sg">{l.kind}</span><span class="tx">{@html l.html}</span></div>
     {/if}
   {/each}

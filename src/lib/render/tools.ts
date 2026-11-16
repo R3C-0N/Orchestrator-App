@@ -184,3 +184,37 @@ export function clock12(at: number): string {
 export function tokens(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
+
+function esc(x: string): string {
+  return x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Vrai si le `tool_use_result` porte un `structuredPatch` non vide (Write qui écrase, Edit). */
+export function hasPatch(meta: unknown): boolean {
+  const m = obj(meta);
+  return Array.isArray(m.structuredPatch) && m.structuredPatch.length > 0;
+}
+
+/**
+ * Write d'un nouveau fichier (`type: "create"`, `t13`) : « Wrote N lines to
+ * <chemin> » (nombre et chemin en gras), puis les premières lignes
+ * numérotées (10 en vue normale, toutes en vue détaillée). HTML échappé.
+ */
+export function writeSummary(
+  input: JsonValue | null | unknown,
+  cwd: string | null,
+  verbose: boolean,
+): { head: string; lines: string[]; more: number } {
+  const inp = obj(input);
+  const content = (s(inp.content) ?? "").replace(/\r\n?/g, "\n");
+  const path = s(inp.file_path) ?? "";
+  const n = lineCount(content);
+  const all = content === "" ? [] : content.replace(/\n$/, "").split("\n");
+  const shown = verbose ? all : all.slice(0, 10);
+  const w = String(Math.max(1, all.length)).length + 1;
+  return {
+    head: `Wrote <b>${n}</b> ${n === 1 ? "line" : "lines"} to <b>${esc(verbose ? path : relPath(path, cwd))}</b>`,
+    lines: shown.map((l, i) => `${String(i + 1).padStart(w)} ${esc(l)}`),
+    more: all.length - shown.length,
+  };
+}

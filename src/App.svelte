@@ -4,6 +4,7 @@
   // simulé (`?mock=…`, ou d'office hors de Tauri : `npm run dev:mock`).
   import { onMount } from "svelte";
   import Conversation from "./lib/components/Conversation.svelte";
+  import StatusLine from "./lib/components/StatusLine.svelte";
   import {
     describeError,
     getLaunchInfo,
@@ -145,6 +146,9 @@
     <div class="banner error">{startError}</div>
   {/if}
   <Conversation {store} {verbose} bind:this={conversation} />
+  <!-- Vue détaillée (Ctrl+O) : la barre « Showing detailed transcript » de la
+       conversation remplace la saisie et la ligne d'état, comme le TUI (03b). -->
+  {#if !verbose}
   <form onsubmit={send}>
     <span class="prompt">❯</span>
     <input
@@ -155,6 +159,8 @@
       aria-label="Message"
     />
   </form>
+  <StatusLine {store} />
+  {/if}
   <footer>
     <span>{cwd}</span>
     <span>{store.status} · {store.rows.length} lignes</span>

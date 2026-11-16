@@ -7,14 +7,14 @@
   import {
     bashCommand,
     errorText,
-    lineCount,
-    relPath,
+    hasPatch,
     runningLabel,
     seconds,
     shortResult,
     toolArg,
     toolTitle,
     truncateLines,
+    writeSummary,
   } from "../../render/tools";
   import type { ToolCallRow } from "../../state/session.svelte";
   import EditDiff from "./EditDiff.svelte";
@@ -41,25 +41,9 @@
     return verbose ? { lines: text.replace(/\n+$/, "").split("\n"), more: 0 } : truncateLines(text, max);
   }
 
-  const writeInfo = $derived.by(() => {
-    if (!isWrite) return null;
-    const inp = row.input as Record<string, unknown> | null;
-    const content = inp && typeof inp.content === "string" ? inp.content : "";
-    const path = inp && typeof inp.file_path === "string" ? inp.file_path : "";
-    const n = lineCount(content);
-    const all = content.replace(/\n$/, "").split("\n");
-    const shown = verbose ? all : all.slice(0, 10);
-    const w = String(all.length).length + 1;
-    return {
-      head: `Wrote <b>${n}</b> ${n === 1 ? "line" : "lines"} to <b>${escape(verbose ? path : relPath(path, cwd))}</b>`,
-      lines: shown.map((l, i) => `${String(i + 1).padStart(w)} ${escape(l)}`),
-      more: all.length - shown.length,
-    };
-  });
-
-  function escape(s: string): string {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  }
+  /** Write qui écrase un fichier existant : le CLI donne un `structuredPatch`, on montre le diff. */
+  const writeIsUpdate = $derived(isWrite && hasPatch(row.result?.meta ?? null));
+  const writeInfo = $derived(isWrite && !writeIsUpdate ? writeSummary(row.input, cwd, verbose) : null);
 </script>
 
 <div class="l">
@@ -83,7 +67,7 @@
     <ToolResult lines={o.lines} more={o.more} tone="err" />
   {/if}
 {:else if row.result}
-  {#if isEdit}
+  {#if isEdit || writeIsUpdate}
     <EditDiff {row} />
   {:else if writeInfo}
     <ToolResult lines={[writeInfo.head, ...writeInfo.lines]} more={writeInfo.more} html />

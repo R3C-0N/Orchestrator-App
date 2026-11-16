@@ -106,9 +106,19 @@ export class ItemCache {
       return res;
     };
 
-    /** Appel resté sans résultat alors que le fil a continué (interruption, fin de tour). */
+    // Le tour d'un appel est clos quand une ligne `interrupted`, `turn` ou
+    // `user` le suit : un appel encore sans résultat ne l'aura plus.
+    // D'autres lignes (texte, appels parallèles, `agent`, `agentDone`)
+    // n'en disent rien : l'appel peut être encore en cours.
+    // `closedAfter[i]` : une ligne de clôture existe à l'index ≥ i.
+    const closedAfter = new Uint8Array(rows.length + 1);
+    for (let k = rows.length - 1; k >= 0; k--) {
+      const kind = rows[k].kind;
+      closedAfter[k] = closedAfter[k + 1] || kind === "interrupted" || kind === "turn" || kind === "user" ? 1 : 0;
+    }
+    /** Appel resté sans résultat alors que son tour est clos (interruption, fin de tour). */
     const unanswered = (r: ToolCallRow, after: number) =>
-      (r.result === null && after < rows.length) || (r.result !== null && isInterruptedResult(r.result.text));
+      (r.result === null && closedAfter[after] === 1) || (r.result !== null && isInterruptedResult(r.result.text));
 
     let i = 0;
     while (i < rows.length) {

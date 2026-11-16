@@ -136,6 +136,8 @@ export class SessionStore {
   });
   status: SessionState | "Starting" = $state("Starting");
   banners: Notice[] = $state([]);
+  /** Durée de réflexion (blocs Thinking) du tour en cours, en ms : « thought for Ns » (`k1`). */
+  thinkingMs = $state(0);
   /** Dernier `seq` appliqué (détection de trou). */
   lastSeq = $state(-1);
   gaps = $state(0);
@@ -160,6 +162,7 @@ export class SessionStore {
   /** Copie de travail de `rows` pendant une application (copie paresseuse). */
   #next: Row[] | null = null;
   #idn = 0;
+  #thinkStart: number | null = null;
   #noticeId = 0;
 
   constructor(schedule: FrameScheduler = defaultScheduler) {
@@ -286,6 +289,8 @@ export class SessionStore {
       case "user_message": {
         // `Replay` = ré-émission d'un message déjà affiché à l'envoi.
         if (ev.origin === "Replay") break;
+        // Nouveau tour : la durée de réflexion repart de zéro.
+        if (ev.origin === "Typed" && ev.thread === "main") this.thinkingMs = 0;
         const row: Row =
           ev.origin === "Interrupted"
             ? { kind: "interrupted", id: this.#id("i", ev.seq), text: INTERRUPTED_TEXT }
@@ -336,7 +341,8 @@ export class SessionStore {
           if (this.byToolUse.has(row.toolUseId)) break;
           this.byToolUse.set(row.toolUseId, this.#append(row));
         }
-        // Thinking : rien dans le fil (plan 1.7).
+        // Thinking : rien dans le fil (plan 1.7) ; seule sa durée est gardée.
+        else if (ev.block.type === "Thinking" && ev.thread === "main") this.#thinkStart = ev.t;
         break;
       }
       case "text_delta": {
@@ -354,6 +360,10 @@ export class SessionStore {
       }
       case "block_done": {
         const key = blockKey(ev.thread, ev.msg, ev.index);
+        if (ev.block.type === "Thinking" && ev.thread === "main" && this.#thinkStart !== null) {
+          this.thinkingMs += Math.max(0, ev.t - this.#thinkStart);
+          this.#thinkStart = null;
+        }
         if (ev.thread !== "main") {
           this.#threadDone(ev.thread, key, ev);
           break;

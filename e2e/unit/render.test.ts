@@ -6,11 +6,21 @@ import type { CoreEvent } from "../../src/lib/core/bindings/CoreEvent";
 import type { EventBody } from "../../src/lib/core/bindings/EventBody";
 import { EventFactory } from "../../src/lib/core/mock";
 import { agentColor, agentName } from "../../src/lib/render/colors";
-import { buildDiff, diffSummaryHtml, editHunks } from "../../src/lib/render/diff";
+import { buildDiff, diffSummaryHtml, editHunks, editPatch } from "../../src/lib/render/diff";
 import { ItemCache, groupLabel, itemIndexOfRow } from "../../src/lib/render/group";
 import { highlightLines } from "../../src/lib/render/highlight";
-import { markdownCached, renderMarkdown } from "../../src/lib/render/markdown";
-import { clock12, errorText, hhmm, relPath, runningLabel, seconds, toolArg } from "../../src/lib/render/tools";
+import { renderMarkdown } from "../../src/lib/render/markdown";
+import {
+  clock12,
+  errorText,
+  hasPatch,
+  hhmm,
+  relPath,
+  runningLabel,
+  seconds,
+  toolArg,
+  writeSummary,
+} from "../../src/lib/render/tools";
 import { SessionStore, type ToolCallRow } from "../../src/lib/state/session.svelte";
 
 function store(...bodies: EventBody[]) {
@@ -218,32 +228,122 @@ describe("diff d'Edit (04)", () => {
   });
 });
 
-describe("markdown (02)", () => {
-  const md = renderMarkdown("## Titre\n\n### Sous-titre\n\n- un **gras** et `code`\n\n1. Premier\n\n```python\ndef f():\n    return 1\n```");
+describe("markdown sans DOM (Node)", () => {
+  // Le rendu avec DOM (DOMPurify actif) est testé dans markdown.dom.test.ts.
+  it("sans DOMPurify, aucune balise n'est émise : tout est échappé", () => {
+    const h = renderMarkdown('## Titre\n\n<img src=x onerror="alert(1)">');
+    expect(h).not.toMatch(/<[a-z]/i);
+    expect(h).toContain("img src=x");
+  });
+});
 
-  it("titres sans #, en bloc gras de même taille", () => {
-    expect(md).toContain('<div class="md-h">Titre</div>');
-    expect(md).not.toContain("#");
-    expect(md).not.toMatch(/<h[1-6]/);
+describe("diff : CRLF, MultiEdit, sans originalFile", () => {
+  it("fichier CRLF : aucun retour chariot dans les lignes, mêmes numéros qu'en LF", () => {
+    const crlf = 'a\r\nb\r\nc\r\nTIMEOUT = 30\r\nd\r\ne\r\nf\r\n';
+    const p = editPatch({ old_string: "TIMEOUT = 30", new_string: "TIMEOUT = 60" }, { originalFile: crlf });
+    expect(p.numbered).toBe(true);
+    const d = buildDiff(p.hunks, "x.py", p.numbered);
+    expect(JSON.stringify(d.lines)).not.toContain("\\r");
+    expect(d.lines.map((l) => (l.kind === "gap" ? "…" : `${l.no}${l.kind}`))).toEqual(["1 ", "2 ", "3 ", "4-", "4+", "5 ", "6 ", "7 "]);
+    expect(highlightLines("x = 1\r\ny = 2", "python")).toHaveLength(2);
+    const fromPatch = editPatch({}, { structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a\r", "+b\r"] }] });
+    expect(fromPatch.hunks[0].lines).toEqual(["-a", "+b"]);
   });
 
-  it("listes avec leur marqueur en texte, code en ligne lavande, bloc de code coloré sans cadre", () => {
-    expect(md).toContain('<span class="md-mark">- </span>');
-    expect(md).toContain('<span class="md-mark">1. </span>');
-    expect(md).toContain('<span class="md-code">code</span>');
-    expect(md).toContain('<pre class="md-pre hl-ansi">');
-    expect(md).toContain('<span class="hljs-keyword">def</span>');
+  it("MultiEdit sans structuredPatch : les edits[] sont appliqués à originalFile", () => {
+    const original = "un\ndeux\ntrois\nquatre\ncinq\nsix\nsept\nhuit\n";
+    const input = {
+      file_path: "f.txt",
+      edits: [
+        { old_string: "deux", new_string: "DEUX" },
+        { old_string: "sept", new_string: "SEPT\nsept bis" },
+      ],
+    };
+    const p = editPatch(input, { originalFile: original });
+    const d = buildDiff(p.hunks, "f.txt", p.numbered);
+    expect([d.added, d.removed]).toEqual([3, 2]);
+    expect(diffSummaryHtml(d.added, d.removed)).not.toBe("No changes");
+    const changed = d.lines.filter((l) => l.kind === "-" || l.kind === "+").map((l) => ("no" in l ? `${l.no}${l.kind}` : ""));
+    expect(changed).toEqual(["2-", "2+", "7-", "7+", "8+"]);
   });
 
-  it("le HTML du texte est échappé", () => {
-    const h = renderMarkdown('<img src=x onerror="alert(1)"> et `<script>`');
-    expect(h).not.toContain("<img");
-    expect(h).not.toContain("<script>");
-    expect(h).toContain("&lt;script&gt;");
+  it("MultiEdit : structuredPatch du CLI prioritaire", () => {
+    const patch = [{ oldStart: 4, oldLines: 1, newStart: 4, newLines: 1, lines: ["-x", "+y"] }];
+    const p = editPatch({ edits: [{ old_string: "zzz", new_string: "w" }] }, { structuredPatch: patch });
+    expect(p).toEqual({ hunks: patch, numbered: true });
   });
 
-  it("cache : même texte, même chaîne", () => {
-    expect(markdownCached("a **b**")).toBe(markdownCached("a **b**"));
+  it("MultiEdit sans originalFile : un bloc par edit, sans numéros", () => {
+    const p = editPatch({ edits: [{ old_string: "a", new_string: "b" }, { old_string: "c", new_string: "d" }] }, null);
+    const d = buildDiff(p.hunks, null, p.numbered);
+    expect(p.numbered).toBe(false);
+    expect(d.lines.map((l) => (l.kind === "gap" ? "…" : `${l.no ?? "_"}${l.kind}`))).toEqual(["_-", "_+", "…", "_-", "_+"]);
+  });
+
+  it("Edit sans originalFile ni structuredPatch : lignes sans numéro (position inconnue)", () => {
+    const p = editPatch({ old_string: "x = 1", new_string: "x = 2" }, null);
+    expect(p.numbered).toBe(false);
+    const d = buildDiff(p.hunks, "a.py", p.numbered);
+    expect(d.lines.every((l) => l.kind === "gap" || l.no === null)).toBe(true);
+    expect(d.gutter).toBe(3);
+  });
+
+  it("Write d'un nouveau fichier : « Wrote N lines to <chemin> », lignes numérotées, HTML échappé", () => {
+    const w = writeSummary({ file_path: "C:\\p\\notes2.txt", content: "alpha\r\n<b>beta</b>\r\n" }, "C:\\p", false);
+    expect(w.head).toBe("Wrote <b>2</b> lines to <b>notes2.txt</b>");
+    expect(w.lines).toEqual([" 1 alpha", " 2 &lt;b&gt;beta&lt;/b&gt;"]);
+    expect(w.more).toBe(0);
+    const long = writeSummary({ file_path: "x", content: Array.from({ length: 25 }, (_, i) => `l${i}`).join("\n") }, null, false);
+    expect([long.lines.length, long.more]).toEqual([10, 15]);
+    expect(hasPatch({ type: "create", structuredPatch: [] })).toBe(false);
+    expect(hasPatch({ type: "update", structuredPatch: [{ lines: [] }] })).toBe(true);
+  });
+});
+
+describe("« No result recorded » (08)", () => {
+  const agentEv = (status: "Running" | "Completed"): EventBody => ({
+    kind: "agent",
+    tool_use_id: "ag",
+    task_id: null,
+    agent_type: "agent-bleu",
+    color: "blue",
+    description: "d",
+    status,
+    background: true,
+    started_at: 0,
+    ended_at: status === "Completed" ? 1000 : null,
+    last_tool: null,
+    tokens: null,
+    tool_uses: null,
+    summary: null,
+  });
+
+  it("un appel en cours suivi d'une ligne agent ou agentDone n'est pas « sans résultat »", () => {
+    const s = store(user("go"), ...tool("Bash", { command: "sleep 9" }), agentEv("Running"), agentEv("Completed"));
+    expect(s.rows.map((r) => r.kind)).toEqual(["user", "tool", "agent", "agentDone"]);
+    const g = new ItemCache().build(s.rows, false)[1];
+    expect(g.kind === "group" && g.noResult).toBe(false);
+  });
+
+  it("le même appel devient « sans résultat » une fois le tour clos", () => {
+    const s = store(user("go"), ...tool("Bash", { command: "sleep 9" }), agentEv("Running"), turn());
+    const g = new ItemCache().build(s.rows, false)[1];
+    expect(g.kind === "group" && g.noResult).toBe(true);
+  });
+});
+
+describe("réflexion (k1)", () => {
+  it("« thought for Ns » : durée des blocs Thinking du tour, remise à zéro au message suivant", () => {
+    const f = new EventFactory();
+    const s = new SessionStore(() => {});
+    s.apply([
+      f.make({ kind: "block_start", thread: "main", msg: "m", index: 0, block: { type: "Thinking" } }, 1000),
+      f.make({ kind: "block_done", thread: "main", msg: "m", index: 0, block: { type: "Thinking", empty: true } }, 2500),
+    ] as CoreEvent[]);
+    expect(s.thinkingMs).toBe(1500);
+    expect(s.rows).toHaveLength(0);
+    s.apply([f.make(user("suite"), 3000)] as CoreEvent[]);
+    expect(s.thinkingMs).toBe(0);
   });
 });
 

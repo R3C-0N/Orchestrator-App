@@ -38,9 +38,9 @@ const EXPECT: Record<string, string[]> = {
     "Error: Exit code 1",
     "Bash(exit 3)",
     "Error: Exit code 3",
-    "12:28 PM claude-haiku-5-5",
+    "12:29 PM claude-haiku-5-5",
   ],
-  k1: ["Running ping for 90 requests to localhost ·", "$ ping -n 90 127.0.0.1", "tokens)"],
+  k1: ["Running ping for 90 requests to localhost ·", "$ ping -n 90 127.0.0.1", "tokens · thought for 1s)"],
 };
 
 /** Textes qui ne doivent pas apparaître (règles de la vue normale). */
@@ -51,6 +51,48 @@ const ABSENT: Record<string, string[]> = {
   "06": ["Done ("],
   "08": ["Interrupted by user"],
   "09": ["Bash(", "Exit code"],
+};
+
+/** Couleur calculée (`color` ou `background-color`) du premier élément trouvé. */
+const css = (page: Page, sel: string, prop: "color" | "background-color") =>
+  page.locator(sel).first().evaluate((el, p) => getComputedStyle(el).getPropertyValue(p), prop);
+
+/** Assertions de style ciblées (valeurs relevées sur les pixels des captures). */
+const STYLE: Record<string, (page: Page) => Promise<void>> = {
+  "02": async (page) => {
+    expect(await css(page, ".md-code", "color")).toBe("rgb(177, 185, 249)");
+    // f-string : seul `f"Bonjour, ` est rouge, la suite garde la couleur du texte.
+    const strings = await page.locator(".md-pre .hljs-string").allInnerTexts();
+    expect(strings[0]).toBe('f"Bonjour, ');
+    // Deux lignes vides avant `if __name__` (02.uia.txt, lignes 25-26).
+    expect(await page.locator(".md-pre").innerText()).toContain("print(message)\n\n\nif __name__");
+    // Bande du message utilisateur.
+    expect(await css(page, ".user-band", "background-color")).toBe("rgb(55, 55, 55)");
+  },
+  "03": async (page) => {
+    await expect(page.locator('input[aria-label="Message"]')).toBeVisible();
+    await expect(page.getByTestId("status-line")).toHaveText(/bypass permissions on/);
+  },
+  "03b": async (page) => {
+    await expect(page.locator('input[aria-label="Message"]')).toHaveCount(0);
+    await expect(page.getByTestId("status-line")).toHaveCount(0);
+    await expect(page.getByTestId("detail-bar")).toBeVisible();
+  },
+  "04": async (page) => {
+    expect(await css(page, ".g.ok", "color")).toBe("rgb(78, 186, 101)");
+    expect(await css(page, ".dl.del", "background-color")).toBe("rgb(61, 1, 0)");
+    expect(await css(page, ".dl.add", "background-color")).toBe("rgb(2, 40, 0)");
+    // Mots changés : fonds relevés sur 04 (« 30 » #5C0200 en (199, 365), « 5 » #044700 en (199, 422)).
+    expect(await css(page, ".dl.del .dw", "background-color")).toBe("rgb(92, 2, 0)");
+    expect(await css(page, ".dl.add .dw", "background-color")).toBe("rgb(4, 71, 0)");
+  },
+  "09": async (page) => {
+    expect(await css(page, ".g.err", "color")).toBe("rgb(255, 107, 128)");
+  },
+  "09b": async (page) => {
+    expect(await css(page, ".g.err", "color")).toBe("rgb(255, 107, 128)");
+    await expect(page.locator('input[aria-label="Message"]')).toHaveCount(0);
+  },
 };
 
 async function play(page: Page, sc: Scenario) {
@@ -88,6 +130,8 @@ for (const sc of scenarios()) {
     for (const s of EXPECT[sc.id] ?? []) expect(text, `« ${s} » attendu (${sc.id})`).toContain(flat(s));
     for (const s of ABSENT[sc.id] ?? []) expect(text, `« ${s} » inattendu (${sc.id})`).not.toContain(flat(s));
 
+    await STYLE[sc.id]?.(page);
+
     mkdirSync(OUT_DIR, { recursive: true });
     const app = `${OUT_DIR}/${sc.id}-app.png`;
     await page.screenshot({ path: app });
@@ -124,9 +168,12 @@ test("Ctrl+O bascule et revient sans perdre la ligne lue", async ({ page }) => {
     page.evaluate(() => {
       const el = document.querySelector<HTMLElement>(".vlist")!;
       const vp = el.getBoundingClientRect();
-      const rows = [...el.querySelectorAll<HTMLElement>("[data-row-kind=user]")];
+      // Première ligne affichée en haut de la vue : sa ligne source (`data-first-row`).
+      const rows = [...el.querySelectorAll<HTMLElement>("[data-first-row]")].sort(
+        (a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top,
+      );
       const r = rows.find((x) => x.getBoundingClientRect().bottom > vp.top + 2);
-      return r?.innerText.slice(0, 60) ?? "";
+      return r?.dataset.firstRow ?? "";
     });
   const before = await topText();
   await page.keyboard.press("Control+o");
@@ -138,6 +185,7 @@ test("Ctrl+O bascule et revient sans perdre la ligne lue", async ({ page }) => {
   await page.waitForTimeout(300);
   const after = await topText();
   console.log(`MESURE ctrl-o ${JSON.stringify({ before, during, after })}`);
+  expect(before).not.toBe("");
   expect(after).toBe(before);
   expect(during).not.toBe("");
 });
