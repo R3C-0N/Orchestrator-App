@@ -105,6 +105,29 @@ describe("autres raccourcis", () => {
   });
 });
 
+describe("IME, répétition et conflits", () => {
+  it("composition IME : tout est laissé à l'IME (Échap, Entrée, Ctrl+C)", () => {
+    expect(decide(key("Escape", { composing: true }), ctx({ busy: true, draft: "x" }), null)).toEqual({ type: "pass" });
+    expect(decide(key("Enter", { composing: true }), ctx({ draft: "x" }), null)).toEqual({ type: "pass" });
+    expect(decide(key("c", { ctrl: true, composing: true }), ctx({ draft: "x" }), null)).toEqual({ type: "pass" });
+  });
+  it("Échap répété (touche maintenue) : ignoré, même armé ou pendant un tour", () => {
+    expect(decide(key("Escape", { repeat: true }), ctx({ draft: "x", now: 10_100 }), 10_000)).toEqual({ type: "pass" });
+    expect(decide(key("Escape", { repeat: true }), ctx({ busy: true }), null)).toEqual({ type: "pass" });
+  });
+  it("sélection avec palette ouverte : Ctrl+C copie, Échap ferme la palette", () => {
+    const c = ctx({ hasSelection: true, overlay: "palette", draft: "x" });
+    expect(decide(CTRL_C, c, null)).toEqual({ type: "copy" });
+    expect(decide(ESC, c, null)).toEqual({ type: "closeOverlay", overlay: "palette" });
+  });
+  it("carte de question et sélecteur ouverts : Échap ferme d'abord le sélecteur", () => {
+    expect(decide(ESC, ctx({ overlay: "picker", question: { canSkip: true }, busy: true }), null)).toEqual({
+      type: "closeOverlay",
+      overlay: "picker",
+    });
+  });
+});
+
 describe("Keys (armement du double Échap)", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
@@ -122,6 +145,20 @@ describe("Keys (armement du double Échap)", () => {
     vi.advanceTimersByTime(ESC_CLEAR_MS);
     expect(k.hint).toBeNull();
     expect(k.armedAt).toBeNull();
+  });
+  it("Maj entre les deux Échap ne désarme pas", () => {
+    const k = new Keys();
+    k.handle(ESC, ctx({ draft: "essai", now: 1000 }));
+    k.handle(key("Shift", { shift: true }), ctx({ draft: "essai", now: 1100 }));
+    expect(k.handle(ESC, ctx({ draft: "essai", now: 1200 })).type).toBe("clear");
+  });
+  it("Échap maintenu : le premier appui arme, la répétition n'efface pas", () => {
+    const k = new Keys();
+    expect(k.handle(ESC, ctx({ draft: "essai", now: 1000 })).type).toBe("armClear");
+    for (let t = 1030; t < 1700; t += 33) {
+      expect(k.handle(key("Escape", { repeat: true }), ctx({ draft: "essai", now: t })).type).toBe("pass");
+    }
+    expect(k.hint).toBe("Esc again to clear");
   });
   it("une frappe entre les deux Échap désarme", () => {
     const k = new Keys();

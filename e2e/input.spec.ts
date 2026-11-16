@@ -255,6 +255,32 @@ test.describe("Échap (décision 13)", () => {
     expect(await page.evaluate(() => (window as unknown as W).__orch.store.rows.length)).toBe(rows);
   });
 
+  test("Échap maintenu (répétition) : la saisie reste", async ({ page }) => {
+    await open(page);
+    await page.keyboard.type("maintenu");
+    await page.evaluate(() => {
+      const ta = document.querySelector("textarea")!;
+      for (let i = 0; i < 10; i++)
+        ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", repeat: i > 0, bubbles: true }));
+    });
+    expect(await draft(page)).toBe("maintenu");
+    await expect(page.getByTestId("prompt-hint")).toHaveText("Esc again to clear");
+  });
+
+  test("effacement par Ctrl+C pendant l'historique : ↓ ne rend pas l'ancien brouillon", async ({ page }) => {
+    await open(page);
+    await page.keyboard.type("envoyé");
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => (window as unknown as W).__orch.store.status === "Idle", null, { timeout: 10_000 });
+    await page.keyboard.type("brouillon");
+    await page.keyboard.press("ArrowUp");
+    expect(await draft(page)).toBe("envoyé");
+    await page.keyboard.press("Control+c");
+    expect(await draft(page)).toBe("");
+    await page.keyboard.press("ArrowDown");
+    expect(await draft(page)).toBe("");
+  });
+
   test("sélecteur ouvert pendant un tour : Échap le ferme sans interrompre", async ({ page }) => {
     await open(page);
     await startTurn(page);
@@ -328,6 +354,20 @@ test.describe("changement de modèle", () => {
     await expect(page.getByTestId("model-picker")).toBeVisible();
     await expect(page.getByTestId("model-picker").locator('[aria-selected="true"]')).toContainText("Haiku 5.5 ✔");
   });
+});
+
+test("`/model` avec une valeur invalide : indication, pas de set_model", async ({ page }) => {
+  await open(page);
+  for (const bad of ["--dangerous", "-x"]) {
+    await page.locator(PROMPT).fill(`/model ${bad}`);
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("prompt-hint")).toHaveText(`Invalid model: ${bad}`);
+  }
+  expect(await calls(page)).toHaveLength(0);
+  // Un identifiant complet non annoncé reste accepté.
+  await page.locator(PROMPT).fill("/model claude-opus-4-8");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => calls(page, "set_model")).toEqual([{ cmd: "set_model", args: { model: "claude-opus-4-8" } }]);
 });
 
 test("latence : message visible < 50 ms après Entrée (1.11)", async ({ page }) => {

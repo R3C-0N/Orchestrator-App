@@ -58,10 +58,29 @@ export type KeyAction =
   | { type: "toggleVerbose" };
 
 /** Touche réduite à ce qui compte pour les raccourcis. */
-export type KeyInput = { key: string; ctrl: boolean; alt: boolean; shift: boolean; meta: boolean };
+export type KeyInput = {
+  key: string;
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+  meta: boolean;
+  /** Composition IME en cours : la touche appartient à l'éditeur de méthode d'entrée. */
+  composing?: boolean;
+  /** Répétition automatique (touche maintenue). */
+  repeat?: boolean;
+};
 
 export function keyInput(e: KeyboardEvent): KeyInput {
-  return { key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey };
+  return {
+    key: e.key,
+    ctrl: e.ctrlKey,
+    alt: e.altKey,
+    shift: e.shiftKey,
+    meta: e.metaKey,
+    // 229 : touche traitée par l'IME (Chromium, avant `compositionstart`).
+    composing: e.isComposing || e.keyCode === 229,
+    repeat: e.repeat,
+  };
 }
 
 const isLetter = (k: KeyInput, l: string) => k.key.toLowerCase() === l;
@@ -71,6 +90,11 @@ const isLetter = (k: KeyInput, l: string) => k.key.toLowerCase() === l;
  * `armedAt` : horodatage du premier Échap encore armé, ou `null`.
  */
 export function decide(k: KeyInput, ctx: KeyContext, armedAt: number | null): KeyAction {
+  // Pendant une composition IME, Échap et Entrée reviennent à l'IME.
+  if (k.composing) return { type: "pass" };
+  // Échap maintenu : seul le premier appui compte (sinon la répétition
+  // automatique ferait un double Échap et effacerait la saisie).
+  if (k.key === "Escape" && k.repeat) return { type: "pass" };
   const onlyCtrl = k.ctrl && !k.alt && !k.shift && !k.meta;
   const plain = !k.ctrl && !k.alt && !k.shift && !k.meta;
 
@@ -96,6 +120,8 @@ export function decide(k: KeyInput, ctx: KeyContext, armedAt: number | null): Ke
   return { type: "pass" };
 }
 
+const MODIFIERS = new Set(["Shift", "Control", "Alt", "Meta", "AltGraph"]);
+
 /** Armement du double Échap et indication « Esc again to clear ». */
 export class Keys {
   /** Horodatage du premier Échap armé, ou `null`. */
@@ -109,7 +135,8 @@ export class Keys {
   handle(k: KeyInput, ctx: KeyContext): KeyAction {
     const action = decide(k, ctx, this.armedAt);
     if (action.type === "armClear") this.#arm(ctx.now);
-    else if (k.key !== "Shift" && k.key !== "Control" && k.key !== "Alt") this.disarm();
+    // Les touches de modification, la répétition d'Échap et l'IME ne désarment pas.
+    else if (!MODIFIERS.has(k.key) && !k.composing && !(k.key === "Escape" && k.repeat)) this.disarm();
     return action;
   }
 

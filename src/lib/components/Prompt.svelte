@@ -65,6 +65,11 @@
     return el;
   }
 
+  /** Quitte la navigation dans l'historique (saisie effacée par un raccourci). */
+  export function resetHistory(): void {
+    histPos = null;
+  }
+
   /** Texte sélectionné dans la zone de saisie. */
   export function hasSelection(): boolean {
     return !!el && el.selectionStart !== el.selectionEnd;
@@ -93,6 +98,8 @@
 
   function onkeydown(e: KeyboardEvent): void {
     const plain = !e.ctrlKey && !e.altKey && !e.metaKey;
+    // Composition IME : Entrée et les flèches appartiennent à l'IME.
+    if (e.isComposing || e.keyCode === 229) return;
     if (pickerOpen && plain && !e.shiftKey && models.length > 0) {
       if (e.key === "ArrowUp" || e.key === "ArrowDown") {
         e.preventDefault();
@@ -106,7 +113,7 @@
         return;
       }
     }
-    if (e.key === "Enter" && plain && !e.shiftKey && !e.isComposing) {
+    if (e.key === "Enter" && plain && !e.shiftKey) {
       e.preventDefault();
       const text = draft;
       if (text.trim().length === 0) return;

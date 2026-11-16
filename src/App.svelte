@@ -79,9 +79,13 @@
   const busy = $derived(
     store.status === "Requesting" || store.status === "Streaming" || store.status === "Interrupting",
   );
+  // Toute nouvelle valeur du statut répond à la demande (`Interrupting`,
+  // `Idle`…) : on ne garde pas le drapeau au-delà.
   $effect(() => {
-    if (!busy) interruptAsked = false;
+    void store.status;
+    interruptAsked = false;
   });
+  let interruptTimer: ReturnType<typeof setTimeout> | null = null;
 
   const overlay: Overlay = $derived(paletteOpen ? "palette" : pickerOpen ? "picker" : null);
 
@@ -110,6 +114,10 @@
 
   async function doInterrupt(): Promise<void> {
     interruptAsked = true;
+    // Le cœur abandonne après 5 s (`Timeout`) : au-delà, Échap ou Ctrl+C
+    // peuvent redemander l'interruption même si aucun statut n'est arrivé.
+    if (interruptTimer) clearTimeout(interruptTimer);
+    interruptTimer = setTimeout(() => (interruptAsked = false), 6000);
     try {
       await backend.interrupt();
     } catch (err) {
@@ -126,6 +134,7 @@
       case "clear":
         draft = "";
         keys.disarm();
+        prompt?.resetHistory();
         break;
       case "closeOverlay":
         if (action.overlay === "picker") pickerOpen = false;
@@ -199,6 +208,16 @@
     }
   }
 
+  /**
+   * Valeur de `/model <valeur>` acceptée : un modèle annoncé par `ready`
+   * (`value` ou `resolved`), sinon un identifiant strict (pas de `-` en tête,
+   * pas d'espace ni de caractère de contrôle ; le cœur refuse aussi ces cas).
+   */
+  function validModel(v: string): boolean {
+    if (store.meta.models.some((m) => m.value === v || m.resolved === v)) return true;
+    return /^[A-Za-z0-9][A-Za-z0-9._:[\]@-]{0,99}$/.test(v);
+  }
+
   async function submit(text: string) {
     keys.disarm();
     const trimmed = text.trim();
@@ -206,7 +225,10 @@
     const model = /^\/model(?:\s+(\S+))?\s*$/.exec(trimmed);
     if (model) {
       draft = "";
-      if (model[1]) void applyModel(model[1]);
+      if (model[1]) {
+        if (validModel(model[1])) void applyModel(model[1]);
+        else showNotice(`Invalid model: ${model[1]}`);
+      }
       else pickerOpen = true;
       return;
     }
