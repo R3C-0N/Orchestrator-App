@@ -280,6 +280,11 @@ export class MockCore {
   #pending: CoreEvent[] = [];
   #flushTimer: ReturnType<typeof setTimeout> | null = null;
   #lastSent = 0;
+  /**
+   * Instant du dernier événement émis, quel qu'il soit : mis à jour à chaque
+   * `#emit`, comme `last_event` du cœur l'est pour chaque événement reçu, y
+   * compris ceux vidés avec le bord avant (`state/batcher.rs`).
+   */
   #lastEvent = -Infinity;
   #streamTimer: ReturnType<typeof setTimeout> | null = null;
   #turn = 0;

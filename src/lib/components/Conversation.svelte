@@ -73,11 +73,13 @@
   }
 
   function onwheel(e: WheelEvent) {
+    stopRestore();
     if (e.deltaY < 0) gestureUp();
     else markIntent();
   }
 
   function onkeydown(e: KeyboardEvent) {
+    if (["Home", "End", "PageUp", "PageDown", "ArrowUp", "ArrowDown", " "].includes(e.key)) stopRestore();
     if (e.key === "Home" || (e.ctrlKey && e.key === "Home")) {
       e.preventDefault();
       scrollToTop();
@@ -176,7 +178,10 @@
   // Écouteurs d'intention posés à la main (molette passive : ne bloque pas le défilement).
   function listen(el: HTMLElement) {
     root = el;
-    const down = () => (pointerDown = true);
+    const down = () => {
+      pointerDown = true;
+      stopRestore();
+    };
     const up = () => {
       pointerDown = false;
       markIntent();
@@ -211,12 +216,35 @@
   });
   /** Ligne source en haut de la vue au moment de la bascule. */
   let anchor: string | null = null;
+  /**
+   * Jeton de génération du recalage de `restore` : un geste de l'utilisateur
+   * (molette, touche de défilement, clic) ou un nouveau `restore`
+   * l'incrémente, et la boucle en cours s'arrête à sa prochaine image. Sans
+   * lui, la boucle réécrivait `scrollTop` pendant ses 10 images contre la
+   * molette, et deux Ctrl+O rapprochés faisaient tourner deux boucles.
+   */
+  let restoreGen = 0;
+  /**
+   * Ligne source du recalage en cours (`null` : aucun). Une bascule qui
+   * arrive avant la fin la reprend, au lieu de lire le haut d'une vue pas
+   * encore recalée.
+   */
+  let settling: string | null = null;
+
+  function stopRestore() {
+    restoreGen++;
+    settling = null;
+  }
 
   $effect.pre(() => {
     void verbose;
     // Avant la mise à jour du DOM : la liste montre encore l'ancienne vue.
     if (!list || sticky || shown.length === 0) {
       anchor = null;
+      return;
+    }
+    if (settling !== null) {
+      anchor = settling;
       return;
     }
     // Premier item vraiment visible : un item dont il ne reste que quelques
@@ -228,14 +256,22 @@
   /** Après le montage de la liste de la nouvelle vue : même ligne en haut, ou toujours collé en bas. */
   function restore(_el: HTMLElement) {
     const a = anchor;
+    const gen = ++restoreGen;
+    settling = sticky ? null : a;
     requestAnimationFrame(() => {
-      if (!list) return;
+      if (gen !== restoreGen) return;
+      if (!list) {
+        settling = null;
+        return;
+      }
       if (sticky || a === null) {
+        settling = null;
         toBottom();
         return;
       }
       const j = itemIndexOfRow(items, a);
-      if (j >= 0) {
+      if (j < 0) settling = null;
+      else {
         markIntent(400);
         // Défilement direct au décalage de l'item (pas de `scrollToIndex`,
         // qui resterait actif pendant un streaming et ramènerait la vue sur
@@ -245,11 +281,12 @@
         // La nouvelle liste n'a que des hauteurs estimées : une fois les
         // lignes mesurées, on recale l'item en haut. Tant qu'il n'est pas
         // rendu, son décalage (que virtua affine à chaque mesure) sert de
-        // cible. Au plus 10 images, puis plus rien : un geste ultérieur de
-        // l'utilisateur n'est jamais contré.
+        // cible. Au plus 10 images, et arrêt dès un geste de l'utilisateur
+        // ou une nouvelle bascule (`restoreGen`) : un geste n'est jamais contré.
         let n = 0;
         let aligned = 0;
         const settle = () => {
+          if (gen !== restoreGen) return;
           const el = root?.querySelector<HTMLElement>(".vlist");
           const it = el?.querySelector<HTMLElement>(`[data-index="${j}"]`);
           if (el && it) {
@@ -265,6 +302,7 @@
             aligned = 0;
           }
           if (++n < 10 && aligned < 2) requestAnimationFrame(settle);
+          else if (gen === restoreGen) settling = null;
         };
         requestAnimationFrame(settle);
       }

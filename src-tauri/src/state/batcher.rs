@@ -61,9 +61,14 @@ pub async fn run_batcher(mut rx: UnboundedReceiver<CoreEvent>, sink: Sink) {
         let mut buf = vec![first];
         if leading_edge {
             // Bord avant : on part tout de suite avec ce qui est déjà là.
+            // Les événements vidés ici comptent comme reçus maintenant : le
+            // suivant mesure son écart à eux, pas seulement à `first`.
             while buf.len() < BATCH_MAX {
                 match rx.try_recv() {
-                    Ok(ev) => buf.push(ev),
+                    Ok(ev) => {
+                        last_event = Some(Instant::now());
+                        buf.push(ev);
+                    }
                     Err(_) => break,
                 }
             }
@@ -197,6 +202,26 @@ mod tests {
         assert!(max <= 16.0 + 1e-9);
     }
 
+    /// Flux régulier à exactement `BURST_GAP` (5 ms) : frontière `>=`, chaque
+    /// événement est un bord avant. C'est le plafond du bord avant : environ
+    /// 200 lots/s (1 000 / 5) pour un flux régulier.
+    #[tokio::test(start_paused = true)]
+    async fn steady_at_burst_gap_is_leading_edge() {
+        let (b, sent) = run(200, BURST_GAP).await;
+        all_in_order(&b, 200);
+        let w = waits(&b, &sent);
+        let max = w.iter().cloned().fold(0.0, f64::max);
+        let span = (b.last().unwrap().0 - b[0].0).as_secs_f64();
+        let per_second = (b.len() - 1) as f64 / span;
+        println!(
+            "200/s : {} lots, {per_second:.0} lots/s, attente max {max:.2} ms",
+            b.len()
+        );
+        assert_eq!(b.len(), 200, "un lot par événement");
+        assert!(max < 1e-9, "attente max {max} ms");
+        assert!((per_second - 200.0).abs() < 1e-6, "{per_second} lots/s");
+    }
+
     /// Rafale après un flux régulier : seul son premier événement part seul.
     #[tokio::test(start_paused = true)]
     async fn burst_after_steady_stream() {
@@ -298,5 +323,45 @@ mod tests {
         let (at, seqs) = b.iter().find(|(_, s)| s.contains(&3)).unwrap();
         assert_eq!(seqs, &vec![1, 2, 3]);
         assert_eq!(*at, typed_at, "écho retenu {:?}", *at - typed_at);
+    }
+
+    /// Écho tapé en tête de boucle (`urgent(&first)`) : 1 ms après un lot,
+    /// donc écart < `BURST_GAP` et dernier lot < `BATCH_WINDOW`. Sans
+    /// `urgent`, il attendrait l'échéance du lot (15 ms). Il emporte ce qui
+    /// est déjà en file derrière lui.
+    #[tokio::test(start_paused = true)]
+    async fn typed_echo_at_loop_head_leaves_at_once() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let batches: Batches = Arc::default();
+        let bb = batches.clone();
+        let sink: Sink = Arc::new(move |batch: Vec<CoreEvent>| {
+            bb.lock()
+                .unwrap()
+                .push((Instant::now(), batch.iter().map(|e| e.seq).collect()));
+            true
+        });
+        let task = tokio::spawn(run_batcher(rx, sink));
+        tx.send(ev(0)).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // 0 est parti seul (bord avant) ; la boucle attend en tête.
+        assert_eq!(batches.lock().unwrap().len(), 1);
+        let typed_at = Instant::now();
+        let mut echo = ev(1);
+        echo.body = EventBody::UserMessage {
+            thread: crate::api::events::ThreadId::main(),
+            uuid: None,
+            text: "bonjour".into(),
+            origin: UserOrigin::Typed,
+        };
+        tx.send(echo).unwrap();
+        tx.send(ev(2)).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(tx);
+        task.await.unwrap();
+        let b = batches.lock().unwrap().clone();
+        all_in_order(&b, 3);
+        assert_eq!(b.len(), 2, "{b:?}");
+        assert_eq!(b[1].1, vec![1, 2]);
+        assert_eq!(b[1].0, typed_at, "écho retenu {:?}", b[1].0 - typed_at);
     }
 }

@@ -185,3 +185,111 @@ test("Ctrl+O pendant un streaming, puis molette vers le haut : la vue ne revient
   expect(await sticky(page)).toBe(false);
   await page.evaluate(() => (window as unknown as { __orch: Orch }).__orch.mock.stopStream());
 });
+
+// Recalage de `restore` après Ctrl+O : au plus 10 images, arrêté par un geste
+// de l'utilisateur ou par une nouvelle bascule (jeton de génération).
+
+/** Ouvre 600 lignes, remonte loin du bas (sans streaming : positions stables). */
+async function readAbove(page: Page) {
+  await open(page, 600);
+  await page.mouse.move(500, 300);
+  for (let i = 0; i < 5; i++) await page.mouse.wheel(0, -400);
+  await page.waitForTimeout(400);
+  expect(await sticky(page)).toBe(false);
+}
+
+/** `data-first-row` de la ligne qui contient le haut de la vue. */
+const rowAtTopOf = (page: Page) =>
+  page.evaluate(() => {
+    const el = document.querySelector<HTMLElement>(".vlist")!;
+    const top = el.getBoundingClientRect().top + 4;
+    const r = [...el.querySelectorAll<HTMLElement>("[data-index]")].find((r) => {
+      const b = r.getBoundingClientRect();
+      return b.top <= top && b.bottom > top;
+    })!;
+    return r.dataset.firstRow!;
+  });
+
+test("Ctrl+O puis molette pendant le recalage : la molette n'est pas écrasée", async ({ page }) => {
+  await readAbove(page);
+  const m = await page.evaluate(
+    () =>
+      new Promise<{ j: string; afterWheel: number; scrollTops: number[]; tops: number[] }>((resolve) => {
+        const ctrlO = () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "o", ctrlKey: true, bubbles: true }));
+        // Appelle `fn` à l'image qui suit celle où la vue détaillée apparaît.
+        const afterDetailBar = (fn: () => void) => {
+          const poll = () => {
+            if (document.querySelector('[data-testid="detail-bar"]')) requestAnimationFrame(fn);
+            else requestAnimationFrame(poll);
+          };
+          requestAnimationFrame(poll);
+        };
+        ctrlO();
+        // Image F où la vue détaillée est montée : le rAF de `restore` passe
+        // dans F (après celui-ci), la première image de `settle` dans F + 1,
+        // avant le rAF demandé ici ; la molette tombe donc en pleine boucle.
+        afterDetailBar(() => {
+          const el = document.querySelector<HTMLElement>(".vlist")!;
+          const vTop = el.getBoundingClientRect().top;
+          // Ligne j recalée en haut par la boucle.
+          const j = [...el.querySelectorAll<HTMLElement>("[data-index]")].find((r) => {
+            const b = r.getBoundingClientRect();
+            return b.top <= vTop + 4 && b.bottom > vTop + 4;
+          })!.dataset.index!;
+          // Molette : l'événement pour l'écouteur, le défilement appliqué à la main.
+          el.dispatchEvent(new WheelEvent("wheel", { deltaY: -300, bubbles: true }));
+          el.scrollTop -= 300;
+          const afterWheel = el.scrollTop;
+          const scrollTops: number[] = [];
+          const tops: number[] = [];
+          const watch = () => {
+            const it = el.querySelector<HTMLElement>(`[data-index="${j}"]`);
+            scrollTops.push(el.scrollTop);
+            tops.push(it ? it.getBoundingClientRect().top - vTop : Infinity);
+            if (tops.length < 15) requestAnimationFrame(watch);
+            else resolve({ j, afterWheel, scrollTops, tops });
+          };
+          requestAnimationFrame(watch);
+        });
+      }),
+  );
+  console.log(`MESURE ctrl-o-molette-pendant-recalage ${JSON.stringify(m)}`);
+  await expect(page.getByTestId("detail-bar")).toBeVisible();
+  // La boucle ramènerait la ligne j en haut en augmentant `scrollTop` (vers
+  // le bas). Après la molette, `scrollTop` ne doit jamais remonter au-dessus
+  // de sa valeur ; il peut baisser un peu quand virtua corrige les hauteurs
+  // estimées des lignes au-dessus (compensation de défilement).
+  for (const top of m.scrollTops) expect(top).toBeLessThanOrEqual(m.afterWheel + 1);
+  expect(m.scrollTops[m.scrollTops.length - 1]).toBeGreaterThan(m.afterWheel - 300);
+  expect(await sticky(page)).toBe(false);
+});
+
+test("deux Ctrl+O rapprochés : retour sur la ligne lue", async ({ page }) => {
+  await readAbove(page);
+  const read = await rowAtTopOf(page);
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        const ctrlO = () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "o", ctrlKey: true, bubbles: true }));
+        // Appelle `fn` à l'image qui suit celle où la vue détaillée apparaît.
+        const afterDetailBar = (fn: () => void) => {
+          const poll = () => {
+            if (document.querySelector('[data-testid="detail-bar"]')) requestAnimationFrame(fn);
+            else requestAnimationFrame(poll);
+          };
+          requestAnimationFrame(poll);
+        };
+        ctrlO();
+        // Seconde bascule pendant le recalage de la première (voir le test
+        // précédent pour l'ordre des images).
+        afterDetailBar(() => {
+          ctrlO();
+          resolve();
+        });
+      }),
+  );
+  await expect(page.getByTestId("detail-bar")).toBeHidden();
+  await page.waitForTimeout(600);
+  expect(await rowAtTopOf(page)).toBe(read);
+  expect(await sticky(page)).toBe(false);
+});
