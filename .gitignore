@@ -1,0 +1,36 @@
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/
+**/*.rs.bk
+
+# Node / front
+node_modules/
+dist/
+build/
+.svelte-kit/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# Environnement et secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Outils et OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# Sortie de l'outil graphify (graphe de connaissances), régénérable
+graphify-out/
+
+# Dossier de travail local de Claude (références, notes), jamais versionné
+.claude-work/
