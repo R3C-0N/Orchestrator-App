@@ -135,50 +135,54 @@ impl Inbound {
         }
     }
 
-    /// Décode une ligne de texte. Seule une erreur de syntaxe JSON échoue.
+    /// Décode une ligne de texte. Échoue comme `serde_json::from_str::<Value>`
+    /// (syntaxe, nombre hors plage), jamais sur un type ou un champ inattendu.
     ///
     /// Chemin rapide du flux : pas de `Value` intermédiaire pour toute la
     /// ligne. Une première passe lit `type` et `subtype` (le reste est sauté
     /// sans allocation), la seconde lit la structure du type. Le résultat est
-    /// identique à `from_value` sur la même ligne (vérifié sur les fixtures).
+    /// identique à `from_value` sur la même ligne : si une passe échoue, la
+    /// ligne est relue par `Value` (vérifié sur les fixtures et des cas limites).
     pub fn from_line(line: &str) -> Result<Inbound, serde_json::Error> {
-        if !line.trim_start().starts_with('{') {
-            // JSON valide mais pas un objet (`[]`, `5`) : pas de type.
-            serde_json::from_str::<serde::de::IgnoredAny>(line)?;
-            return Ok(Inbound::Unknown(None));
+        match Inbound::from_line_fast(line) {
+            Some(m) => Ok(m),
+            // Chemin lent, sémantique de référence : erreur de syntaxe ou
+            // nombre hors plage -> `Err` ; clé en double -> la dernière gagne.
+            None => Ok(Inbound::from_value(&serde_json::from_str::<Value>(line)?)),
         }
-        let tag: Tag = match serde_json::from_str(line) {
-            Ok(t) => t,
-            // JSON valide mais pas un objet (`[]`, `5`) : pas de type.
-            Err(e) if e.classify() == serde_json::error::Category::Data => {
-                return Ok(Inbound::Unknown(None))
-            }
-            Err(e) => return Err(e),
-        };
+    }
+
+    /// Chemin rapide ; `None` dès qu'une passe échoue (y compris sur une ligne
+    /// qui n'est pas un objet), sans jamais remplacer une erreur par un défaut.
+    fn from_line_fast(line: &str) -> Option<Inbound> {
+        if !line.trim_start().starts_with('{') {
+            return None;
+        }
+        let tag: Tag = serde_json::from_str(line).ok()?;
         let src = Line(line);
         let Some(kind) = tag.kind else {
-            return Ok(Inbound::Unknown(None));
+            return Some(Inbound::Unknown(None));
         };
-        Ok(match kind.as_str() {
+        Some(match kind.as_str() {
             "system" => Inbound::System(match tag.subtype.as_deref() {
                 None => SystemMessage::Unknown(None),
-                Some(sub) => SystemMessage::from_subtype(sub, src),
+                Some(sub) => SystemMessage::from_subtype(sub, src)?,
             }),
-            "stream_event" => Inbound::StreamEvent(src.read()),
-            "assistant" => Inbound::Assistant(src.read()),
-            "user" => Inbound::User(src.read()),
-            "result" => Inbound::Result(src.read()),
-            "rate_limit_event" => Inbound::RateLimitEvent(src.read()),
+            "stream_event" => Inbound::StreamEvent(src.read()?),
+            "assistant" => Inbound::Assistant(src.read()?),
+            "user" => Inbound::User(src.read()?),
+            "result" => Inbound::Result(src.read()?),
+            "rate_limit_event" => Inbound::RateLimitEvent(src.read()?),
             "control_request" => {
-                let r: RawControlRequest = src.read();
+                let r: RawControlRequest = src.read()?;
                 Inbound::ControlRequest(InControlRequest {
                     request_id: r.request_id,
                     request: InControlRequestBody::from_value(r.request.as_ref()),
                 })
             }
-            "control_response" => Inbound::ControlResponse(src.read()),
-            "control_cancel_request" => Inbound::ControlCancelRequest(src.read()),
-            "tool_progress" => Inbound::ToolProgress(src.read()),
+            "control_response" => Inbound::ControlResponse(src.read()?),
+            "control_cancel_request" => Inbound::ControlCancelRequest(src.read()?),
+            "tool_progress" => Inbound::ToolProgress(src.read()?),
             k if IGNORED_TYPES.contains(&k) => Inbound::Ignored(k.to_string()),
             _ => Inbound::Unknown(Some(kind)),
         })
@@ -240,12 +244,13 @@ impl Inbound {
 /// Source d'un message : valeur déjà lue, ou ligne de texte (lue une seconde
 /// fois, directement dans la structure du type).
 trait Source: Copy {
-    fn read<T: DeserializeOwned + Default>(self) -> T;
+    /// `None` : la lecture rapide a échoué, il faut relire par `Value`.
+    fn read<T: DeserializeOwned + Default>(self) -> Option<T>;
 }
 
 impl Source for &Value {
-    fn read<T: DeserializeOwned + Default>(self) -> T {
-        from_value(self)
+    fn read<T: DeserializeOwned + Default>(self) -> Option<T> {
+        Some(from_value(self))
     }
 }
 
@@ -253,10 +258,11 @@ impl Source for &Value {
 struct Line<'a>(&'a str);
 
 impl Source for Line<'_> {
-    fn read<T: DeserializeOwned + Default>(self) -> T {
-        // La syntaxe a été vérifiée par la première passe ; une structure
-        // tolérante lue depuis un objet ne peut pas échouer autrement.
-        serde_json::from_str(self.0).unwrap_or_default()
+    fn read<T: DeserializeOwned + Default>(self) -> Option<T> {
+        // Peut échouer sur une ligne de syntaxe valide : clé en double (refusée
+        // par une structure dérivée, alors que `Value` garde la dernière) ou
+        // nombre hors plage. L'appelant relit alors la ligne par `Value`.
+        serde_json::from_str(self.0).ok()
     }
 }
 
@@ -307,24 +313,27 @@ impl SystemMessage {
     pub fn from_value(v: &Value) -> SystemMessage {
         match str_field(v, "subtype") {
             None => SystemMessage::Unknown(None),
-            Some(sub) => SystemMessage::from_subtype(sub, v),
+            // Lecture depuis une `Value` : jamais `None`.
+            Some(sub) => {
+                SystemMessage::from_subtype(sub, v).unwrap_or(SystemMessage::Unknown(None))
+            }
         }
     }
 
-    fn from_subtype<S: Source>(sub: &str, src: S) -> SystemMessage {
-        match sub {
-            "init" => SystemMessage::Init(src.read()),
-            "status" => SystemMessage::Status(src.read()),
-            "task_started" => SystemMessage::TaskStarted(src.read()),
-            "task_progress" => SystemMessage::TaskProgress(src.read()),
-            "task_updated" => SystemMessage::TaskUpdated(src.read()),
-            "task_notification" => SystemMessage::TaskNotification(src.read()),
-            "background_tasks_changed" => SystemMessage::BackgroundTasksChanged(src.read()),
-            "hook_started" | "hook_progress" | "hook_response" => SystemMessage::Hook(src.read()),
-            "thinking_tokens" => SystemMessage::ThinkingTokens(src.read()),
+    fn from_subtype<S: Source>(sub: &str, src: S) -> Option<SystemMessage> {
+        Some(match sub {
+            "init" => SystemMessage::Init(src.read()?),
+            "status" => SystemMessage::Status(src.read()?),
+            "task_started" => SystemMessage::TaskStarted(src.read()?),
+            "task_progress" => SystemMessage::TaskProgress(src.read()?),
+            "task_updated" => SystemMessage::TaskUpdated(src.read()?),
+            "task_notification" => SystemMessage::TaskNotification(src.read()?),
+            "background_tasks_changed" => SystemMessage::BackgroundTasksChanged(src.read()?),
+            "hook_started" | "hook_progress" | "hook_response" => SystemMessage::Hook(src.read()?),
+            "thinking_tokens" => SystemMessage::ThinkingTokens(src.read()?),
             s if IGNORED_SYSTEM_SUBTYPES.contains(&s) => SystemMessage::Ignored(s.to_string()),
             s => SystemMessage::Unknown(Some(s.to_string())),
-        }
+        })
     }
 }
 

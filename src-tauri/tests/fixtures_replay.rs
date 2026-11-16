@@ -503,6 +503,35 @@ fn from_line_equals_from_value() {
         r#"{"type":"user","message":{"content":[1,{"type":"text","text":7}]}}"#,
         r#"{"type":"result","usage":null,"modelUsage":{"a":3}}"#,
         r#"{"type":"stream_event","event":[1,2]}"#,
+        // Clés en double : la dernière gagne, comme avec `Value`.
+        r#"{"type":"result","subtype":"a","subtype":"b","is_error":true}"#,
+        r#"{"type":"assistant","type":"result","subtype":"x"}"#,
+        r#"{"type":"result","type":"assistant","message":{"id":"m","content":[]}}"#,
+        r#"{"type":"system","subtype":"init","subtype":"status","status":"requesting"}"#,
+        r#"{"type":"control_request","request_id":"a","request_id":"b","request":{"subtype":"can_use_tool","tool_name":"Bash"}}"#,
+        r#"{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool","tool_name":"A","tool_name":"Bash","input":{}}}"#,
+        r#"{"type":"stream_event","api_message_id":"m1","api_message_id":"m2","event":{"type":"message_start"}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"index":2,"delta":{"type":"text_delta","text":"x"}}}"#,
+        r#"{"type":"assistant","message":{"id":"a","id":"b","content":[{"type":"text","text":"t","text":"u"}]}}"#,
+        // Échappements `\u…` (é, 😀 en paire de substitution) et caractère nul.
+        // `concat!` coupe chaque `\u` pour que l'échappement reste littéral.
+        concat!(
+            r#"{"type":"result","subtype":""#,
+            "\\",
+            "u00e9",
+            "\\",
+            "ud83d",
+            "\\",
+            r#"ude00"}"#
+        ),
+        concat!(r#"{"type":"result","result":"a"#, "\\", r#"u0000b"}"#),
+        concat!(
+            r#"{"type":"user","message":{"content":""#,
+            "\\",
+            "u0000",
+            "\\",
+            r#"u00e9"}}"#
+        ),
     ] {
         let v: Value = serde_json::from_str(l).unwrap();
         assert_eq!(
@@ -512,7 +541,88 @@ fn from_line_equals_from_value() {
         );
         n += 1;
     }
+    // Nombre hors plage : erreur des deux côtés (`bad_json` en production).
+    for l in [
+        r#"{"type":"result","total_cost_usd":1e400}"#,
+        r#"{"type":"assistant","message":{"usage":{"x":-1e400}}}"#,
+        r#"{"type":"result","subtype":"a","subtype":"b","duration_ms":1e999}"#,
+    ] {
+        assert!(serde_json::from_str::<Value>(l).is_err(), "{l}");
+        assert!(
+            Inbound::from_line(l).is_err(),
+            "from_line doit échouer : {l}"
+        );
+        n += 1;
+    }
     println!("{n} lignes : from_line = from_value");
+}
+
+/// Chemin de production (`from_line` puis `handle_inbound`, celui du
+/// superviseur) comparé au chemin `from_value` puis `handle`, sur toutes les
+/// captures : mêmes actions, même état final du réducteur.
+#[test]
+fn production_path_replays_like_value_path() {
+    let mut total = 0;
+    for f in FIXTURES {
+        let name = format!("{f}.jsonl");
+        let (cli, _) = load_text(&name);
+        let mut prod = Reducer::new();
+        let mut reference = Reducer::new();
+        prod.expect_initialize("init-1");
+        reference.expect_initialize("init-1");
+        for (i, l) in cli.iter().enumerate() {
+            let a = prod.handle_inbound(&Inbound::from_line(l).unwrap());
+            let b = reference.handle(&serde_json::from_str::<Value>(l).unwrap());
+            assert_eq!(a, b, "{name} ligne CLI {}", i + 1);
+        }
+        assert_eq!(prod.unknown_count, reference.unknown_count, "{name}");
+        assert_eq!(prod.capabilities, reference.capabilities, "{name}");
+        assert_eq!(prod.version, reference.version, "{name}");
+        assert_eq!(prod.questions, reference.questions, "{name}");
+        assert_eq!(prod.state, reference.state, "{name}");
+        println!(
+            "{name} : {} lignes, chemin de production = chemin Value",
+            cli.len()
+        );
+        total += cli.len();
+    }
+    println!("total : {total} lignes");
+}
+
+/// Les cas relevés par la relecture, sur le chemin de production.
+#[test]
+fn duplicate_keys_on_production_path() {
+    let run = |l: &str| Reducer::new().handle_inbound(&Inbound::from_line(l).unwrap());
+    let a = run(r#"{"type":"result","subtype":"a","subtype":"b","is_error":true}"#);
+    assert!(
+        matches!(&a[0], Action::Emit(EventBody::TurnResult { subtype, is_error: true, .. }) if subtype == "b"),
+        "{a:?}"
+    );
+    let a = run(
+        r#"{"type":"control_request","request_id":"a","request_id":"b","request":{"subtype":"hook_callback"}}"#,
+    );
+    let Action::Write(w) = &a[0] else {
+        panic!("{a:?}")
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(w).unwrap()["response"]["request_id"],
+        "b"
+    );
+    // Échappements décodés (é, 😀 en paire de substitution).
+    let l = concat!(
+        r#"{"type":"result","subtype":""#,
+        "\\",
+        "u00e9",
+        "\\",
+        "ud83d",
+        "\\",
+        r#"ude00"}"#
+    );
+    let a = run(l);
+    assert!(
+        matches!(&a[0], Action::Emit(EventBody::TurnResult { subtype, .. }) if subtype == "\u{e9}\u{1f600}"),
+        "{a:?}"
+    );
 }
 
 /// Lecture + décodage + réducteur sur `t15` (10 505 lignes, 6,9 Mo). Le seuil
