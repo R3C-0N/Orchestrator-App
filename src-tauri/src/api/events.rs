@@ -216,6 +216,9 @@ pub enum BlockDoneKind {
     Text {
         text: String,
     },
+    /// `empty` : rien à afficher. Vrai pour un bloc `thinking` sans texte
+    /// (signature seule, spec 4.8) et toujours pour `redacted_thinking`
+    /// (contenu chiffré).
     Thinking {
         empty: bool,
     },
@@ -235,20 +238,30 @@ pub enum ResultPart {
     Other { raw: Value },
 }
 
+/// État **complet** d'un sous-agent, renvoyé à chaque changement :
+/// l'interface remplace sa copie, elle ne fusionne pas.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct AgentEvent {
     pub tool_use_id: String,
     pub task_id: Option<String>,
+    /// `subagent_type` après `trim()` (U+00A0 retiré, spec 4.8).
     pub agent_type: String,
+    /// `blue`, `green`, `orange`, `purple`, `pink`, `cyan`, `yellow`, `red`
+    /// (`colors::agent_color`) ; `None` pour un agent inconnu (gris).
     pub color: Option<String>,
     pub description: String,
     pub status: AgentStatus,
     pub background: bool,
+    /// Heure (ms, horloge des `CoreEvent`) de l'appel `Agent` ou du
+    /// `task_started`.
     #[ts(type = "number | null")]
     pub started_at: Option<u64>,
+    /// Heure de la ligne qui a terminé l'agent.
     #[ts(type = "number | null")]
     pub ended_at: Option<u64>,
+    /// Outil en cours ou dernier outil (`task_progress.last_tool_name`,
+    /// `tool_progress`, `tool_use` du fil de l'agent).
     pub last_tool: Option<String>,
     #[ts(type = "number | null")]
     pub tokens: Option<u64>,
@@ -285,8 +298,13 @@ pub struct QuestionOption {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub enum QuestionCloseReason {
+    /// Réponse envoyée par `answer_question`.
     Answered,
+    /// Requête retirée par le CLI (`control_cancel_request`).
     Cancelled,
+    /// Question ignorée par `skip_question` (`annotations[q].unanswered`,
+    /// raisons `skipped` et `dismissed`, `t10`).
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

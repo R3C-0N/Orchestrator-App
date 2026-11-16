@@ -2,6 +2,7 @@
 //! `CoreEvent` normalisés à l'interface Svelte.
 
 pub mod api;
+pub mod colors;
 pub mod process;
 pub mod protocol;
 pub mod state;

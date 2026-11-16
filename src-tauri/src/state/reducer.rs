@@ -1,23 +1,37 @@
-//! Réducteur : une ligne JSON du CLI -> actions (événements pour l'interface,
+//! Réducteur : un message du CLI -> actions (événements pour l'interface,
 //! lignes à écrire sur stdin, réponses à nos requêtes de contrôle).
 //!
-//! Pur et synchrone : testable sur les fixtures sans processus. Tolérant : un
-//! champ manquant ou un type inconnu ne fait jamais paniquer.
+//! Pur et synchrone (plan 1.6) : aucune E/S, l'heure est passée en argument
+//! (`handle_inbound_at`), ce qui permet de rejouer les fixtures sans
+//! processus et d'en tirer des instantanés stables (`state::replay`).
+//! Tolérant : un champ manquant ou un type inconnu ne fait jamais paniquer.
 //!
-//! Décodage : par les types de `protocol::inbound` et `protocol::control`
-//! (jalon J2) ; le comportement est celui de J0.
+//! Décodage par `protocol::inbound` et `protocol::control` (J2). Corrélation
+//! (J4) : fils et index de blocs (`threads`), sous-agents (`agents`),
+//! questions et `initialize` en attente (`pending`).
 //!
-//! J0 : corps provisoires pour `agent` (task_started / task_notification) ; le
-//! reste suit la section 1.5 du plan.
+//! Choix documentés :
+//! - **Thinking** : `block_done` porte `Thinking { empty }`. `empty` vaut
+//!   `true` quand il n'y a rien à afficher : bloc `thinking` sans texte
+//!   (signature seule, spec 4.8) et **toujours** pour `redacted_thinking`,
+//!   dont le contenu est chiffré (`data`) : un éventuel champ `thinking` sur
+//!   ce type n'est pas lu (il n'existe pas dans l'API ; le décodeur ne le
+//!   garde pas). J0 lisait ce champ et pouvait donner `false` : c'était un
+//!   texte non affichable présenté comme affichable.
+//! - **Inconnus** (plan 1.9) : chaque élément non reconnu d'un message
+//!   (`Inbound::unknown_kinds` : type, sous-type `system/*`, événement de
+//!   flux, delta, bloc, requête de contrôle) est compté dans `unknown_count`
+//!   et par nom dans `unknown_kinds` ; aucune notice.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
 use crate::api::events::{
-    AgentEvent, AgentInfo, AgentStatus, BlockDoneKind, BlockStartKind, CommandInfo, EventBody,
-    McpServer, ModelInfo, MsgKey, NoticeLevel, QuestionCloseReason, QuestionItem, QuestionOption,
-    ResultPart, SessionState, ThreadId, UserOrigin,
+    AgentEvent, AgentInfo, BlockDoneKind, BlockStartKind, CommandInfo, EventBody, McpServer,
+    ModelInfo, MsgKey, NoticeLevel, QuestionCloseReason, ResultPart, SessionState, ThreadId,
+    UserOrigin,
 };
 use crate::process::locate::EXPECTED_CLAUDE_VERSION;
 use crate::protocol::control::{
@@ -30,7 +44,11 @@ use crate::protocol::inbound::{
 };
 use crate::protocol::outbound;
 
-pub const CAP_UNANSWERED: &str = "ask_user_question_unanswered_v1";
+use super::agents::AgentRegistry;
+use super::threads::{thread_of, BlockCounters};
+
+pub use super::pending::{parse_questions, CAP_UNANSWERED};
+
 pub const INTERRUPTED_TEXT: &str = "[Request interrupted by user]";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,8 +66,8 @@ pub enum Action {
 #[derive(Debug, Default)]
 pub struct Reducer {
     pub state: Option<SessionState>,
-    /// Blocs `assistant` déjà reçus par `message.id` -> index du prochain bloc.
-    assistant_blocks: HashMap<String, u32>,
+    /// Index des blocs des messages `assistant` complets.
+    blocks: BlockCounters,
     /// Questions en attente : request_id -> input brut de l'outil.
     pub questions: HashMap<String, Value>,
     /// request_id de nos requêtes `initialize`.
@@ -57,24 +75,35 @@ pub struct Reducer {
     pub capabilities: Vec<String>,
     pub version: Option<String>,
     version_warned: bool,
-    /// Lignes de type inconnu, ignorées (plan 1.9 : comptées, pas de notice).
+    /// Éléments non reconnus (plan 1.9 : comptés, pas de notice).
     pub unknown_count: u64,
+    /// Même compte, par nom (`system/xyz`, `assistant/bloc/xyz`…).
+    pub unknown_kinds: BTreeMap<String, u64>,
+    /// Sous-agents.
+    agents: AgentRegistry,
+    /// Rejeu d'un transcript (`load_history`, J11) : les messages
+    /// utilisateur prennent l'origine `History`.
+    pub history: bool,
+    /// Heure de la ligne en cours (ms depuis l'epoch).
+    now: u64,
 }
 
-fn s(v: &Value, k: &str) -> Option<String> {
-    v.get(k).and_then(Value::as_str).map(str::to_string)
-}
-
-fn thread_of(parent_tool_use_id: &Option<String>) -> ThreadId {
-    match parent_tool_use_id {
-        Some(id) => ThreadId(id.clone()),
-        None => ThreadId::main(),
-    }
+/// Heure système en ms depuis l'epoch.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Reducer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sous-agents connus, dans l'ordre d'apparition.
+    pub fn agents(&self) -> &[AgentEvent] {
+        self.agents.all()
     }
 
     /// Déclare un `request_id` d'`initialize` envoyé par nous : sa réponse
@@ -123,6 +152,44 @@ impl Reducer {
         }
     }
 
+    /// Message tapé par l'utilisateur et écrit sur stdin : `user_message`
+    /// `Typed` puis `status` `Requesting` (ce que fait `send_message`).
+    pub fn user_sent(&mut self, text: &str) -> Vec<Action> {
+        let mut out = vec![Action::Emit(EventBody::UserMessage {
+            thread: ThreadId::main(),
+            uuid: None,
+            text: text.to_string(),
+            origin: UserOrigin::Typed,
+        })];
+        self.set_state(SessionState::Requesting, &mut out);
+        out
+    }
+
+    /// Ferme une question en attente (réponse envoyée, `Answered` ou
+    /// `Skipped`) : la retire de la table et émet `question_closed`. Rien si
+    /// la question n'est pas (ou plus) en attente.
+    pub fn close_question(&mut self, request_id: &str, reason: QuestionCloseReason) -> Vec<Action> {
+        if self.questions.remove(request_id).is_none() {
+            return vec![];
+        }
+        vec![Action::Emit(EventBody::QuestionClosed {
+            request_id: request_id.to_string(),
+            reason,
+        })]
+    }
+
+    /// Fin du processus : `exited` (avec `during_turn`), puis `status`
+    /// `Exited`, terminal.
+    pub fn exited(&mut self, code: Option<i32>, stderr_tail: Vec<String>) -> Vec<Action> {
+        let mut out = vec![Action::Emit(EventBody::Exited {
+            code,
+            during_turn: self.in_turn(),
+            stderr_tail,
+        })];
+        self.set_state(SessionState::Exited, &mut out);
+        out
+    }
+
     fn check_version(&mut self, version: &str, out: &mut Vec<Action>) {
         self.version = Some(version.to_string());
         if version != EXPECTED_CLAUDE_VERSION && !self.version_warned {
@@ -138,13 +205,29 @@ impl Reducer {
         }
     }
 
-    /// Traite une ligne de stdout déjà désérialisée.
+    /// Traite une ligne de stdout déjà désérialisée, à l'heure système.
     pub fn handle(&mut self, v: &Value) -> Vec<Action> {
-        self.handle_inbound(&Inbound::from_value(v))
+        self.handle_at(v, now_ms())
     }
 
-    /// Traite un message déjà décodé (`protocol::inbound`).
+    /// Traite une ligne de stdout déjà désérialisée, lue à l'heure `t`.
+    pub fn handle_at(&mut self, v: &Value, t: u64) -> Vec<Action> {
+        self.handle_inbound_at(&Inbound::from_value(v), t)
+    }
+
+    /// Traite un message déjà décodé, à l'heure système.
     pub fn handle_inbound(&mut self, m: &Inbound) -> Vec<Action> {
+        self.handle_inbound_at(m, now_ms())
+    }
+
+    /// Traite un message déjà décodé (`protocol::inbound`), lu à l'heure `t`
+    /// (ms depuis l'epoch ; sert à `started_at` / `ended_at` des agents).
+    pub fn handle_inbound_at(&mut self, m: &Inbound, t: u64) -> Vec<Action> {
+        self.now = t;
+        for k in m.unknown_kinds() {
+            self.unknown_count += 1;
+            *self.unknown_kinds.entry(k).or_insert(0) += 1;
+        }
         let mut out = Vec::new();
         match m {
             Inbound::System(sys) => self.on_system(sys, &mut out),
@@ -157,23 +240,20 @@ impl Reducer {
             Inbound::ControlResponse(r) => self.on_control_response(r, &mut out),
             Inbound::ControlCancelRequest(c) => {
                 if let Some(id) = &c.request_id {
-                    if self.questions.remove(id).is_some() {
-                        out.push(Action::Emit(EventBody::QuestionClosed {
-                            request_id: id.clone(),
-                            reason: QuestionCloseReason::Cancelled,
-                        }));
-                    }
+                    out.extend(self.close_question(id, QuestionCloseReason::Cancelled));
                 }
             }
-            // Types définis par sdk.d.ts, connus et sans effet en J0
-            // (`tool_progress` est capturé dans `t14`).
-            Inbound::ToolProgress(_) | Inbound::Ignored(_) => {}
-            Inbound::Unknown(_) => self.unknown_count += 1,
+            Inbound::ToolProgress(p) => {
+                emit_agent(&mut out, self.agents.on_tool_progress(p));
+            }
+            // Types de `sdk.d.ts` connus et sans effet ; inconnus déjà comptés.
+            Inbound::Ignored(_) | Inbound::Unknown(_) => {}
         }
         out
     }
 
     fn on_system(&mut self, sys: &SystemMessage, out: &mut Vec<Action>) {
+        let now = self.now;
         match sys {
             SystemMessage::Init(i) => {
                 self.capabilities = i.capabilities.clone();
@@ -206,62 +286,41 @@ impl Reducer {
                     self.set_state(SessionState::Requesting, out);
                 }
             }
-            SystemMessage::TaskStarted(t) => {
-                let agent_type = t
-                    .subagent_type
-                    .clone()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                out.push(Action::Emit(EventBody::Agent(AgentEvent {
-                    tool_use_id: t.tool_use_id.clone().unwrap_or_default(),
-                    task_id: t.task_id.clone(),
-                    agent_type,
-                    color: None,
-                    description: t.description.clone().unwrap_or_default(),
-                    status: AgentStatus::Running,
-                    background: t.is_backgrounded.unwrap_or(false),
-                    started_at: None,
-                    ended_at: None,
-                    last_tool: None,
-                    tokens: None,
-                    tool_uses: None,
-                    summary: None,
-                })));
+            SystemMessage::TaskStarted(t) => emit_agent(out, self.agents.on_task_started(t, now)),
+            SystemMessage::TaskProgress(p) => emit_agent(out, self.agents.on_task_progress(p)),
+            SystemMessage::TaskUpdated(u) => {
+                let a = self.agents.on_task_updated(u, now);
+                self.forget_finished(a.as_ref());
+                emit_agent(out, a);
             }
-            SystemMessage::TaskNotification(t) => {
-                let status = match t.status.as_deref() {
-                    Some("completed") => AgentStatus::Completed,
-                    Some("failed") => AgentStatus::Failed,
-                    Some("stopped") | Some("killed") => AgentStatus::Stopped,
-                    _ => AgentStatus::Completed,
-                };
-                let usage = t.usage.as_ref();
-                out.push(Action::Emit(EventBody::Agent(AgentEvent {
-                    tool_use_id: t.tool_use_id.clone().unwrap_or_default(),
-                    task_id: t.task_id.clone(),
-                    agent_type: String::new(),
-                    color: None,
-                    description: String::new(),
-                    status,
-                    background: false,
-                    started_at: None,
-                    ended_at: None,
-                    last_tool: None,
-                    tokens: usage.and_then(|u_| u_.total_tokens),
-                    tool_uses: usage.and_then(|u_| u_.tool_uses).map(|n| n as u32),
-                    summary: t.summary.clone(),
-                })));
+            SystemMessage::TaskNotification(n) => {
+                let a = self.agents.on_task_notification(n, now);
+                self.forget_finished(a.as_ref());
+                emit_agent(out, a);
             }
-            // Connus et sans effet en J0 : hook_*, thinking_tokens, task_progress,
-            // task_updated, background_tasks_changed, etc.
-            _ => {}
+            SystemMessage::BackgroundTasksChanged(b) => {
+                for a in self.agents.on_background_tasks(b.tasks.as_ref()) {
+                    out.push(Action::Emit(EventBody::Agent(a)));
+                }
+            }
+            // Connus et sans effet : hook_*, thinking_tokens, sous-types ignorés.
+            SystemMessage::Hook(_)
+            | SystemMessage::ThinkingTokens(_)
+            | SystemMessage::Ignored(_)
+            | SystemMessage::Unknown(_) => {}
+        }
+    }
+
+    /// Un agent fini n'aura plus de message : ses compteurs de blocs partent.
+    fn forget_finished(&mut self, a: Option<&AgentEvent>) {
+        if let Some(a) = a.filter(|a| a.ended_at.is_some()) {
+            self.blocks.clear_thread(&a.tool_use_id);
         }
     }
 
     fn on_stream_event(&mut self, m: &StreamEventMessage, out: &mut Vec<Action>) {
         let Some(ev) = &m.event else { return };
-        let thread = thread_of(&m.parent_tool_use_id);
+        let thread = thread_of(m.parent_tool_use_id.as_deref());
         let msg_id = m
             .api_message_id
             .clone()
@@ -292,6 +351,8 @@ impl Reducer {
                 }));
             }
             StreamEventKind::ContentBlockDelta => {
+                // Les `input_json_delta` restent dans le cœur (plan 1.5) :
+                // l'`input` complet arrive avec le message `assistant`.
                 if let Some(Delta::TextDelta { text: Some(text) }) = &ev.delta {
                     out.push(Action::Emit(EventBody::TextDelta {
                         thread,
@@ -308,21 +369,21 @@ impl Reducer {
     fn on_assistant(&mut self, a: &AssistantMessage, out: &mut Vec<Action>) {
         let Some(m) = &a.message else { return };
         let msg_id = m.id.clone().unwrap_or_default();
-        let thread = thread_of(&a.parent_tool_use_id);
+        let thread = thread_of(a.parent_tool_use_id.as_deref());
         let Some(content) = &m.content else {
             return;
         };
         for b in content {
-            let counter = self.assistant_blocks.entry(msg_id.clone()).or_insert(0);
-            let index = *counter;
-            *counter += 1;
+            // Tout bloc compte, même inconnu : l'index suit celui de l'API.
+            let index = self.blocks.next_index(&thread, &msg_id);
             let block = match b {
                 ContentBlock::Text { text } => BlockDoneKind::Text {
                     text: text.clone().unwrap_or_default(),
                 },
                 ContentBlock::Thinking { thinking } => BlockDoneKind::Thinking {
-                    empty: thinking.as_ref().map(|t| t.is_empty()).unwrap_or(true),
+                    empty: thinking.as_deref().is_none_or(str::is_empty),
                 },
+                // Contenu chiffré : jamais affichable (voir l'en-tête).
                 ContentBlock::RedactedThinking => BlockDoneKind::Thinking { empty: true },
                 ContentBlock::ToolUse(t) | ContentBlock::ServerToolUse(t) => {
                     BlockDoneKind::ToolUse {
@@ -331,7 +392,20 @@ impl Reducer {
                         input: t.input.clone().unwrap_or(Value::Null),
                     }
                 }
+                // Bloc inconnu (compté) ou inattendu ici : rien à émettre.
                 _ => continue,
+            };
+            let agent_events = match &block {
+                BlockDoneKind::ToolUse {
+                    tool_use_id,
+                    name,
+                    input,
+                } => {
+                    let parent = (thread != ThreadId::main()).then_some(thread.0.as_str());
+                    self.agents
+                        .on_tool_use(tool_use_id, name, input, parent, self.now)
+                }
+                _ => vec![],
             };
             out.push(Action::Emit(EventBody::BlockDone {
                 thread: thread.clone(),
@@ -339,11 +413,16 @@ impl Reducer {
                 index,
                 block,
             }));
+            // Après `block_done` : l'interface crée la ligne de l'outil, puis
+            // la transforme en ligne d'agent.
+            for ev in agent_events {
+                out.push(Action::Emit(EventBody::Agent(ev)));
+            }
         }
     }
 
     fn on_user(&mut self, m: &UserMessage, out: &mut Vec<Action>) {
-        let thread = thread_of(&m.parent_tool_use_id);
+        let thread = thread_of(m.parent_tool_use_id.as_deref());
         let uuid = m.uuid.clone();
         let Some(content) = m.message.as_ref().and_then(|b| b.content.as_ref()) else {
             return;
@@ -356,13 +435,18 @@ impl Reducer {
                     match p {
                         ContentBlock::Text { text } => texts.push(text.clone().unwrap_or_default()),
                         ContentBlock::ToolResult(tr) => {
+                            let tool_use_id = tr.tool_use_id.clone().unwrap_or_default();
+                            let is_error = tr.is_error.unwrap_or(false);
                             out.push(Action::Emit(EventBody::ToolResult {
                                 thread: thread.clone(),
-                                tool_use_id: tr.tool_use_id.clone().unwrap_or_default(),
+                                tool_use_id: tool_use_id.clone(),
                                 content: result_parts(tr.content.as_ref()),
-                                is_error: tr.is_error.unwrap_or(false),
+                                is_error,
                                 meta: m.tool_use_result.clone(),
                             }));
+                            let a = self.agents.on_tool_result(&tool_use_id, is_error, self.now);
+                            self.forget_finished(a.as_ref());
+                            emit_agent(out, a);
                         }
                         _ => {}
                     }
@@ -376,6 +460,8 @@ impl Reducer {
         let text = texts.join("\n");
         let origin = if text.trim() == INTERRUPTED_TEXT {
             UserOrigin::Interrupted
+        } else if self.history {
+            UserOrigin::History
         } else {
             UserOrigin::Replay
         };
@@ -410,6 +496,8 @@ impl Reducer {
             permission_denials: r.permission_denials.clone().unwrap_or_default(),
             result: r.result.clone(),
         }));
+        // Un message du fil principal ne chevauche pas deux tours.
+        self.blocks.clear_thread("main");
         self.set_state(SessionState::Idle, out);
     }
 
@@ -499,6 +587,12 @@ impl Reducer {
     }
 }
 
+fn emit_agent(out: &mut Vec<Action>, a: Option<AgentEvent>) {
+    if let Some(a) = a {
+        out.push(Action::Emit(EventBody::Agent(a)));
+    }
+}
+
 fn result_parts(content: Option<&ToolResultContent>) -> Vec<ResultPart> {
     match content {
         None | Some(ToolResultContent::Null) => vec![],
@@ -517,37 +611,6 @@ fn result_parts(content: Option<&ToolResultContent>) -> Vec<ResultPart> {
             .collect(),
         Some(ToolResultContent::Other(other)) => vec![ResultPart::Other { raw: other.clone() }],
     }
-}
-
-pub fn parse_questions(input: &Value) -> Vec<QuestionItem> {
-    input
-        .get("questions")
-        .and_then(Value::as_array)
-        .map(|qs| {
-            qs.iter()
-                .map(|q| QuestionItem {
-                    question: s(q, "question").unwrap_or_default(),
-                    header: s(q, "header").unwrap_or_default(),
-                    options: q
-                        .get("options")
-                        .and_then(Value::as_array)
-                        .map(|os| {
-                            os.iter()
-                                .map(|o| QuestionOption {
-                                    label: s(o, "label").unwrap_or_default(),
-                                    description: s(o, "description").unwrap_or_default(),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    multi_select: q
-                        .get("multiSelect")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Construit `ready` depuis la réponse à `initialize` (`t11`).

@@ -1,0 +1,4 @@
+[
+{"seq":0,"t":1794823200080,"session":"t12","kind":"exited","code":0,"during_turn":false,"stderr_tail":[]},
+{"seq":1,"t":1794823200080,"session":"t12","kind":"status","state":"Exited"}
+]
