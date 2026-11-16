@@ -81,6 +81,9 @@ pub struct Diagnostics {
     pub capabilities: Vec<String>,
     pub log_path: Option<String>,
     pub stderr_tail: Vec<String>,
+    /// Types et sous-types inconnus ignorés par le réducteur (plan 1.9).
+    #[ts(type = "number")]
+    pub unknown_count: u64,
 }
 
 /// Réponse de `get_launch_info` (ajout au plan : l'interface doit connaître le

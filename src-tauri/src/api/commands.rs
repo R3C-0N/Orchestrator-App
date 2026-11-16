@@ -5,10 +5,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use super::events::CoreEvent;
 use super::types::{
@@ -60,8 +61,74 @@ impl AppState {
             .collect();
         for s in all {
             s.stop().await;
+            *self.last.lock().unwrap() = Some(s);
         }
     }
+
+    /// Ferme une session et la retire de la table ; `None` si elle n'y est
+    /// plus (déjà fermée). La session reste visible des diagnostics (`last`).
+    pub async fn close_session(&self, key: &SessionKey) -> Option<ExitInfo> {
+        let s = self.sessions.lock().unwrap().remove(key)?;
+        let info = s.stop().await;
+        *self.last.lock().unwrap() = Some(s);
+        Some(info)
+    }
+
+    /// La webview (re)charge sa page : l'interface qui tenait les canaux des
+    /// sessions n'existe plus, ces sessions sont orphelines (plan J6). Elles
+    /// sont fermées ; l'interface relancée repart de `get_launch_info`.
+    pub async fn close_orphans(&self) -> usize {
+        let n = self.sessions.lock().unwrap().len();
+        if n > 0 {
+            tracing::warn!(
+                sessions = n,
+                "rechargement de l'interface : sessions orphelines fermées"
+            );
+            self.stop_all().await;
+        }
+        n
+    }
+
+    /// Retire de la table les sessions dont le processus est mort ; la plus
+    /// récente reste dans `last` pour les diagnostics.
+    fn forget_dead(&self) {
+        let mut map = self.sessions.lock().unwrap();
+        let dead: Vec<SessionKey> = map
+            .iter()
+            .filter(|(_, s)| !s.is_running())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in dead {
+            if let Some(s) = map.remove(&k) {
+                *self.last.lock().unwrap() = Some(s);
+            }
+        }
+    }
+}
+
+/// Destination des événements d'une session : le canal de l'interface. Si le
+/// canal refuse un lot (interface fermée ou rechargée), la session est
+/// orpheline : elle est fermée et retirée de `AppState.sessions`, une fois.
+fn channel_sink(
+    events: Channel<Vec<CoreEvent>>,
+    app: AppHandle,
+    key: SessionKey,
+) -> crate::state::batcher::Sink {
+    let closed = Arc::new(AtomicBool::new(false));
+    Arc::new(move |batch| {
+        if events.send(batch).is_ok() {
+            return true;
+        }
+        if !closed.swap(true, Ordering::SeqCst) {
+            tracing::warn!(session = %key.0, "canal de l'interface fermé : session orpheline fermée");
+            let app = app.clone();
+            let key = key.clone();
+            tauri::async_runtime::spawn(async move {
+                app.state::<AppState>().close_session(&key).await;
+            });
+        }
+        false
+    })
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -71,6 +138,7 @@ pub fn get_launch_info(state: State<'_, AppState>) -> LaunchInfo {
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn start_session(
+    app: AppHandle,
     state: State<'_, AppState>,
     cwd: String,
     resume: Option<String>,
@@ -80,7 +148,8 @@ pub async fn start_session(
     let exe = locate_claude().map_err(|tried| CoreError::ClaudeNotFound(tried.join(" ; ")))?;
     let cwd = PathBuf::from(cwd);
     let key = SessionKey(uuid::Uuid::new_v4().to_string());
-    let sink: crate::state::batcher::Sink = Arc::new(move |batch| events.send(batch).is_ok());
+    state.forget_dead();
+    let sink = channel_sink(events, app, key.clone());
     let session = Session::start(
         key.clone(),
         &exe,
@@ -174,15 +243,10 @@ pub async fn stop_session(
     state: State<'_, AppState>,
     session: SessionKey,
 ) -> Result<ExitInfo, CoreError> {
-    let s = state
-        .sessions
-        .lock()
-        .unwrap()
-        .remove(&session)
-        .ok_or(CoreError::NotRunning)?;
-    let info = s.stop().await;
-    *state.last.lock().unwrap() = Some(s);
-    Ok(info)
+    state
+        .close_session(&session)
+        .await
+        .ok_or(CoreError::NotRunning)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -192,11 +256,13 @@ pub fn get_diagnostics(state: State<'_, AppState>) -> Diagnostics {
     let mut d = Diagnostics {
         expected_version: EXPECTED_CLAUDE_VERSION.into(),
         claude_path: state.launch.claude_path.clone(),
+        log_path: crate::logging::log_dir().map(display_path),
         ..Default::default()
     };
     if let Some(s) = s {
         d.claude_version = s.version();
         d.capabilities = s.capabilities();
+        d.unknown_count = s.unknown_count();
         let tail = s.stderr_tail();
         d.stderr_tail = tail.iter().rev().take(50).rev().cloned().collect();
     }

@@ -3,4 +3,8 @@
 /**
  * Réponse de `get_diagnostics`.
  */
-export type Diagnostics = { claude_version: string | null, expected_version: string, claude_path: string | null, capabilities: Array<string>, log_path: string | null, stderr_tail: Array<string>, };
+export type Diagnostics = { claude_version: string | null, expected_version: string, claude_path: string | null, capabilities: Array<string>, log_path: string | null, stderr_tail: Array<string>, 
+/**
+ * Types et sous-types inconnus ignorés par le réducteur (plan 1.9).
+ */
+unknown_count: number, };

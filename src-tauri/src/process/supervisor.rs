@@ -3,22 +3,32 @@
 //!
 //! Indépendant de Tauri : les événements sortent par un [`Sink`] (Channel Tauri
 //! dans l'app, impression JSON dans le binaire `probe` et les tests).
+//!
+//! Supervision (plan 1.9, J6) : la fin du processus est détectée par
+//! `child.wait()` en concurrence avec la lecture de stdout (`select!`), et non
+//! par la fin de stdout, qu'un petit-enfant peut garder ouverte. Après la
+//! sortie, stdout est encore lu pendant [`SessionConfig::exit_flush`], puis le
+//! Job Object est terminé : tout l'arbre meurt et les tuyaux se ferment.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
+use tokio::process::{Child, ChildStdout};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 
 use crate::api::events::{
-    CoreEvent, EventBody, NoticeLevel, QuestionCloseReason, SessionState, ThreadId, UserOrigin,
+    CoreEvent, EventBody, QuestionCloseReason, SessionState, ThreadId, UserOrigin,
 };
 use crate::api::types::{Answers, CoreError, ExitInfo, InterruptAck, SessionKey, SkipReason};
+use crate::errors::{self, NoticeLimiter};
+use crate::logging::{self, RawLog};
 use crate::process::locate::display_path;
-use crate::process::reader::{LineReader, RawLine};
+use crate::process::reader::{LineReader, RawLine, MAX_LINE_BYTES};
 use crate::process::spawn::{
     build_args, spawn_claude, validate_launch_options, Job, LaunchOptions,
 };
@@ -31,9 +41,17 @@ use crate::state::reducer::{Action, Reducer, CAP_UNANSWERED};
 pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 pub const STOP_GRACE: Duration = Duration::from_secs(3);
-/// Attente maximale de la fin de lecture de stderr après un échec de démarrage.
+/// Attente maximale de la fin de lecture de stderr après la fin du processus
+/// ou un échec de démarrage.
 pub const STDERR_DRAIN: Duration = Duration::from_secs(1);
+/// Lecture de stdout encore permise après la sortie du processus, avant de
+/// terminer le Job (les dernières lignes écrites juste avant la sortie).
+pub const EXIT_FLUSH: Duration = Duration::from_millis(500);
+/// Délai entre l'acceptation d'un `interrupt` et le `result` attendu.
+pub const INTERRUPT_RESULT_TIMEOUT: Duration = Duration::from_secs(5);
 const STDERR_KEEP: usize = 200;
+/// Lignes de stderr jointes à `exited`.
+const EXIT_STDERR_TAIL: usize = 20;
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
 
@@ -42,6 +60,31 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Délais et plafonds d'une session. `Default` = valeurs du plan ; les tests
+/// les raccourcissent.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub initialize_timeout: Duration,
+    pub control_timeout: Duration,
+    pub interrupt_result_timeout: Duration,
+    pub stop_grace: Duration,
+    pub exit_flush: Duration,
+    pub max_line_bytes: usize,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        SessionConfig {
+            initialize_timeout: INITIALIZE_TIMEOUT,
+            control_timeout: CONTROL_TIMEOUT,
+            interrupt_result_timeout: INTERRUPT_RESULT_TIMEOUT,
+            stop_grace: STOP_GRACE,
+            exit_flush: EXIT_FLUSH,
+            max_line_bytes: MAX_LINE_BYTES,
+        }
+    }
 }
 
 /// Numérote et horodate les événements, puis les passe au regroupeur.
@@ -62,6 +105,14 @@ impl Emitter {
             body,
         });
     }
+
+    fn emit_actions(&self, out: Vec<Action>, t: u64) {
+        for a in out {
+            if let Action::Emit(b) = a {
+                self.emit(b, t);
+            }
+        }
+    }
 }
 
 pub struct Session {
@@ -69,15 +120,276 @@ pub struct Session {
     pub pid: u32,
     pub claude_path: PathBuf,
     pub cwd: PathBuf,
+    config: SessionConfig,
     stdin_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
     reducer: Arc<Mutex<Reducer>>,
     pending: Pending,
     emitter: Emitter,
-    job: Job,
+    job: Arc<Job>,
     exit_rx: watch::Receiver<Option<Option<i32>>>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
-    stderr_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Vrai dès que l'app demande l'arrêt : la sortie n'est plus une alerte.
+    stopping: Arc<AtomicBool>,
+    /// Numéro de la dernière interruption (garde de son délai de `result`).
+    interrupt_gen: Arc<AtomicU64>,
+    raw: Option<Arc<RawLog>>,
     next_id: AtomicU64,
+}
+
+/// Ce que la tâche de supervision partage avec la session.
+struct Supervision {
+    reducer: Arc<Mutex<Reducer>>,
+    pending: Pending,
+    em: Emitter,
+    /// Référence faible : fermer stdin (stop) ne doit pas dépendre du lecteur.
+    writer: mpsc::WeakUnboundedSender<String>,
+    job: Arc<Job>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    stderr_task: Option<JoinHandle<()>>,
+    stopping: Arc<AtomicBool>,
+    raw: Option<Arc<RawLog>>,
+    exit_tx: watch::Sender<Option<Option<i32>>>,
+    exit_flush: Duration,
+    max_line_bytes: usize,
+    key: SessionKey,
+    pid: u32,
+}
+
+impl Supervision {
+    /// Boucle de supervision : lit stdout et attend la fin du processus en
+    /// même temps. Émet `exited` dès que le processus est mort, même si un
+    /// petit-enfant garde stdout ouvert.
+    async fn run(mut self, mut child: Child, stdout: ChildStdout) {
+        let mut r = LineReader::with_max(stdout, self.max_line_bytes);
+        let mut limiter = NoticeLimiter::default();
+        let mut stdout_open = true;
+        let status = {
+            let wait = child.wait();
+            tokio::pin!(wait);
+            loop {
+                if !stdout_open {
+                    break (&mut wait).await;
+                }
+                tokio::select! {
+                    // Les lignes déjà écrites passent avant la fin du processus.
+                    biased;
+                    line = r.next_line() => match line {
+                        Ok(Some(raw)) => self.on_line(raw, &mut limiter),
+                        Ok(None) => {
+                            tracing::debug!(session = %self.key.0, "fin de stdout");
+                            stdout_open = false;
+                        }
+                        Err(e) => {
+                            tracing::warn!(session = %self.key.0, "lecture de stdout : {e}");
+                            stdout_open = false;
+                        }
+                    },
+                    st = &mut wait => break st,
+                }
+            }
+        };
+        let code = match &status {
+            Ok(s) => s.code(),
+            Err(e) => {
+                tracing::warn!(session = %self.key.0, "attente du processus : {e}");
+                None
+            }
+        };
+
+        // Dernières lignes écrites juste avant la sortie ; au-delà du délai,
+        // stdout est tenu par un autre processus de l'arbre.
+        if stdout_open {
+            let deadline = tokio::time::Instant::now() + self.exit_flush;
+            loop {
+                match tokio::time::timeout_at(deadline, r.next_line()).await {
+                    Ok(Ok(Some(raw))) => self.on_line(raw, &mut limiter),
+                    Ok(Ok(None)) | Ok(Err(_)) => break,
+                    Err(_) => {
+                        tracing::warn!(
+                            session = %self.key.0,
+                            "stdout encore ouvert {} ms après la sortie : un processus de l'arbre le tient",
+                            self.exit_flush.as_millis()
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        // Finir l'arbre (bash, serveurs MCP, petits-enfants) : ferme les tuyaux.
+        self.job.terminate();
+        drop(r);
+
+        // stderr complet avant `exited` (dernier message d'erreur du CLI).
+        if let Some(task) = self.stderr_task.take() {
+            let _ = tokio::time::timeout(STDERR_DRAIN, task).await;
+        }
+
+        let during_turn = self.reducer.lock().unwrap().in_turn();
+        // Lu avant de libérer les requêtes en attente : un échec d'`initialize`
+        // causé par cette mort ne doit pas la faire passer pour un arrêt voulu.
+        let stopping = self.stopping.load(Ordering::SeqCst);
+        // Les requêtes en attente ne recevront jamais de réponse.
+        for (_, tx) in self.pending.lock().unwrap().drain() {
+            let _ = tx.send(Err("claude.exe s'est arrêté".into()));
+        }
+        let tail: Vec<String> = {
+            let t = self.stderr_tail.lock().unwrap();
+            let skip = t.len().saturating_sub(EXIT_STDERR_TAIL);
+            t.iter().skip(skip).cloned().collect()
+        };
+        tracing::info!(
+            session = %self.key.0,
+            pid = self.pid,
+            ?code,
+            during_turn,
+            requested = stopping,
+            "claude.exe arrêté"
+        );
+        let t = now_ms();
+        self.em.emit(
+            EventBody::Exited {
+                code,
+                during_turn,
+                stderr_tail: tail.clone(),
+            },
+            t,
+        );
+        // Code non nul sans arrêt demandé : alerte (plan 1.9). Code 0 après
+        // fermeture de stdin : arrêt normal.
+        if code != Some(0) && !stopping {
+            self.em.emit(errors::exit_nonzero(code, &tail), t);
+        }
+        // Par le réducteur : `Exited` y devient terminal.
+        let mut out = Vec::new();
+        self.reducer
+            .lock()
+            .unwrap()
+            .set_state(SessionState::Exited, &mut out);
+        self.em.emit_actions(out, t);
+        if let Some(raw) = &self.raw {
+            raw.exit(code);
+        }
+        let _ = self.exit_tx.send(Some(code));
+    }
+
+    fn on_line(&self, raw: RawLine, limiter: &mut NoticeLimiter) {
+        let t = now_ms();
+        match raw {
+            RawLine::Line(text) => {
+                let line = text.trim();
+                if line.is_empty() {
+                    return;
+                }
+                if let Some(log) = &self.raw {
+                    log.cli(line);
+                }
+                match Inbound::from_line(line) {
+                    Ok(msg) => {
+                        for k in msg.unknown_kinds() {
+                            tracing::info!(session = %self.key.0, kind = %k, "type inconnu ignoré");
+                        }
+                        let actions = self.reducer.lock().unwrap().handle_inbound_at(&msg, t);
+                        apply_actions(actions, &self.em, &self.writer, &self.pending, &self.raw, t);
+                    }
+                    Err(e) => {
+                        tracing::warn!(session = %self.key.0, error = %e, line, "ligne illisible");
+                        if limiter.allow(errors::BAD_JSON, Instant::now()) {
+                            let n = limiter.take_suppressed(errors::BAD_JSON);
+                            self.em.emit(errors::bad_json(&e.to_string(), line, n), t);
+                        }
+                    }
+                }
+            }
+            RawLine::TooLong { len, head } => {
+                tracing::warn!(
+                    session = %self.key.0,
+                    len,
+                    max = self.max_line_bytes,
+                    head = %head,
+                    "ligne trop longue ignorée"
+                );
+                if limiter.allow(errors::LINE_TOO_LONG, Instant::now()) {
+                    let n = limiter.take_suppressed(errors::LINE_TOO_LONG);
+                    self.em
+                        .emit(errors::line_too_long(len, self.max_line_bytes, &head, n), t);
+                }
+            }
+        }
+    }
+}
+
+/// Lit stderr ligne à ligne : 200 lignes en mémoire, toutes au journal, chacune
+/// relayée (`stderr`).
+fn spawn_stderr_reader(
+    stderr: tokio::process::ChildStderr,
+    tail: Arc<Mutex<VecDeque<String>>>,
+    em: Emitter,
+    raw: Option<Arc<RawLog>>,
+    key: SessionKey,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut r = LineReader::new(stderr);
+        loop {
+            match r.next_line().await {
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::debug!(session = %key.0, "lecture de stderr : {e}");
+                    break;
+                }
+                Ok(Some(raw_line)) => {
+                    let line = match raw_line {
+                        RawLine::Line(l) => l.trim_end().to_string(),
+                        RawLine::TooLong { len, head } => {
+                            format!("{head}… [ligne de {len} octets tronquée]")
+                        }
+                    };
+                    tracing::info!(target: "claude_stderr", session = %key.0, "{line}");
+                    if let Some(log) = &raw {
+                        log.stderr(&line);
+                    }
+                    {
+                        let mut t = tail.lock().unwrap();
+                        if t.len() == STDERR_KEEP {
+                            t.pop_front();
+                        }
+                        t.push_back(line.clone());
+                    }
+                    em.emit(EventBody::Stderr { line }, now_ms());
+                }
+            }
+        }
+    })
+}
+
+/// Surveille la tâche d'écriture : un tuyau stdin cassé laisse une trace au
+/// journal, et une `notice` si le processus tourne encore (sinon c'est la
+/// conséquence de sa mort, déjà signalée par `exited`).
+fn watch_writer(
+    task: JoinHandle<std::io::Result<()>>,
+    mut exit_rx: watch::Receiver<Option<Option<i32>>>,
+    em: Emitter,
+    stopping: Arc<AtomicBool>,
+    key: SessionKey,
+) {
+    tokio::spawn(async move {
+        match task.await {
+            Ok(Ok(())) => tracing::debug!(session = %key.0, "stdin fermé"),
+            Ok(Err(e)) => {
+                tracing::warn!(session = %key.0, "écriture sur stdin en échec : {e}");
+                // Laisser à la supervision le temps de voir une mort éventuelle.
+                let exited = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    exit_rx.wait_for(|x| x.is_some()),
+                )
+                .await
+                .is_ok();
+                if !exited && !stopping.load(Ordering::SeqCst) {
+                    em.emit(errors::stdin_broken(&e.to_string()), now_ms());
+                }
+            }
+            Err(e) => tracing::error!(session = %key.0, "tâche d'écriture interrompue : {e}"),
+        }
+    });
 }
 
 impl Session {
@@ -89,13 +401,42 @@ impl Session {
         opts: LaunchOptions,
         sink: Sink,
     ) -> Result<Arc<Session>, CoreError> {
+        Self::start_with(key, exe, cwd, opts, sink, SessionConfig::default()).await
+    }
+
+    /// Comme [`Session::start`], avec des délais et plafonds choisis.
+    pub async fn start_with(
+        key: SessionKey,
+        exe: &Path,
+        cwd: &Path,
+        opts: LaunchOptions,
+        sink: Sink,
+        config: SessionConfig,
+    ) -> Result<Arc<Session>, CoreError> {
         if !cwd.is_dir() {
             return Err(CoreError::BadCwd(display_path(cwd)));
         }
         validate_launch_options(&opts).map_err(CoreError::InvalidArgument)?;
         let args = build_args(&opts);
-        let mut spawned =
-            spawn_claude(exe, cwd, &args).map_err(|e| CoreError::SpawnFailed(e.to_string()))?;
+        let mut spawned = spawn_claude(exe, cwd, &args).map_err(|e| {
+            tracing::error!(exe = %exe.display(), "échec du lancement : {e}");
+            CoreError::SpawnFailed(e.to_string())
+        })?;
+        tracing::info!(
+            session = %key.0,
+            pid = spawned.pid,
+            exe = %exe.display(),
+            cwd = %cwd.display(),
+            args = ?spawned.args,
+            "claude.exe lancé"
+        );
+
+        let raw = logging::raw_dir().and_then(|dir| {
+            RawLog::create(&dir, &key.0, now_ms())
+                .map_err(|e| tracing::warn!("flux brut non copié : {e}"))
+                .ok()
+                .map(Arc::new)
+        });
 
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         tokio::spawn(run_batcher(ev_rx, sink));
@@ -117,169 +458,100 @@ impl Session {
         let stdout = spawned.child.stdout.take().expect("stdout piped");
         let stderr = spawned.child.stderr.take().expect("stderr piped");
 
-        // Écrivain : une ligne JSON par message ; fermer le canal ferme stdin.
-        let (stdin_tx, _writer_task) = writer::spawn_writer(stdin);
-
-        // stderr : gardé en mémoire (200 lignes) et relayé.
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
-        let stderr_task = {
-            let tail = stderr_tail.clone();
-            let em = emitter.clone();
-            tokio::spawn(async move {
-                let mut r = LineReader::new(stderr);
-                loop {
-                    match r.next_line().await {
-                        Ok(None) | Err(_) => break,
-                        Ok(Some(raw)) => {
-                            let line = match raw {
-                                RawLine::Line(l) => l.trim_end().to_string(),
-                                RawLine::TooLong { len, head } => {
-                                    format!("{head}… [ligne de {len} octets tronquée]")
-                                }
-                            };
-                            {
-                                let mut t = tail.lock().unwrap();
-                                if t.len() == STDERR_KEEP {
-                                    t.pop_front();
-                                }
-                                t.push_back(line.clone());
-                            }
-                            em.emit(EventBody::Stderr { line }, now_ms());
-                        }
-                    }
-                }
-            })
-        };
+        let stderr_task = Some(spawn_stderr_reader(
+            stderr,
+            stderr_tail.clone(),
+            emitter.clone(),
+            raw.clone(),
+            key.clone(),
+        ));
 
         let reducer = Arc::new(Mutex::new(Reducer::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (exit_tx, exit_rx) = watch::channel(None);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let job = Arc::new(spawned.job);
 
-        // Lecteur de stdout, puis attente de la fin du processus.
-        {
-            let reducer = reducer.clone();
-            let pending = pending.clone();
-            let em = emitter.clone();
-            // Référence faible : fermer stdin (stop) ne doit pas dépendre du lecteur.
-            let writer = stdin_tx.downgrade();
-            let tail = stderr_tail.clone();
-            let mut child = spawned.child;
-            tokio::spawn(async move {
-                let mut r = LineReader::new(stdout);
-                let mut last_bad_json: Option<Instant> = None;
-                loop {
-                    let raw = match r.next_line().await {
-                        Ok(Some(raw)) => raw,
-                        Ok(None) | Err(_) => break,
-                    };
-                    let t = now_ms();
-                    // Ligne trop longue : traitée comme une ligne illisible
-                    // (notice Warn limitée à 1 par minute, plan 1.9).
-                    let parsed = match &raw {
-                        RawLine::Line(text) => {
-                            let line = text.trim();
-                            if line.is_empty() {
-                                continue;
-                            }
-                            Inbound::from_line(line)
-                                .map_err(|e| (e.to_string(), line.chars().take(500).collect()))
-                        }
-                        RawLine::TooLong { len, head } => Err((
-                            format!("ligne de {len} octets au-delà du plafond"),
-                            head.clone(),
-                        )),
-                    };
-                    let msg = match parsed {
-                        Ok(m) => m,
-                        Err((e, line)) => {
-                            let now = Instant::now();
-                            if last_bad_json.is_none_or(|l| now - l >= Duration::from_secs(60)) {
-                                last_bad_json = Some(now);
-                                em.emit(
-                                    EventBody::Notice {
-                                        level: NoticeLevel::Warn,
-                                        code: "bad_json".into(),
-                                        message: format!("Ligne illisible ignorée : {e}"),
-                                        detail: Some(Value::String(line)),
-                                    },
-                                    t,
-                                );
-                            }
-                            continue;
-                        }
-                    };
-                    let actions = reducer.lock().unwrap().handle_inbound(&msg);
-                    apply_actions(actions, &em, &writer, &pending, t);
-                }
-                let code = child.wait().await.ok().and_then(|s| s.code());
-                let during_turn = reducer.lock().unwrap().in_turn();
-                // Les requêtes en attente ne recevront jamais de réponse.
-                for (_, tx) in pending.lock().unwrap().drain() {
-                    let _ = tx.send(Err("claude.exe s'est arrêté".into()));
-                }
-                let stderr_tail: Vec<String> = tail.lock().unwrap().iter().cloned().collect();
-                let t = now_ms();
-                em.emit(
-                    EventBody::Exited {
-                        code,
-                        during_turn,
-                        stderr_tail: stderr_tail.iter().rev().take(20).rev().cloned().collect(),
-                    },
-                    t,
-                );
-                // Par le réducteur : `Exited` y devient terminal.
-                let mut out = Vec::new();
-                reducer
-                    .lock()
-                    .unwrap()
-                    .set_state(SessionState::Exited, &mut out);
-                for a in out {
-                    if let Action::Emit(b) = a {
-                        em.emit(b, t);
-                    }
-                }
-                let _ = exit_tx.send(Some(code));
-            });
-        }
+        // Écrivain : une ligne JSON par message ; fermer le canal ferme stdin.
+        let (stdin_tx, writer_task) = writer::spawn_writer(stdin);
+        watch_writer(
+            writer_task,
+            exit_rx.clone(),
+            emitter.clone(),
+            stopping.clone(),
+            key.clone(),
+        );
+
+        let sup = Supervision {
+            reducer: reducer.clone(),
+            pending: pending.clone(),
+            em: emitter.clone(),
+            writer: stdin_tx.downgrade(),
+            job: job.clone(),
+            stderr_tail: stderr_tail.clone(),
+            stderr_task,
+            stopping: stopping.clone(),
+            raw: raw.clone(),
+            exit_tx,
+            exit_flush: config.exit_flush,
+            max_line_bytes: config.max_line_bytes,
+            key: key.clone(),
+            pid: spawned.pid,
+        };
+        tokio::spawn(sup.run(spawned.child, stdout));
 
         let session = Arc::new(Session {
             key,
             pid: spawned.pid,
             claude_path: exe.to_path_buf(),
             cwd: cwd.to_path_buf(),
+            config,
             stdin_tx: Mutex::new(Some(stdin_tx)),
             reducer,
             pending,
             emitter,
-            job: spawned.job,
+            job,
             exit_rx,
             stderr_tail,
-            stderr_task: Mutex::new(Some(stderr_task)),
+            stopping,
+            interrupt_gen: Arc::new(AtomicU64::new(0)),
+            raw,
             next_id: AtomicU64::new(1),
         });
 
         // initialize (spec 4.7bis) : la réponse produit `ready`.
         let init_id = session.new_request_id("init");
         session.reducer.lock().unwrap().expect_initialize(&init_id);
+        let timeout = session.config.initialize_timeout;
         match session
-            .control_with_id(&init_id, "initialize", Map::new(), INITIALIZE_TIMEOUT)
+            .control_with_id(&init_id, "initialize", Map::new(), timeout)
             .await
         {
             Ok(_) => Ok(session),
             Err(e) => {
-                // Tuer l'arbre ferme stderr ; on laisse la tâche de lecture
-                // vider ce qui reste avant de construire le message d'erreur.
-                session.job.terminate();
-                let task = session.stderr_task.lock().unwrap().take();
-                if let Some(task) = task {
-                    let _ = tokio::time::timeout(STDERR_DRAIN, task).await;
+                // Arrêt voulu par l'app : pas d'alerte « code non nul » en plus
+                // de l'erreur rendue ici, sauf si le processus était déjà mort.
+                if session.is_running() {
+                    session.stopping.store(true, Ordering::SeqCst);
                 }
+                // Tuer l'arbre ferme stdout et stderr ; on attend la fin de la
+                // supervision (stderr vidé) avant de construire le message.
+                session.job.terminate();
+                let mut rx = session.exit_rx.clone();
+                let _ = tokio::time::timeout(
+                    STDERR_DRAIN + session.config.exit_flush,
+                    rx.wait_for(|x| x.is_some()),
+                )
+                .await;
                 let tail = session.stderr_tail();
                 let detail = if tail.is_empty() {
                     String::new()
                 } else {
-                    format!(" ; stderr : {}", tail.join(" | "))
+                    let skip = tail.len().saturating_sub(EXIT_STDERR_TAIL);
+                    format!(" ; stderr : {}", tail[skip..].join(" | "))
                 };
+                tracing::error!(session = %session.key.0, "échec du démarrage : {e}{detail}");
                 Err(CoreError::SpawnFailed(format!(
                     "pas de réponse à initialize ({e}){detail}"
                 )))
@@ -295,6 +567,9 @@ impl Session {
     fn write(&self, line: String) -> Result<(), CoreError> {
         let guard = self.stdin_tx.lock().unwrap();
         let tx = guard.as_ref().ok_or(CoreError::NotRunning)?;
+        if let Some(raw) = &self.raw {
+            raw.sent(&line);
+        }
         tx.send(line).map_err(|_| CoreError::NotRunning)
     }
 
@@ -312,6 +587,36 @@ impl Session {
 
     pub fn capabilities(&self) -> Vec<String> {
         self.reducer.lock().unwrap().capabilities.clone()
+    }
+
+    /// Lignes de type inconnu ignorées par le réducteur (plan 1.9).
+    pub fn unknown_count(&self) -> u64 {
+        self.reducer.lock().unwrap().unknown_count
+    }
+
+    /// État courant tel que le voit le réducteur.
+    pub fn state(&self) -> Option<SessionState> {
+        self.reducer.lock().unwrap().state
+    }
+
+    /// Code de sortie, une fois le processus arrêté : `Some(code)`.
+    pub fn exit_code(&self) -> Option<Option<i32>> {
+        *self.exit_rx.borrow()
+    }
+
+    /// Attend la fin du processus (et de sa supervision) ; `None` au-delà du délai.
+    pub async fn wait_exit(&self, within: Duration) -> Option<Option<i32>> {
+        let mut rx = self.exit_rx.clone();
+        tokio::time::timeout(within, rx.wait_for(|x| x.is_some()))
+            .await
+            .ok()
+            .and_then(|r| r.ok().map(|c| *c))
+            .flatten()
+    }
+
+    /// Fichier de copie du flux brut, si le journal est actif.
+    pub fn raw_log_path(&self) -> Option<&Path> {
+        self.raw.as_deref().map(RawLog::path)
     }
 
     async fn control_with_id(
@@ -388,6 +693,7 @@ impl Session {
 
     pub async fn interrupt(&self, cancel_queued: bool) -> Result<InterruptAck, CoreError> {
         // `Interrupting` seulement pendant un tour ; rien après `Exited`.
+        let gen = self.interrupt_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let prev = self.with_reducer(now_ms(), |r, out| r.begin_interrupt(out));
         let mut extra = Map::new();
         if cancel_queued {
@@ -395,7 +701,7 @@ impl Session {
         }
         let id = self.new_request_id("int");
         let res = self
-            .control_with_id(&id, "interrupt", extra, CONTROL_TIMEOUT)
+            .control_with_id(&id, "interrupt", extra, self.config.control_timeout)
             .await;
         let v = match res {
             Ok(v) => v,
@@ -406,6 +712,9 @@ impl Session {
                 return Err(e);
             }
         };
+        if let Some(prev) = prev {
+            self.watch_interrupt(gen, prev);
+        }
         Ok(InterruptAck {
             still_queued: v
                 .get("still_queued")
@@ -423,12 +732,43 @@ impl Session {
         })
     }
 
+    /// Interruption acceptée : si aucun `result` ne suit dans le délai, l'état
+    /// ne reste pas bloqué sur `Interrupting` ; il revient à l'état d'avant
+    /// (le tour continue, on peut réessayer) avec une `notice`. Une nouvelle
+    /// interruption entre-temps annule cette garde.
+    fn watch_interrupt(&self, gen: u64, prev: SessionState) {
+        let reducer = self.reducer.clone();
+        let em = self.emitter.clone();
+        let current = self.interrupt_gen.clone();
+        let wait = self.config.interrupt_result_timeout;
+        let key = self.key.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            if current.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            let t = now_ms();
+            let mut out = Vec::new();
+            let stuck = {
+                let mut r = reducer.lock().unwrap();
+                let stuck = r.state == Some(SessionState::Interrupting);
+                r.abort_interrupt(prev, &mut out);
+                stuck
+            };
+            if stuck {
+                tracing::warn!(session = %key.0, "interrupt accepté sans result après {wait:?}");
+                em.emit(errors::interrupt_no_result(wait), t);
+            }
+            em.emit_actions(out, t);
+        });
+    }
+
     pub async fn set_model(&self, model: &str) -> Result<String, CoreError> {
         let mut extra = Map::new();
         extra.insert("model".into(), json!(model));
         let id = self.new_request_id("mdl");
         let v = self
-            .control_with_id(&id, "set_model", extra, CONTROL_TIMEOUT)
+            .control_with_id(&id, "set_model", extra, self.config.control_timeout)
             .await?;
         Ok(v.get("model")
             .and_then(Value::as_str)
@@ -474,7 +814,7 @@ impl Session {
         self.emitter.emit(
             EventBody::QuestionClosed {
                 request_id: request_id.into(),
-                reason: QuestionCloseReason::Answered,
+                reason: QuestionCloseReason::Skipped,
             },
             now_ms(),
         );
@@ -483,29 +823,34 @@ impl Session {
 
     /// Ferme stdin, attend 3 s, puis tue l'arbre par le Job Object.
     pub async fn stop(&self) -> ExitInfo {
-        self.stdin_tx.lock().unwrap().take();
-        let mut rx = self.exit_rx.clone();
-        let waited = tokio::time::timeout(STOP_GRACE, rx.wait_for(|x| x.is_some()))
-            .await
-            .ok()
-            .and_then(|r| r.ok().map(|c| c.flatten()));
-        if let Some(code) = waited {
+        self.stopping.store(true, Ordering::SeqCst);
+        if let Some(code) = self.exit_code() {
             return ExitInfo {
                 code,
                 killed: false,
             };
         }
+        tracing::info!(session = %self.key.0, "arrêt demandé : fermeture de stdin");
+        self.stdin_tx.lock().unwrap().take();
+        if let Some(code) = self.wait_exit(self.config.stop_grace).await {
+            return ExitInfo {
+                code,
+                killed: false,
+            };
+        }
+        tracing::warn!(
+            session = %self.key.0,
+            "pas de sortie {} s après la fermeture de stdin : Job Object terminé",
+            self.config.stop_grace.as_secs()
+        );
         self.job.terminate();
-        let code = tokio::time::timeout(Duration::from_secs(2), rx.wait_for(|x| x.is_some()))
-            .await
-            .ok()
-            .and_then(|r| r.ok().map(|c| c.flatten()))
-            .flatten();
+        let code = self.wait_exit(Duration::from_secs(2)).await.flatten();
         ExitInfo { code, killed: true }
     }
 
     /// Tue immédiatement l'arbre de processus (sans attente).
     pub fn kill(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
         self.job.terminate();
     }
 }
@@ -534,6 +879,7 @@ fn apply_actions(
     em: &Emitter,
     writer: &mpsc::WeakUnboundedSender<String>,
     pending: &Pending,
+    raw: &Option<Arc<RawLog>>,
     t: u64,
 ) {
     for a in actions {
@@ -541,6 +887,9 @@ fn apply_actions(
             Action::Emit(body) => em.emit(body, t),
             Action::Write(line) => {
                 if let Some(w) = writer.upgrade() {
+                    if let Some(log) = raw {
+                        log.sent(&line);
+                    }
                     let _ = w.send(line);
                 }
             }
