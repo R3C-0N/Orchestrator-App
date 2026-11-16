@@ -127,6 +127,32 @@ describe("regroupement des appels (vue normale)", () => {
     expect(runningLabel(s.rows[1] as ToolCallRow)).toBe("Running ping for 90 requests to localhost");
   });
 
+  it("07 : AskUserQuestion sans résultat dans un tour en cours → masqué (vues normale et détaillée)", () => {
+    const ask = tool("AskUserQuestion", { questions: [{ question: "Q ?", header: "H", options: [], multiSelect: true }] });
+    const s = store(user("demande"), ...ask);
+    expect(new ItemCache().build(s.rows, false).map((i) => i.kind)).toEqual(["user"]);
+    expect(new ItemCache().build(s.rows, true).map((i) => i.kind)).toEqual(["user"]);
+  });
+
+  it("07 : AskUserQuestion répondu → réaffiché avec son résultat", () => {
+    const s = store(user("demande"), ...tool("AskUserQuestion", { questions: [] }, { text: "Your questions have been answered" }), turn());
+    expect(new ItemCache().build(s.rows, false).map((i) => i.kind)).toEqual(["user", "tool", "turn"]);
+  });
+
+  it("07 : AskUserQuestion resté sans réponse dans un tour clos → réaffiché (« No result »)", () => {
+    const s = store(user("demande"), ...tool("AskUserQuestion", { questions: [] }), turn());
+    const items = new ItemCache().build(s.rows, false);
+    expect(items.map((i) => i.kind)).toEqual(["user", "tool", "turn"]);
+    expect(items[1].kind === "tool" && items[1].noResult).toBe(true);
+  });
+
+  it("ligne « plain » (historique omis) : un item à part, dans le fil", () => {
+    const s = store(user("a"));
+    s.addPlain("Début de l'historique omis (3 lignes)");
+    const items = new ItemCache().build(s.rows, false);
+    expect(items.map((i) => i.kind)).toEqual(["user", "plain"]);
+  });
+
   it("réutilise les objets des lignes inchangées (Svelte ne redessine que ce qui change)", () => {
     const s = store(user("a"), ...text("b"));
     const c = new ItemCache();

@@ -267,23 +267,45 @@ test("saut en haut / en bas : affichage complet < 100 ms", async () => {
 test("streaming : reste collé en bas, puis ne saute pas pendant la lecture, puis reprend le collage", async () => {
   await page.evaluate(() => window.__orch.conversation().scrollToBottom());
   await page.evaluate(() => window.__orch.mock.streamReply(Infinity));
-  // 1. Collé : distance au bas mesurée à chaque image pendant 3 s.
+  // 1. Collé : distance au bas de chaque image **peinte**, pendant 3 s.
+  //
+  // La distance est lue après la peinture (message posté depuis le rappel
+  // `requestAnimationFrame`, traité une fois l'image peinte), et non dans le
+  // rappel lui-même. Les rappels d'une image passent dans l'ordre où ils ont
+  // été demandés : quand l'application d'un lot par le magasin (rappel
+  // demandé par `push`, avant celui de la mesure) passe en premier, la
+  // mesure lit un état intermédiaire jamais affiché : la nouvelle ligne est
+  // là (38 px = une ligne de marge + une ligne de texte), mais pas encore la
+  // correction, faite ensuite dans la même image avant la peinture (rappel
+  // du ResizeObserver de virtua, `followResize`). Mesuré : 38 px dans le
+  // rappel, 0 px après la peinture de la même image. Selon l'ordre de ces
+  // deux rappels, l'ancienne mesure échouait environ une fois sur deux.
+  // Les deux sont relevées ; seule l'image peinte compte.
   const stuck = await page.evaluate(
     () =>
-      new Promise<{ frames: number; maxPx: number; over1Line: number; finalPx: number }>((resolve) => {
+      new Promise<{ frames: number; maxPx: number; over1Line: number; finalPx: number; maxInFramePx: number }>((resolve) => {
         const el = document.querySelector<HTMLElement>(".vlist")!;
-        const d: number[] = [];
+        const dist = () => el.scrollHeight - el.clientHeight - el.scrollTop;
+        const painted: number[] = [];
+        const inFrame: number[] = [];
         const end = performance.now() + 3000;
         const loop = () => {
-          d.push(el.scrollHeight - el.clientHeight - el.scrollTop);
-          if (performance.now() < end) requestAnimationFrame(loop);
-          else
-            resolve({
-              frames: d.length,
-              maxPx: Math.max(...d),
-              over1Line: d.filter((x) => x > 18).length,
-              finalPx: d[d.length - 1],
-            });
+          inFrame.push(dist());
+          const ch = new MessageChannel();
+          const last = performance.now() >= end;
+          ch.port1.onmessage = () => {
+            painted.push(dist());
+            if (last)
+              resolve({
+                frames: painted.length,
+                maxPx: Math.max(...painted),
+                over1Line: painted.filter((x) => x > 18).length,
+                finalPx: painted[painted.length - 1],
+                maxInFramePx: Math.max(...inFrame),
+              });
+          };
+          ch.port2.postMessage(0);
+          if (!last) requestAnimationFrame(loop);
         };
         requestAnimationFrame(loop);
       }),

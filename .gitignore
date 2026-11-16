@@ -6,6 +6,9 @@ src-tauri/gen/
 
 # Node / front
 node_modules/
+# Sorties de Playwright lancé hors de e2e/ (la config les met dans %TEMP%)
+test-results/
+playwright-report/
 dist/
 build/
 .svelte-kit/

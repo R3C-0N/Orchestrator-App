@@ -312,6 +312,17 @@ test("« Chat about this » : skip_question replied_in_chat, puis focus dans la 
   await expect(page.locator(PROMPT)).toBeFocused();
 });
 
+test("07 : question ouverte, ni appel AskUserQuestion brut ni « Crunching… » dans la conversation", async ({ page }) => {
+  await open(page);
+  await ask(page, [LANG]);
+  await expect(page.locator(".conversation")).not.toContainText("AskUserQuestion");
+  await expect(page.locator(".indicator-line")).toHaveCount(0);
+  // Réponse : l'appel revient avec son résultat, comme le reste du fil.
+  await page.keyboard.press("Enter");
+  await closed(page);
+  await expect(page.locator('[data-row-kind="tool"]').last()).toContainText("AskUserQuestion");
+});
+
 test("t4 : la question de la fixture, Bleu choisi, donne les answers envoyés au CLI", async ({ page }) => {
   await open(page);
   const fx = JSON.parse(readFileSync(`${ROOT}fixtures/ui-events/t4.json`, "utf8")) as { kind: string; questions?: QItem[] }[];

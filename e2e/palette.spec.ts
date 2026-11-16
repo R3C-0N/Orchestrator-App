@@ -213,6 +213,34 @@ test("Ctrl+K : ouvre n'importe où, filtre à la frappe, garde le texte déjà t
   expect(await draft(page)).toBe("zzzzqqq");
 });
 
+test("Ctrl+K sans correspondance : Entrée et Tab n'envoient rien, la palette reste ouverte", async ({ page }) => {
+  await open(page);
+  await page.keyboard.type("brouillon");
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("zzzzqqq");
+  await expect(page.locator(PALETTE)).toContainText("No matching commands");
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Tab");
+  expect(await calls(page, "send_message")).toHaveLength(0);
+  expect(await draft(page)).toBe("brouillonzzzzqqq");
+  await expect(page.locator(PALETTE)).toBeVisible();
+  await expect(page.locator(PROMPT)).toBeFocused();
+});
+
+test("Ctrl+K puis texte de départ effacé : tout devient filtre, rien n'est recollé", async ({ page }) => {
+  await open(page);
+  await page.keyboard.type("à relire");
+  await page.keyboard.press("Control+k");
+  await expect(page.locator(PALETTE)).toBeVisible();
+  // La base est effacée : la saisie entière filtre.
+  await page.keyboard.press("Control+a");
+  await page.keyboard.type("orch");
+  expect(await selected(page)).toBe("orchestrateur");
+  await page.keyboard.press("Tab");
+  expect(await draft(page)).toBe("/orchestrateur ");
+  expect(await calls(page, "send_message")).toHaveLength(0);
+});
+
 test("`/model` reste traité par l'app : Entrée ouvre le sélecteur de modèle", async ({ page }) => {
   await open(page);
   await page.keyboard.type("/model");

@@ -5,6 +5,7 @@ import type { CoreEvent } from "../../src/lib/core/bindings/CoreEvent";
 import type { EventBody } from "../../src/lib/core/bindings/EventBody";
 import { EventFactory, MockCore, buildHistory } from "../../src/lib/core/mock";
 import { SessionStore } from "../../src/lib/state/session.svelte";
+import { applyHistory, historyCutText } from "../../src/lib/state/sessions.svelte";
 
 function setup() {
   const f = new EventFactory();
@@ -248,5 +249,31 @@ describe("SessionStore", () => {
       f.make({ kind: "text_delta", ...text("m1"), text: "b" }, 20),
     ]);
     expect(ts).toEqual([10, 20]);
+  });
+});
+
+describe("applyHistory : ligne « Début de l'historique omis »", () => {
+  const base = {
+    session_id: "s",
+    lines: 1, used: 1, ignored: 0, unknown: 0, unknown_elements: 0, bad: 0, sidechain: 0,
+    truncated: true, subagent_threads: 0, omitted_bytes: 0, clipped: 0,
+  };
+  const ev = { seq: 0, t: 1, session: "k", kind: "user_message", thread: "main", uuid: null, text: "bonjour", origin: "History" };
+
+  it("historique tronqué : ligne grise dans le fil, avant l'historique (elle défile avec lui)", () => {
+    const s = new SessionStore(() => {});
+    applyHistory(s, { ...base, omitted_lines: 1200, dropped_events: 0, events: [ev] } as never);
+    expect(s.rows.map((r) => r.kind)).toEqual(["plain", "user"]);
+    expect(s.rows[0].kind === "plain" && s.rows[0].text).toBe("Début de l'historique omis (1200 lignes)");
+  });
+
+  it("événements écartés seulement : compte en événements", () => {
+    expect(historyCutText({ omitted_lines: 0, dropped_events: 40 })).toBe("Début de l'historique omis (40 événements)");
+  });
+
+  it("historique complet : aucune ligne ajoutée", () => {
+    const s = new SessionStore(() => {});
+    applyHistory(s, { ...base, omitted_lines: 0, dropped_events: 0, events: [ev] } as never);
+    expect(s.rows.map((r) => r.kind)).toEqual(["user"]);
   });
 });

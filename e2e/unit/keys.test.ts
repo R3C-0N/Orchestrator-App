@@ -128,6 +128,59 @@ describe("IME, répétition et conflits", () => {
   });
 });
 
+describe("sélecteur de projet ou de session ouvert (J11)", () => {
+  const sel = (over: Partial<KeyContext> = {}) => ctx({ selector: true, ...over });
+  it("↑↓, Entrée, Échap, Espace : laissés au sélecteur", () => {
+    for (const k of ["ArrowUp", "ArrowDown", "Enter", "Escape", " "]) {
+      expect(decide(key(k), sel({ draft: "x", busy: true }), null)).toEqual({ type: "pass" });
+    }
+  });
+  it("Ctrl+O : sans effet (pas de vue détaillée derrière un sélecteur)", () => {
+    expect(decide(key("o", { ctrl: true }), sel(), null)).toEqual({ type: "none" });
+  });
+  it("Ctrl+K et Alt+P : sans effet", () => {
+    expect(decide(key("k", { ctrl: true }), sel(), null)).toEqual({ type: "none" });
+    expect(decide(key("p", { alt: true }), sel(), null)).toEqual({ type: "none" });
+  });
+  it("Ctrl+C : copie une sélection, sinon rien (ni interruption ni effacement)", () => {
+    expect(decide(CTRL_C, sel({ hasSelection: true }), null)).toEqual({ type: "copy" });
+    expect(decide(CTRL_C, sel({ busy: true, draft: "x" }), null)).toEqual({ type: "none" });
+  });
+  it("frappe ordinaire : laissée au filtre du sélecteur", () => {
+    expect(decide(key("a"), sel(), null)).toEqual({ type: "pass" });
+  });
+});
+
+describe("Ctrl+C avec la carte de question ouverte (J8)", () => {
+  const card = (over: Partial<KeyContext> = {}) => ctx({ question: { canSkip: true }, ...over });
+  it("sélection : copie", () => {
+    expect(decide(CTRL_C, card({ hasSelection: true, busy: true }), null)).toEqual({ type: "copy" });
+  });
+  it("pendant le tour : interrompt", () => {
+    expect(decide(CTRL_C, card({ busy: true, draft: "x" }), null)).toEqual({ type: "interrupt" });
+  });
+  it("interruption déjà demandée : rien de plus", () => {
+    expect(decide(CTRL_C, card({ busy: true, interrupting: true }), null)).toEqual({ type: "none" });
+  });
+  it("au repos : n'efface pas la saisie cachée derrière la carte", () => {
+    expect(decide(CTRL_C, card({ draft: "brouillon caché" }), null)).toEqual({ type: "none" });
+    expect(decide(CTRL_C, card({ question: { canSkip: false }, draft: "x" }), null)).toEqual({ type: "none" });
+  });
+});
+
+describe("Ctrl+K sans correspondance (J10)", () => {
+  const pal = (over: Partial<KeyContext> = {}) => ctx({ overlay: "palette", draft: "texte zzz", ...over });
+  it("Entrée : laissée à la saisie (Prompt.svelte la consomme sans rien envoyer)", () => {
+    expect(decide(key("Enter"), pal(), null)).toEqual({ type: "pass" });
+  });
+  it("Échap : ferme la palette, sans armer l'effacement", () => {
+    expect(decide(ESC, pal(), null)).toEqual({ type: "closeOverlay", overlay: "palette" });
+  });
+  it("Ctrl+K de nouveau : reste une demande d'ouverture (sans effet si déjà ouverte)", () => {
+    expect(decide(key("k", { ctrl: true }), pal(), null)).toEqual({ type: "openPalette" });
+  });
+});
+
 describe("Keys (armement du double Échap)", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
