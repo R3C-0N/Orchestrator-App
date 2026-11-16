@@ -160,7 +160,13 @@ async fn run(name: &str, reply: Reply) -> (String, bool, String) {
             assert!(text.contains(&labels[0]), "{text}");
             assert!(text.contains(&labels[2.min(labels.len() - 1)]), "{text}");
         }
-        Reply::Skip(_) => assert_eq!(closed, QuestionCloseReason::Skipped),
+        Reply::Skip(_) => {
+            assert_eq!(closed, QuestionCloseReason::Skipped);
+            // Constaté en 2.1.325 (`t17`, `t18`) : même texte pour toutes
+            // les raisons, sans erreur.
+            assert!(!is_error, "skip refusé : {text}");
+            assert_eq!(text, "The user did not answer the questions.");
+        }
     }
     (text, is_error, result)
 }

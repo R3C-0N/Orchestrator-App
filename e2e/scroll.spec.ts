@@ -35,16 +35,21 @@ declare global {
 type Recording = { d: number[]; traveledPx: number; viewportPx: number; minIndex: number; maxIndex: number };
 
 function installFrameRecorder() {
-  let run = false;
+  // `gen` : une boucle par enregistrement. Avec un simple drapeau, un stop()
+  // suivi d'un start() dans la même image laissait tourner l'ancienne boucle
+  // à côté de la nouvelle : deux intervalles par image (≈ 1 200 images sur
+  // « 20 s » au lieu de 600 sur 10 s à la molette). Correctif repris de
+  // `tools/recette/perf.mjs` (recette J12).
+  let gen = 0;
   let rec: Recording = { d: [], traveledPx: 0, viewportPx: 0, minIndex: Infinity, maxIndex: -Infinity };
   window.__frames = {
     start() {
       rec = { d: [], traveledPx: 0, viewportPx: 0, minIndex: Infinity, maxIndex: -Infinity };
-      run = true;
+      const my = ++gen;
       let last = 0;
       let lastTop: number | null = null;
       const loop = (t: number) => {
-        if (!run) return;
+        if (my !== gen) return;
         if (last) rec.d.push(t - last);
         last = t;
         const el = document.querySelector<HTMLElement>(".vlist");
@@ -66,7 +71,7 @@ function installFrameRecorder() {
       requestAnimationFrame(loop);
     },
     stop() {
-      run = false;
+      gen++;
       return rec;
     },
   };
@@ -312,6 +317,15 @@ test("streaming : reste collé en bas, puis ne saute pas pendant la lecture, pui
   );
   report("collage-streaming", stuck);
   expect(stuck.over1Line).toBe(0);
+  // Image peinte : au bas, au pixel près (arrondis de virtua).
+  expect(stuck.maxPx).toBeLessThanOrEqual(2);
+  // État lu dans le rappel, jamais peint : il ne peut retarder que de ce
+  // qu'un lot ajoute avant la correction de la même image, soit une ligne
+  // neuve (une ligne de marge + sa première ligne de texte, 38 px) et au
+  // plus une ligne de plus du texte en cours (19 px) : 3 lignes. Au-delà,
+  // la correction aurait manqué une image entière. Signalé sans arrêter la
+  // suite du test.
+  expect.soft(stuck.maxInFramePx).toBeLessThanOrEqual(3 * 19);
 
   // 2. Lecture plus haut : la ligne repère ne bouge pas pendant que le flux
   //    grandit et que de nouvelles lignes s'ajoutent en bas.

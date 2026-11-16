@@ -127,3 +127,61 @@ test("redimensionnement de la fenêtre pendant le streaming : reste collé", asy
   // redimensionnement, jamais un décrochage durable.
   expect(m.over1Line).toBeLessThanOrEqual(8);
 });
+
+test("Ctrl+O pendant un streaming, puis molette vers le haut : la vue ne revient pas sur la ligne j", async ({ page }) => {
+  await open(page, 600);
+  await page.mouse.move(500, 300);
+  await page.evaluate(() => (window as unknown as { __orch: Orch }).__orch.conversation().scrollToBottom());
+  await page.evaluate(() => (window as unknown as { __orch: Orch }).__orch.mock.streamReply(Infinity));
+  await page.waitForTimeout(1000);
+  // Lecture un peu au-dessus du bas : la ligne en cours, qui grandit, reste
+  // rendue (donc mesurée à chaque ligne ajoutée) sous la ligne lue.
+  await page.mouse.wheel(0, -150);
+  await page.waitForTimeout(300);
+  expect(await sticky(page)).toBe(false);
+  // Ligne source lue en haut de la vue, avant la bascule.
+  const rowAtTop = () =>
+    page.evaluate(() => {
+      const el = document.querySelector<HTMLElement>(".vlist")!;
+      const top = el.getBoundingClientRect().top + 4;
+      const r = [...el.querySelectorAll<HTMLElement>("[data-index]")].find((r) => {
+        const b = r.getBoundingClientRect();
+        return b.top <= top && b.bottom > top;
+      })!;
+      return r.dataset.firstRow!;
+    });
+  const read = await rowAtTop();
+  await page.keyboard.press("Control+o");
+  await expect(page.getByTestId("detail-bar")).toBeVisible();
+  await page.waitForTimeout(500);
+  // Bascule sans perdre la lecture : la même ligne source est en haut.
+  expect(await rowAtTop()).toBe(read);
+  // Ligne j : celle qui contient le haut de la vue après la bascule (virtua
+  // ne range pas les lignes dans l'ordre du DOM).
+  const j = await page.evaluate(() => {
+    const el = document.querySelector<HTMLElement>(".vlist")!;
+    const top = el.getBoundingClientRect().top + 4;
+    const rows = [...el.querySelectorAll<HTMLElement>("[data-index]")];
+    return rows.find((r) => {
+      const b = r.getBoundingClientRect();
+      return b.top <= top && b.bottom > top;
+    })!.dataset.index!;
+  });
+  const topOf = (j: string) =>
+    page.evaluate((j) => {
+      const el = document.querySelector<HTMLElement>(".vlist")!;
+      const it = el.querySelector<HTMLElement>(`[data-index="${j}"]`);
+      return it ? it.getBoundingClientRect().top - el.getBoundingClientRect().top : Infinity;
+    }, j);
+  const before = await topOf(j);
+  for (let i = 0; i < 3; i++) await page.mouse.wheel(0, -200);
+  await page.waitForTimeout(1000);
+  // La ligne j est descendue d'environ 600 px et y reste (le streaming
+  // continue) ; l'ancien `scrollToIndex(j)` la ramenait en haut.
+  const after = await topOf(j);
+  const topOfJ = after - before;
+  console.log(`MESURE ctrl-o-puis-molette ${JSON.stringify({ j, before, after })}`);
+  expect(topOfJ).toBeGreaterThan(300);
+  expect(await sticky(page)).toBe(false);
+  await page.evaluate(() => (window as unknown as { __orch: Orch }).__orch.mock.stopStream());
+});

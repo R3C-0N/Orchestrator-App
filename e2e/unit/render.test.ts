@@ -127,23 +127,62 @@ describe("regroupement des appels (vue normale)", () => {
     expect(runningLabel(s.rows[1] as ToolCallRow)).toBe("Running ping for 90 requests to localhost");
   });
 
-  it("07 : AskUserQuestion sans résultat dans un tour en cours → masqué (vues normale et détaillée)", () => {
+  /** `tool_use_id` d'un appel construit par `tool()`. */
+  const idOf = (ev: EventBody[]) => (ev[0] as { block: { tool_use_id: string } }).block.tool_use_id;
+
+  it("07 : carte ouverte pour cet AskUserQuestion → appel masqué (vues normale et détaillée)", () => {
     const ask = tool("AskUserQuestion", { questions: [{ question: "Q ?", header: "H", options: [], multiSelect: true }] });
     const s = store(user("demande"), ...ask);
-    expect(new ItemCache().build(s.rows, false).map((i) => i.kind)).toEqual(["user"]);
-    expect(new ItemCache().build(s.rows, true).map((i) => i.kind)).toEqual(["user"]);
+    expect(new ItemCache().build(s.rows, false, idOf(ask)).map((i) => i.kind)).toEqual(["user"]);
+    expect(new ItemCache().build(s.rows, true, idOf(ask)).map((i) => i.kind)).toEqual(["user"]);
+  });
+
+  it("AskUserQuestion sans résultat mais sans carte (historique repris, processus arrêté) → visible", () => {
+    const ask = tool("AskUserQuestion", { questions: [] });
+    const s = store(user("demande"), ...ask);
+    expect(new ItemCache().build(s.rows, false, null).map((i) => i.kind)).toEqual(["user", "tool"]);
+    // Carte ouverte pour une autre question : celui-ci reste visible.
+    expect(new ItemCache().build(s.rows, false, "toolu_autre").map((i) => i.kind)).toEqual(["user", "tool"]);
   });
 
   it("07 : AskUserQuestion répondu → réaffiché avec son résultat", () => {
-    const s = store(user("demande"), ...tool("AskUserQuestion", { questions: [] }, { text: "Your questions have been answered" }), turn());
-    expect(new ItemCache().build(s.rows, false).map((i) => i.kind)).toEqual(["user", "tool", "turn"]);
+    const ask = tool("AskUserQuestion", { questions: [] }, { text: "Your questions have been answered" });
+    const s = store(user("demande"), ...ask, turn());
+    expect(new ItemCache().build(s.rows, false, idOf(ask)).map((i) => i.kind)).toEqual(["user", "tool", "turn"]);
   });
 
-  it("07 : AskUserQuestion resté sans réponse dans un tour clos → réaffiché (« No result »)", () => {
+  it("AskUserQuestion resté sans réponse dans un tour clos → réaffiché (« No result »)", () => {
     const s = store(user("demande"), ...tool("AskUserQuestion", { questions: [] }), turn());
-    const items = new ItemCache().build(s.rows, false);
+    const items = new ItemCache().build(s.rows, false, null);
     expect(items.map((i) => i.kind)).toEqual(["user", "tool", "turn"]);
     expect(items[1].kind === "tool" && items[1].noResult).toBe(true);
+  });
+
+  it("AskUserQuestion suivi d'une interruption → réaffiché, « No result », interruption collée", () => {
+    const s = store(
+      user("demande"),
+      ...tool("AskUserQuestion", { questions: [] }),
+      { kind: "user_message", thread: "main", uuid: null, text: "[Request interrupted by user]", origin: "Interrupted" },
+      turn("error_during_execution"),
+    );
+    const items = new ItemCache().build(s.rows, false, null);
+    expect(items.map((i) => i.kind)).toEqual(["user", "tool", "interrupted"]);
+    expect(items[1].kind === "tool" && items[1].noResult).toBe(true);
+    expect(items[2].kind === "interrupted" && items[2].attached).toBe(true);
+  });
+
+  it("Bash sans résultat dans un tour en cours → reste visible (même avec une carte ouverte ailleurs)", () => {
+    const s = store(user("ping"), ...tool("Bash", { command: "ping" }));
+    expect(new ItemCache().build(s.rows, false, "toolu_x").map((i) => i.kind)).toEqual(["user", "group"]);
+    expect(new ItemCache().build(s.rows, true, "toolu_x").map((i) => i.kind)).toEqual(["user", "tool"]);
+  });
+
+  it("deux appels dont un seul AskUserQuestion (carte ouverte) : seul celui-là est masqué", () => {
+    const ask = tool("AskUserQuestion", { questions: [] });
+    const s = store(user("demande"), ...tool("Edit", { file_path: "a", old_string: "x", new_string: "y" }), ...ask);
+    const items = new ItemCache().build(s.rows, false, idOf(ask));
+    expect(items.map((i) => i.kind)).toEqual(["user", "tool"]);
+    expect(items[1].kind === "tool" && items[1].row.name).toBe("Edit");
   });
 
   it("ligne « plain » (historique omis) : un item à part, dans le fil", () => {
