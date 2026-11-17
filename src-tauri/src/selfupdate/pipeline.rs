@@ -771,11 +771,13 @@ impl Pipeline {
         };
         // Fusion faite (y compris « relance requise » et retour arrière) :
         // envoi de la seule branche `auto/…`, par le pipeline, après l'arrêt
-        // de la session et les contrôles. Un échec laisse la fusion acquise.
+        // de la session et les contrôles. Réglage `push` demandé et pas de
+        // refus définitif : envoi, ou mise en attente (sonde en cours ou
+        // impossible). Un échec laisse la fusion acquise.
         if let ImproveOutcome::Merged { commit } | ImproveOutcome::RestartRequired { commit } =
             &outcome
         {
-            if let PushStatus::Enabled { .. } = self.push_status() {
+            if self.push_wanted() {
                 rep.status.push = Some(PushResult::Pushing {
                     branch: request.branch.clone(),
                 });
@@ -795,42 +797,44 @@ impl Pipeline {
     }
 
     /// Envoie `branch` (tête `commit`, fusionnée dans le `main` du clone)
-    /// vers le dépôt distant, après une nouvelle vérification du droit
-    /// d'écriture. Échec : branche
-    /// gardée dans les envois en attente ; refus d'écriture : envoi
-    /// désactivé.
+    /// vers le dépôt canonique, après une nouvelle sonde (destination,
+    /// clone, droit d'écriture ; refaite aussi quand la précédente était
+    /// impossible ou en cours). Échec : branche mise en attente, sauf refus
+    /// définitif (pas de droit, autre dépôt, réglage git douteux).
     async fn push_merged(&self, branch: &str, commit: &str) -> PushResult {
-        let PushStatus::Enabled { url } = self.push_status() else {
-            return PushResult::Failed {
-                branch: branch.to_string(),
-                reason: "envoi désactivé".into(),
-            };
-        };
-        let res = {
-            let _l = self.push_lock.lock().await;
-            match push::check_write_access(&self.repo.dir, &url, push::PUSH_TIMEOUT).await {
-                Err(push::CheckError::Denied(r)) => {
-                    self.set_push(PushStatus::Disabled { reason: r.clone() });
-                    Err(r)
-                }
-                Err(push::CheckError::Unavailable(r)) => Err(r),
-                Ok(()) => {
-                    push::push_branch(&self.repo.dir, &url, branch, commit, push::PUSH_TIMEOUT)
-                        .await
-                }
+        let res = match self.probe(push::PUSH_TIMEOUT).await {
+            PushStatus::Enabled { url } => {
+                let _l = self.push_lock.lock().await;
+                push::push_branch(
+                    &self.repo.dir,
+                    &url,
+                    &self.push_origin,
+                    branch,
+                    commit,
+                    push::PUSH_TIMEOUT,
+                )
+                .await
             }
+            PushStatus::Disabled { reason } if self.push_refused() => {
+                tracing::warn!(branch, "envoi refusé : {reason}");
+                return PushResult::Failed {
+                    branch: branch.to_string(),
+                    reason,
+                };
+            }
+            PushStatus::Disabled { reason } => Err(reason),
+            other => Err(format!("état d'envoi inattendu : {other:?}")),
         };
-        let pending = self.pending();
         match res {
             Ok(()) => {
-                pending.remove(branch);
-                tracing::info!(branch, url = %url, "branche envoyée");
+                self.pending_remove(branch);
+                tracing::info!(branch, "branche envoyée");
                 PushResult::Pushed {
                     branch: branch.to_string(),
                 }
             }
             Err(reason) => {
-                pending.add(push::Pending {
+                self.pending_add(push::Pending {
                     branch: branch.to_string(),
                     commit: commit.to_string(),
                 });
@@ -922,6 +926,10 @@ impl Pipeline {
             drop(ro);
             drop(lock);
             done?.map_err(|e| Stop::Failed(S::Working, e.to_string()))?;
+            // Fichiers de l'app atteignables par la session (`config.json`,
+            // envois en attente) : inchangés, sinon cycle refusé.
+            self.check_app_files()
+                .map_err(|e| Stop::Failed(S::Checking, e))?;
         }
 
         // --- Contrôles déterministes.
@@ -1376,17 +1384,8 @@ async fn check(
             remotes.split_whitespace().collect::<Vec<_>>().join(", ")
         ));
     }
-    let sneaky = git(
-        clone,
-        &["config", "--local", "--get-regexp", push::SNEAKY_CONFIG],
-    )
-    .await
-    .unwrap_or_default();
-    if !sneaky.trim().is_empty() {
-        return Err(format!(
-            "réglage git refusé dans le clone : {}",
-            sneaky.trim()
-        ));
+    if let Some(sneaky) = push::sneaky_config(clone).await {
+        return Err(format!("réglage git refusé dans le clone : {sneaky}"));
     }
 
     // node_modules partagé avec le clone.

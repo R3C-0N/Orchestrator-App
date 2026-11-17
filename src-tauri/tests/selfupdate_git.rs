@@ -360,6 +360,7 @@ fn pipeline(root: &Path, cfg: RepoConfig, host: Arc<FakeHost>, tc: Arc<FakeToolc
         .with_toolchain(tc)
         .with_dirs(root.join("work"), root.join("ui"))
         .with_contract(CONTRACT)
+        .with_config_file(root.join("config.json"))
 }
 
 fn collector() -> (StatusSink, Arc<Mutex<Vec<ImproveStatus>>>) {
@@ -1593,12 +1594,26 @@ fn remote_refs(bare: &str) -> Vec<(String, String)> {
     v
 }
 
-/// Clone prêt dont l'URL (celle de l'envoi) passe par le faux ssh `host`.
+/// Clone prêt dont l'URL (celle de l'envoi, et `remote.origin.url` du
+/// clone) passe par le faux ssh `host`.
 async fn push_clone(root: &Path, host: &str) -> (RepoConfig, String, String, String) {
     let (mut cfg, c1, c2) = ready_clone(root).await;
     let bare = cfg.url.clone();
     cfg.url = ssh_url(host, &bare);
+    sh(&cfg.dir, &["remote", "set-url", "origin", &cfg.url]);
     (cfg, bare, c1, c2)
+}
+
+/// Pipeline dont le dépôt canonique (seul destinataire d'un envoi) est
+/// l'URL ssh du clone de test.
+fn push_pipeline(
+    root: &Path,
+    cfg: RepoConfig,
+    host: Arc<FakeHost>,
+    tc: Arc<FakeToolchain>,
+) -> Pipeline {
+    let url = cfg.url.clone();
+    pipeline(root, cfg, host, tc).with_push_origin(url)
 }
 
 fn pushes(log: &[ImproveStatus]) -> Vec<Option<PushResult>> {
@@ -1648,6 +1663,74 @@ fn push_setting_and_branch_rules() {
     assert!(!push::is_denied(
         "ssh: connect to host github.com port 22: Connection timed out"
     ));
+    assert!(push::is_denied(
+        "fatal: unable to access 'https://github.com/a/b.git/': The requested URL returned error: 401"
+    ));
+    // Un SHA ou un identifiant qui contient 401 ou 403 n'est pas un refus.
+    let sha = "40340140340140340140340140340140340140ab";
+    assert!(!push::is_denied(&format!(
+        "To git@github.com:a/b.git\n!\t{sha}:refs/heads/orchestrator-sonde-ecriture-401403\t[rejected] (fetch first)\nerror: failed to push some refs"
+    )));
+    assert!(!push::is_denied(&format!(
+        "error: object {sha} is corrupt\nssh: Could not resolve hostname h403: Name or service not known"
+    )));
+    assert!(!push::is_denied("error: 4031 erreurs"));
+    // Dépôt canonique : formes SSH strictement équivalentes seulement.
+    let canon = orchestrator_lib::selfupdate::DEFAULT_ORIGIN;
+    assert!(push::same_repo(canon, canon));
+    assert!(push::same_repo(
+        canon,
+        "ssh://git@github.com/R3C-0N/Orchestrator-App.git"
+    ));
+    for other in [
+        "https://github.com/R3C-0N/Orchestrator-App.git",
+        "git@github.com:R3C-0N/Orchestrator-App",
+        "git@github.com:r3c-0n/orchestrator-app.git",
+        "git@github.com:autre/Orchestrator-App.git",
+        "git@github.com:/R3C-0N/Orchestrator-App.git",
+        "ssh://git@github.com:22/R3C-0N/Orchestrator-App.git",
+        "ssh://autre@github.com/R3C-0N/Orchestrator-App.git",
+        "alice@github.com:R3C-0N/Orchestrator-App.git",
+        "git@gitlab.com:R3C-0N/Orchestrator-App.git",
+        "git@github.com:R3C-0N/../R3C-0N/Orchestrator-App.git",
+        "C:/depot/Orchestrator-App.git",
+    ] {
+        assert!(!push::same_repo(canon, other), "{other}");
+    }
+    // Réglages locaux refusés au moment de la sonde et de l'envoi.
+    for bad in [
+        "http.proxy",
+        "http.https://github.com/.proxy",
+        "http.extraheader",
+        "http.https://github.com/.extraHeader",
+        "http.sslverify",
+        "http.sslcainfo",
+        "core.askpass",
+        "core.gitproxy",
+        "core.sshcommand",
+        "protocol.allow",
+        "protocol.file.allow",
+        "remote.origin.pushurl2",
+        "remote.origin.receivepack",
+        "remote.origin.proxy",
+        "remote.evil.url",
+        "remote.pushdefault",
+        "url.x.insteadof",
+        "includeif.gitdir:x.path",
+        "credential.helper",
+    ] {
+        assert!(push::is_sneaky_key(bad), "{bad}");
+    }
+    for ok in [
+        "remote.origin.url",
+        "remote.origin.fetch",
+        "remote.origin.pushurl",
+        "core.autocrlf",
+        "user.email",
+        "http.postbuffer",
+    ] {
+        assert!(!push::is_sneaky_key(ok), "{ok}");
+    }
 }
 
 /// Propriétaire avec droit d'écriture : vérification sans rien écrire, puis
@@ -1663,7 +1746,7 @@ async fn owner_with_write_access_pushes_auto_branch_only() {
         vec![("src/a.txt", "a\n")],
         "ajoute a",
     )]));
-    let p = pipeline(&root, cfg.clone(), ship, Arc::new(FakeToolchain::new()));
+    let p = push_pipeline(&root, cfg.clone(), ship, Arc::new(FakeToolchain::new()));
     assert_eq!(p.push_status(), PushStatus::Off);
 
     let st = p.enable_push(true).await;
@@ -1730,7 +1813,7 @@ async fn without_write_access_push_is_disabled_and_never_attempted() {
     let host = fake_host("deny", "denied");
     let (cfg, bare, _, _) = push_clone(&root, &host).await;
     let before = remote_refs(&bare);
-    let p = pipeline(
+    let p = push_pipeline(
         &root,
         cfg.clone(),
         Arc::new(success_host(vec![commit_src(
@@ -1763,7 +1846,7 @@ async fn without_setting_nothing_is_pushed() {
     let host = fake_host("allow", "off");
     let (cfg, bare, _, _) = push_clone(&root, &host).await;
     let before = remote_refs(&bare);
-    let p = pipeline(
+    let p = push_pipeline(
         &root,
         cfg.clone(),
         Arc::new(success_host(vec![commit_src(
@@ -1788,7 +1871,7 @@ async fn network_failure_keeps_local_merge_and_retries_later() {
     let host = fake_host("allow", "down");
     let (cfg, bare, _, c2) = push_clone(&root, &host).await;
     let before = remote_refs(&bare);
-    let p = pipeline(
+    let p = push_pipeline(
         &root,
         cfg.clone(),
         Arc::new(success_host(vec![commit_src(
@@ -1819,9 +1902,12 @@ async fn network_failure_keeps_local_merge_and_retries_later() {
         other => panic!("{other:?}"),
     }
     assert_eq!(remote_refs(&bare), before);
+    // Panne : sonde « non vérifiable », pas un refus ; refaite au cycle
+    // suivant ou au démarrage.
     assert!(
-        matches!(p.push_status(), PushStatus::Enabled { .. }),
-        "panne : envoi toujours activé"
+        matches!(p.push_status(), PushStatus::Disabled { ref reason } if reason.contains("non vérifiable")),
+        "{:?}",
+        p.push_status()
     );
     assert_eq!(
         p.pending_pushes(),
@@ -1833,7 +1919,7 @@ async fn network_failure_keeps_local_merge_and_retries_later() {
 
     // Réseau revenu, démarrage suivant : l'envoi en attente est fait.
     set_down(&host, false);
-    let p2 = pipeline(
+    let p2 = push_pipeline(
         &root,
         cfg.clone(),
         Arc::new(FakeHost::default()),
@@ -1863,7 +1949,7 @@ async fn push_is_never_forced_and_remote_refusal_keeps_merge() {
     let root = TempRoot::new("push-noforce");
     let host = fake_host("allow", "noforce");
     let (cfg, bare, _, c2) = push_clone(&root, &host).await;
-    let p = pipeline(
+    let p = push_pipeline(
         &root,
         cfg.clone(),
         Arc::new(success_host(vec![commit_src(
@@ -1905,7 +1991,7 @@ async fn push_is_never_forced_and_remote_refusal_keeps_merge() {
         "hooks/pre-receive",
         "#!/bin/sh\necho \"refusé par le dépôt distant\" >&2\nexit 1\n",
     );
-    let p = pipeline(
+    let p = push_pipeline(
         &root,
         cfg.clone(),
         Arc::new(success_host(vec![commit_src(
@@ -1946,7 +2032,7 @@ async fn revert_and_restart_required_are_pushed() {
     let root = TempRoot::new("push-revert");
     let host = fake_host("allow", "revert");
     let (cfg, bare, _, c2) = push_clone(&root, &host).await;
-    let p = pipeline(
+    let p = push_pipeline(
         &root,
         cfg.clone(),
         Arc::new(success_host(vec![commit_src(
@@ -1983,7 +2069,7 @@ async fn revert_and_restart_required_are_pushed() {
     );
 
     // Cœur Rust modifié : fusionnée sans activation, branche envoyée.
-    let p = pipeline(
+    let p = push_pipeline(
         &root,
         cfg.clone(),
         Arc::new(success_host(vec![commit_src(
@@ -2032,9 +2118,247 @@ async fn push_branch_refuses_main_unmerged_and_bad_refspecs() {
         // c2 n'est pas dans le main du clone (placé sur c1).
         ("auto/x", c2.as_str()),
     ] {
-        let r = push::push_branch(&cfg.dir, &cfg.url, branch, commit, t).await;
+        let r = push::push_branch(&cfg.dir, &cfg.url, &cfg.url, branch, commit, t).await;
         assert!(r.is_err(), "{branch} {commit}");
     }
     assert!(ssh_log(&host).is_empty(), "rien n'a joint le distant");
     assert_eq!(remote_refs(&bare), before);
+}
+
+/// Envoi réservé au dépôt canonique : un `repo_url` d'un autre dépôt (fork,
+/// miroir) ou une URL d'origine du clone différente désactive l'envoi, sans
+/// connexion ni mise en attente ; le cycle fusionne quand même.
+#[tokio::test]
+async fn push_only_to_canonical_repository() {
+    let root = TempRoot::new("push-fork");
+    let host = fake_host("allow", "fork");
+    let (cfg, bare, _, _) = push_clone(&root, &host).await;
+    let before = remote_refs(&bare);
+    // Dépôt canonique par défaut (GitHub) : l'URL de test est un « fork ».
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(success_host(vec![commit_src(
+            vec![("src/a.txt", "a\n")],
+            "a",
+        )])),
+        Arc::new(FakeToolchain::new()),
+    );
+    match p.enable_push(true).await {
+        PushStatus::Disabled { reason } => {
+            assert!(reason.contains("envoi réservé au dépôt"), "{reason}");
+            assert!(
+                reason.contains(orchestrator_lib::selfupdate::DEFAULT_ORIGIN),
+                "{reason}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let (out, statuses) = run(&p, "a").await;
+    assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
+    assert!(pushes(&statuses).iter().all(Option::is_none));
+    assert!(ssh_log(&host).is_empty(), "aucune connexion");
+    assert!(p.pending_pushes().is_empty());
+
+    // `repo_url` canonique, mais l'origine du clone pointe ailleurs.
+    sh(
+        &cfg.dir,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &ssh_url("allow-ailleurs", &bare),
+        ],
+    );
+    let p = push_pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(FakeHost::default()),
+        Arc::new(FakeToolchain::new()),
+    );
+    match p.enable_push(true).await {
+        PushStatus::Disabled { reason } => {
+            assert!(reason.contains("URL d'origine du clone"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(ssh_log(&host).is_empty());
+    assert_eq!(remote_refs(&bare), before);
+}
+
+/// Réglage git douteux dans le clone (`http.proxy`, autre dépôt distant) :
+/// la sonde est refusée avant toute connexion.
+#[tokio::test]
+async fn sneaky_clone_config_blocks_the_probe() {
+    let root = TempRoot::new("push-sneaky");
+    let host = fake_host("allow", "sneaky");
+    let (cfg, _, _, _) = push_clone(&root, &host).await;
+    for (key, value) in [
+        ("http.proxy", "http://127.0.0.1:9"),
+        ("remote.evil.url", "git@allow-evil:x.git"),
+        ("core.askPass", "calc.exe"),
+    ] {
+        sh(&cfg.dir, &["config", "--local", key, value]);
+        let p = push_pipeline(
+            &root,
+            cfg.clone(),
+            Arc::new(FakeHost::default()),
+            Arc::new(FakeToolchain::new()),
+        );
+        match p.enable_push(true).await {
+            PushStatus::Disabled { reason } => {
+                assert!(reason.contains("réglage git refusé"), "{key} : {reason}")
+            }
+            other => panic!("{key} : {other:?}"),
+        }
+        sh(&cfg.dir, &["config", "--local", "--unset", key]);
+    }
+    assert!(ssh_log(&host).is_empty(), "aucune connexion");
+    let p = push_pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(FakeHost::default()),
+        Arc::new(FakeToolchain::new()),
+    );
+    assert!(matches!(
+        p.enable_push(true).await,
+        PushStatus::Enabled { .. }
+    ));
+}
+
+/// Sonde impossible au démarrage (réseau) : la fusion du cycle est mise en
+/// attente, et la sonde est refaite au cycle suivant, qui envoie les deux
+/// branches.
+#[tokio::test]
+async fn unavailable_probe_queues_merge_and_is_retried_next_cycle() {
+    let root = TempRoot::new("push-unavail");
+    let host = fake_host("allow", "unavail");
+    let (cfg, bare, _, c2) = push_clone(&root, &host).await;
+    set_down(&host, true);
+    let p = push_pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(success_host(vec![commit_src(
+            vec![("src/a.txt", "a\n")],
+            "a",
+        )])),
+        Arc::new(FakeToolchain::new()),
+    );
+    match p.enable_push(true).await {
+        PushStatus::Disabled { reason } => assert!(reason.contains("non vérifiable"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    let req1 = p.request("a").unwrap();
+    let (sink, statuses) = collector();
+    let out = p.run(req1.clone(), sink).await.unwrap();
+    let ImproveOutcome::Merged { commit: c_a } = out else {
+        panic!("{out:?}")
+    };
+    let last = statuses.lock().unwrap().last().unwrap().clone();
+    assert!(
+        matches!(&last.push, Some(PushResult::Failed { branch, .. }) if *branch == req1.branch),
+        "{:?}",
+        last.push
+    );
+    assert_eq!(p.pending_pushes().len(), 1, "fusion mise en attente");
+
+    // Le faux hôte de session ne rejoue qu'une liste fixe de commits : un
+    // second cycle demande un nouveau pipeline, remis dans le même état
+    // (liste en attente relue, sonde impossible) avant le cycle.
+    let p = {
+        drop(p);
+        push_pipeline(
+            &root,
+            cfg.clone(),
+            Arc::new(success_host(vec![commit_src(
+                vec![("src/b.txt", "b\n")],
+                "b",
+            )])),
+            Arc::new(FakeToolchain::new()),
+        )
+    };
+    set_down(&host, true);
+    assert!(matches!(
+        p.enable_push(true).await,
+        PushStatus::Disabled { .. }
+    ));
+    // Réseau revenu : le cycle suivant refait la sonde et envoie tout.
+    set_down(&host, false);
+    let (out, statuses) = run(&p, "b").await;
+    let ImproveOutcome::Merged { commit: c_b } = out else {
+        panic!("{out:?}")
+    };
+    let last = statuses.last().unwrap();
+    assert!(
+        matches!(&last.push, Some(PushResult::Pushed { .. })),
+        "{:?}",
+        last.push
+    );
+    assert!(matches!(p.push_status(), PushStatus::Enabled { .. }));
+    assert!(p.pending_pushes().is_empty());
+    let refs = remote_refs(&bare);
+    assert!(refs.contains(&(format!("refs/heads/{}", req1.branch), c_a)));
+    assert!(refs
+        .iter()
+        .any(|(r, c)| r.starts_with("refs/heads/auto/") && *c == c_b));
+    assert_eq!(sh(Path::new(&bare), &["rev-parse", "refs/heads/main"]), c2);
+}
+
+/// `config.json` figé au lancement : une session qui le modifie fait
+/// refuser le cycle ; `push-pending.json` : une entrée ajoutée par la
+/// session fait refuser le cycle, n'est jamais envoyée et le fichier est
+/// rétabli depuis la mémoire.
+#[tokio::test]
+async fn session_cannot_touch_config_json_or_pending_list() {
+    let root = TempRoot::new("push-files");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    let conf = root.join("config.json");
+    std::fs::write(&conf, r#"{ "improve_model": "haiku" }"#).unwrap();
+    let path = conf.clone();
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(FakeHost {
+            commits: vec![commit_src(vec![("src/a.txt", "a\n")], "a")],
+            extra: Some(Box::new(move |_wt| {
+                std::fs::write(&path, r#"{ "improve_model": "haiku", "push": true }"#).unwrap();
+            })),
+            switch_ok: true,
+            ..Default::default()
+        }),
+        Arc::new(FakeToolchain::new()),
+    );
+    let (out, _) = run(&p, "config").await;
+    assert_refused(&out, "config.json");
+    assert_eq!(main_of(&cfg), c1);
+
+    std::fs::write(&conf, r#"{ "improve_model": "haiku" }"#).unwrap();
+    let pending = root.join("work").join(push::PENDING_FILE);
+    let forged = pending.clone();
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(FakeHost {
+            commits: vec![commit_src(vec![("src/b.txt", "b\n")], "b")],
+            extra: Some(Box::new(move |_wt| {
+                std::fs::create_dir_all(forged.parent().unwrap()).unwrap();
+                std::fs::write(
+                    &forged,
+                    r#"[{ "branch": "auto/pirate", "commit": "0123456789012345678901234567890123456789" }]"#,
+                )
+                .unwrap();
+            })),
+            switch_ok: true,
+            ..Default::default()
+        }),
+        Arc::new(FakeToolchain::new()),
+    );
+    let (out, _) = run(&p, "liste").await;
+    assert_refused(&out, "push-pending.json");
+    assert_eq!(main_of(&cfg), c1);
+    assert!(p.pending_pushes().is_empty(), "entrée jamais retenue");
+    assert!(
+        !pending.exists(),
+        "fichier rétabli depuis la mémoire (vide)"
+    );
 }

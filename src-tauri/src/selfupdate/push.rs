@@ -4,6 +4,12 @@
 //! - Réglage d'activation : `"push": true` dans
 //!   `%LOCALAPPDATA%\orchestrator\config.json` (absent ou faux par défaut,
 //!   jamais exposé ni activable dans l'interface). Sans lui, rien ne change.
+//! - Destination unique : le dépôt canonique compilé
+//!   ([`super::DEFAULT_ORIGIN`]). Si `repo_url` ou l'URL d'origine du clone
+//!   (`remote.origin.url`) désigne un autre dépôt (fork, miroir, dépôt
+//!   local), l'envoi est désactivé ; le clone depuis un autre `repo_url`
+//!   reste possible. Formes reconnues comme équivalentes : `git@hôte:chemin`
+//!   et `ssh://git@hôte/chemin` (même hôte, même chemin, casse comprise).
 //! - Autorité : le dépôt distant (GitHub). Avant d'activer l'envoi (au
 //!   démarrage, clone prêt) et avant chaque envoi, le droit d'écriture est
 //!   vérifié par `git push --dry-run <url> <commit>:refs/heads/<sonde>` :
@@ -16,9 +22,12 @@
 //!   fusion réussie, seule la branche `auto/…` est envoyée, sous le même
 //!   nom, vers l'URL réelle passée en argument, avec l'environnement de
 //!   l'app : jamais `main`, jamais `--force` (pas de `+`), jamais de
-//!   suppression (source toujours un commit).
-//! - Échec : la fusion locale reste acquise ; la branche est gardée dans
-//!   `push-pending.json` et renvoyée au cycle suivant et au démarrage.
+//!   suppression (source toujours un commit). La configuration locale du
+//!   clone est contrôlée au moment même de la sonde et de l'envoi
+//!   ([`sneaky_config`]).
+//! - Échec : la fusion locale reste acquise ; la branche est gardée en
+//!   attente (mémoire du pipeline, recopiée dans `push-pending.json`) et
+//!   renvoyée au cycle suivant et au démarrage.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -60,19 +69,79 @@ const PUSH_CONFIG: &[&str] = &[
     "push.pushOption=",
 ];
 
-/// Réglages locaux refusés avant un envoi (même liste que les contrôles
-/// d'après session) : un `credential.helper` ou un `url.*.insteadOf` du
-/// clone ne doit jamais servir à l'envoi.
-pub const SNEAKY_CONFIG: &str =
-    r"^(url\.|core\.sshcommand|core\.hookspath|core\.fsmonitor|include|credential)";
+/// Clé SSH d'un dépôt : `(hôte, chemin)` pour les seules formes
+/// `git@hôte:chemin` et `ssh://git@hôte/chemin` (utilisateur `git`, pas de
+/// port, chemin non vide sans `..` ni espace). Toute autre forme (HTTPS,
+/// autre utilisateur, port, chemin local) : `None`.
+pub fn ssh_repo_key(url: &str) -> Option<(String, String)> {
+    let (host, path) = if let Some(rest) = url.strip_prefix("ssh://git@") {
+        let (host, path) = rest.split_once('/')?;
+        (host, path)
+    } else {
+        let rest = url.strip_prefix("git@")?;
+        rest.split_once(':')?
+    };
+    let host_ok = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    let path_ok = !path.is_empty()
+        && !path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.chars().any(|c| c.is_whitespace() || c.is_control())
+        && !path
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..");
+    (host_ok && path_ok).then(|| (host.to_string(), path.to_string()))
+}
 
-/// Réglage git refusé dans la configuration locale du clone, s'il y en a.
+/// `a` et `b` désignent le même dépôt SSH (voir [`ssh_repo_key`]).
+pub fn same_repo(a: &str, b: &str) -> bool {
+    match (ssh_repo_key(a), ssh_repo_key(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Réglage local du clone refusé avant un envoi et après la session :
+/// réécriture d'URL, commande ssh, hooks, inclusions, identifiants,
+/// mandataire, en-têtes ou certificats HTTP, aide à la saisie, transports,
+/// dépôts distants autres que `remote.origin.{url,fetch,pushurl}`.
+pub fn is_sneaky_key(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let section = n.split('.').next().unwrap_or("");
+    let key = n.rsplit('.').next().unwrap_or("");
+    match section {
+        "url" | "include" | "includeif" | "credential" | "protocol" => true,
+        "core" => matches!(
+            key,
+            "sshcommand" | "hookspath" | "fsmonitor" | "askpass" | "gitproxy"
+        ),
+        "http" => matches!(key, "proxy" | "extraheader" | "sslverify" | "sslcainfo"),
+        "remote" => !matches!(
+            n.as_str(),
+            "remote.origin.url" | "remote.origin.fetch" | "remote.origin.pushurl"
+        ),
+        _ => false,
+    }
+}
+
+/// Réglages refusés ([`is_sneaky_key`]) dans la configuration locale du
+/// clone, s'il y en a (une ligne `nom=valeur` par réglage).
 pub async fn sneaky_config(clone: &Path) -> Option<String> {
-    let found = git(clone, &["config", "--local", "--get-regexp", SNEAKY_CONFIG])
-        .await
-        .unwrap_or_default();
-    let found = found.trim();
-    (!found.is_empty()).then(|| found.to_string())
+    let listed = match git(clone, &["config", "--local", "--list", "-z"]).await {
+        Ok(s) => s,
+        Err(e) => return Some(format!("configuration illisible : {e}")),
+    };
+    let found: Vec<String> = listed
+        .split('\0')
+        .filter(|e| !e.is_empty())
+        .filter_map(|e| {
+            let (name, value) = e.split_once('\n').unwrap_or((e, ""));
+            is_sneaky_key(name).then(|| format!("{name}={value}"))
+        })
+        .collect();
+    (!found.is_empty()).then(|| found.join(" ; "))
 }
 
 /// Nom de branche envoyable : `auto/…`, format git valide, sans `+`, `:`,
@@ -90,18 +159,34 @@ pub fn valid_branch(branch: &str) -> bool {
             .any(|c| c.is_empty() || c.starts_with('.'))
 }
 
+/// `line` contient `code` (`error: 403`…) non suivi d'un chiffre.
+fn has_code(line: &str, code: &str) -> bool {
+    line.match_indices(code).any(|(i, _)| {
+        !line[i + code.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
 /// Le texte d'erreur de git dit que l'utilisateur n'a pas le droit
-/// d'écrire (et non une panne de réseau).
+/// d'écrire (et non une panne de réseau). Formes précises seulement ; les
+/// lignes qui citent une référence (`refs/heads/…`, refspec de
+/// `--porcelain`) ou la destination (`To …`) sont ignorées : un SHA ou un
+/// identifiant qui contient « 403 » ne compte pas.
 pub fn is_denied(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    e.contains("permission to") && e.contains("denied")
-        || e.contains("permission denied")
-        || e.contains("write access")
-        || e.contains("403")
-        || e.contains("401")
-        || e.contains("authentication failed")
-        || e.contains("access denied")
-        || e.contains("not allowed")
+    err.lines().map(str::trim).any(|l| {
+        let low = l.to_ascii_lowercase();
+        if low.contains("refs/heads/") || low.starts_with("to ") {
+            return false;
+        }
+        (low.contains("permission to ") && low.contains(" denied to "))
+            || low.contains("permission denied (publickey")
+            || has_code(&low, "error: 403")
+            || has_code(&low, "error: 401")
+            || low.contains("write access to repository not granted")
+            || low.contains("authentication failed for")
+    })
 }
 
 /// Lignes utiles d'un échec de git (refus du distant, erreur ssh, ligne
@@ -150,26 +235,69 @@ pub fn summarize(err: &str) -> String {
 pub enum CheckError {
     /// Le dépôt distant refuse l'écriture à cet utilisateur.
     Denied(String),
-    /// Vérification impossible (réseau, délai, git…).
+    /// Envoi interdit par l'app (autre dépôt que le canonique, réglage git
+    /// douteux dans le clone) : rien n'est tenté ni mis en attente.
+    Refused(String),
+    /// Vérification impossible (réseau, délai, git…) : à refaire.
     Unavailable(String),
 }
 
 impl CheckError {
     pub fn reason(&self) -> &str {
         match self {
-            CheckError::Denied(r) | CheckError::Unavailable(r) => r,
+            CheckError::Denied(r) | CheckError::Refused(r) | CheckError::Unavailable(r) => r,
         }
+    }
+
+    /// Refus définitif pour cette exécution (pas de nouvel essai, pas
+    /// d'attente).
+    pub fn is_final(&self) -> bool {
+        !matches!(self, CheckError::Unavailable(_))
     }
 }
 
+/// Destination et clone acceptables pour un envoi : `url` est le dépôt
+/// `canonical`, l'URL d'origine du clone aussi (une seule valeur), et la
+/// configuration locale du clone n'a aucun réglage refusé.
+pub async fn check_target(clone: &Path, url: &str, canonical: &str) -> Result<(), String> {
+    if !same_repo(url, canonical) {
+        return Err(format!(
+            "envoi réservé au dépôt {canonical} ; repo_url = {url} : envoi désactivé \
+             (un fork ou un miroir ne reçoit jamais d'envoi)"
+        ));
+    }
+    let origin = git(
+        clone,
+        &["config", "--local", "--get-all", "remote.origin.url"],
+    )
+    .await
+    .unwrap_or_default();
+    let origins: Vec<&str> = origin.lines().map(str::trim).collect();
+    if origins.len() != 1 || !same_repo(origins[0], canonical) {
+        return Err(format!(
+            "URL d'origine du clone ({}) différente de {canonical} : envoi désactivé",
+            origins.join(", ")
+        ));
+    }
+    if let Some(bad) = sneaky_config(clone).await {
+        return Err(format!("réglage git refusé dans le clone : {bad}"));
+    }
+    Ok(())
+}
+
 /// Vérifie le droit d'écriture sur `url` sans rien écrire :
-/// `git push --dry-run --porcelain <url> <commit>:refs/heads/<sonde>`.
+/// `git push --dry-run --porcelain <url> <commit>:refs/heads/<sonde>`,
+/// après [`check_target`].
 pub async fn check_write_access(
     clone: &Path,
     url: &str,
+    canonical: &str,
     timeout: Duration,
 ) -> Result<(), CheckError> {
-    super::repo::check_url(url).map_err(CheckError::Denied)?;
+    super::repo::check_url(url).map_err(CheckError::Refused)?;
+    check_target(clone, url, canonical)
+        .await
+        .map_err(CheckError::Refused)?;
     let commit = resolve(clone, "refs/heads/main")
         .await
         .ok_or_else(|| CheckError::Unavailable("branche main absente du clone".into()))?;
@@ -202,10 +330,12 @@ async fn git_timeout_out(dir: &Path, args: &[&str], timeout: Duration) -> Result
 
 /// Envoie `commit` sur `refs/heads/<branch>` de `url` : jamais forcé (pas
 /// de `+`, pas de `--force`), jamais une suppression, seulement une branche
-/// `auto/…` dont `commit` est dans le `main` du clone.
+/// `auto/…` dont `commit` est dans le `main` du clone, vers le dépôt
+/// `canonical` ; le clone est contrôlé ([`check_target`]) juste avant.
 pub async fn push_branch(
     clone: &Path,
     url: &str,
+    canonical: &str,
     branch: &str,
     commit: &str,
     timeout: Duration,
@@ -226,9 +356,7 @@ pub async fn push_branch(
             &commit[..10]
         ));
     }
-    if let Some(bad) = sneaky_config(clone).await {
-        return Err(format!("réglage git refusé dans le clone : {bad}"));
-    }
+    check_target(clone, url, canonical).await?;
     let refspec = format!("{commit}:refs/heads/{branch}");
     let mut args: Vec<&str> = PUSH_CONFIG.to_vec();
     args.extend(["push", "--porcelain", "--", url, &refspec]);
@@ -244,18 +372,23 @@ pub struct Pending {
     pub commit: String,
 }
 
-/// Liste des envois en attente (`push-pending.json`).
-pub struct PendingList(pub PathBuf);
+/// Fichier des envois en attente (`push-pending.json`) : recopie de la
+/// liste tenue en mémoire par le pipeline, relue seulement à sa création.
+pub struct PendingFile(pub PathBuf);
 
-impl PendingList {
-    pub fn read(&self) -> Vec<Pending> {
-        std::fs::read(&self.0)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+impl PendingFile {
+    /// Contenu du fichier : liste vide s'il est absent, `None` s'il est
+    /// illisible.
+    pub fn read(&self) -> Option<Vec<Pending>> {
+        match std::fs::read(&self.0) {
+            Ok(b) => serde_json::from_slice(&b).ok(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+            Err(_) => None,
+        }
     }
 
-    fn write(&self, v: &[Pending]) {
+    /// Remplace le fichier par `v` (supprimé si `v` est vide).
+    pub fn write(&self, v: &[Pending]) {
         if v.is_empty() {
             let _ = std::fs::remove_file(&self.0);
             return;
@@ -270,24 +403,6 @@ impl PendingList {
             .and_then(|()| std::fs::rename(&tmp, &self.0).ok());
         if ok.is_none() {
             tracing::warn!("{} non écrit", self.0.display());
-        }
-    }
-
-    /// Ajoute (ou remplace) l'envoi de `branch`.
-    pub fn add(&self, p: Pending) {
-        let mut v = self.read();
-        v.retain(|x| x.branch != p.branch);
-        v.push(p);
-        self.write(&v);
-    }
-
-    /// Retire l'envoi de `branch`.
-    pub fn remove(&self, branch: &str) {
-        let mut v = self.read();
-        let n = v.len();
-        v.retain(|x| x.branch != branch);
-        if v.len() != n {
-            self.write(&v);
         }
     }
 }

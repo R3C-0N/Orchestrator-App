@@ -18,6 +18,7 @@ pub mod repo;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::api::types::{CoreError, ImproveStatus, ImproveStep, PushStatus, RepoStatus};
@@ -165,26 +166,60 @@ pub struct Pipeline {
     /// Empreinte du contrat de l'exe (`build_info::CONTRACT`).
     pub contract: String,
     active: Mutex<Option<pipeline::Active>>,
+    /// Seul dépôt qui peut recevoir un envoi ([`DEFAULT_ORIGIN`]).
+    push_origin: String,
     /// Envoi des branches `auto/…` ([`push`]) : `Off` tant que
     /// [`Pipeline::enable_push`] ne l'a pas activé.
     push: Mutex<PushStatus>,
-    /// Un seul envoi à la fois (cycle, envois en attente).
+    /// Réglage `push` demandé (propriétaire).
+    push_requested: AtomicBool,
+    /// Envoi refusé pour cette exécution (pas de droit d'écriture, autre
+    /// dépôt que le canonique, réglage git douteux) : rien n'est tenté ni
+    /// mis en attente.
+    push_final: AtomicBool,
+    /// Un seul envoi ou une seule sonde à la fois.
     push_lock: tokio::sync::Mutex<()>,
+    /// Envois en attente : la liste fait foi en mémoire, relue du disque
+    /// seulement à la création du pipeline (lancement de l'app) ; le fichier
+    /// n'en est qu'une recopie.
+    pending: Mutex<Vec<push::Pending>>,
+    /// `config.json` et son empreinte SHA-256 au lancement (`None` :
+    /// absent) : une session qui le modifie fait refuser le cycle.
+    config_file: Option<PathBuf>,
+    config_digest: Option<Vec<u8>>,
+}
+
+/// SHA-256 d'un fichier, `None` s'il est absent ou illisible.
+fn file_digest(p: &Path) -> Option<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    std::fs::read(p).ok().map(|b| Sha256::digest(&b).to_vec())
 }
 
 impl Pipeline {
     pub fn new(repo: RepoConfig, host: Arc<dyn PipelineHost>) -> Self {
         let data = data_dir().unwrap_or_else(std::env::temp_dir);
+        let config_file = config_path();
+        let config_digest = config_file.as_deref().and_then(file_digest);
+        let work_root = data.join("work");
+        let pending = push::PendingFile(work_root.join(push::PENDING_FILE))
+            .read()
+            .unwrap_or_default();
         Pipeline {
             repo,
             host,
             toolchain: Arc::new(pipeline::NpmToolchain::default()),
-            work_root: data.join("work"),
+            work_root,
             ui_root: data.join("ui"),
             contract: crate::build_info::CONTRACT.into(),
             active: Mutex::new(None),
+            push_origin: DEFAULT_ORIGIN.into(),
             push: Mutex::new(PushStatus::Off),
+            push_requested: AtomicBool::new(false),
+            push_final: AtomicBool::new(false),
             push_lock: tokio::sync::Mutex::new(()),
+            pending: Mutex::new(pending),
+            config_file,
+            config_digest,
         }
     }
 
@@ -194,16 +229,32 @@ impl Pipeline {
         self
     }
 
-    /// Remplace les dossiers des worktrees et des versions d'interface.
+    /// Remplace les dossiers des worktrees et des versions d'interface (les
+    /// envois en attente sont relus depuis le nouveau dossier).
     pub fn with_dirs(mut self, work_root: PathBuf, ui_root: PathBuf) -> Self {
         self.work_root = work_root;
         self.ui_root = ui_root;
+        let pending = self.pending_file().read().unwrap_or_default();
+        self.pending = Mutex::new(pending);
         self
     }
 
     /// Remplace l'empreinte de contrat de référence.
     pub fn with_contract(mut self, contract: impl Into<String>) -> Self {
         self.contract = contract.into();
+        self
+    }
+
+    /// Remplace le dépôt canonique, seul destinataire d'un envoi (tests).
+    pub fn with_push_origin(mut self, url: impl Into<String>) -> Self {
+        self.push_origin = url.into();
+        self
+    }
+
+    /// Remplace `config.json` (tests) ; son empreinte est relevée ici.
+    pub fn with_config_file(mut self, path: PathBuf) -> Self {
+        self.config_digest = file_digest(&path);
+        self.config_file = Some(path);
         self
     }
 
@@ -249,11 +300,11 @@ impl Pipeline {
             .unwrap_or(PushStatus::Off)
     }
 
-    /// Active l'envoi si `requested` (réglage `push` de `config.json`) et si
-    /// le dépôt distant accorde le droit d'écriture
-    /// ([`push::check_write_access`]) ; sinon `Off` (réglage absent) ou
-    /// `Disabled { reason }`. Clone prêt requis. Envoi activé : les envois
-    /// en attente sont refaits. Renvoie le nouvel état.
+    /// Active l'envoi si `requested` (réglage `push` de `config.json`), si
+    /// la destination est le dépôt canonique et si celui-ci accorde le droit
+    /// d'écriture ([`push::check_write_access`]) ; sinon `Off` (réglage
+    /// absent) ou `Disabled { reason }`. Clone prêt requis. Envoi activé :
+    /// les envois en attente sont refaits. Renvoie le nouvel état.
     pub async fn enable_push(&self, requested: bool) -> PushStatus {
         self.enable_push_with(requested, push::PUSH_TIMEOUT).await
     }
@@ -264,29 +315,14 @@ impl Pipeline {
         requested: bool,
         timeout: std::time::Duration,
     ) -> PushStatus {
+        self.push_requested.store(requested, Ordering::SeqCst);
+        self.push_final.store(false, Ordering::SeqCst);
         if !requested {
             self.set_push(PushStatus::Off);
             return PushStatus::Off;
         }
         self.set_push(PushStatus::Checking);
-        let state = {
-            let _l = self.push_lock.lock().await;
-            if !repo::is_clone(&self.repo.dir) {
-                PushStatus::Disabled {
-                    reason: "clone de l'app indisponible".into(),
-                }
-            } else {
-                match push::check_write_access(&self.repo.dir, &self.repo.url, timeout).await {
-                    Ok(()) => PushStatus::Enabled {
-                        url: self.repo.url.clone(),
-                    },
-                    Err(e) => PushStatus::Disabled {
-                        reason: e.reason().to_string(),
-                    },
-                }
-            }
-        };
-        self.set_push(state.clone());
+        let state = self.probe(timeout).await;
         match &state {
             PushStatus::Enabled { url } => {
                 tracing::info!("envoi des améliorations activé vers {url}");
@@ -303,9 +339,59 @@ impl Pipeline {
         state
     }
 
-    /// Envois en attente (échecs précédents).
+    /// Sonde du droit d'écriture (destination, clone, `--dry-run`) ; met à
+    /// jour l'état et le refus définitif. Renvoie le nouvel état.
+    pub(crate) async fn probe(&self, timeout: std::time::Duration) -> PushStatus {
+        let _l = self.push_lock.lock().await;
+        let (state, final_) = if !repo::is_clone(&self.repo.dir) {
+            (
+                PushStatus::Disabled {
+                    reason: "clone de l'app indisponible".into(),
+                },
+                false,
+            )
+        } else {
+            match push::check_write_access(
+                &self.repo.dir,
+                &self.repo.url,
+                &self.push_origin,
+                timeout,
+            )
+            .await
+            {
+                Ok(()) => (
+                    PushStatus::Enabled {
+                        url: self.repo.url.clone(),
+                    },
+                    false,
+                ),
+                Err(e) => (
+                    PushStatus::Disabled {
+                        reason: e.reason().to_string(),
+                    },
+                    e.is_final(),
+                ),
+            }
+        };
+        self.push_final.store(final_, Ordering::SeqCst);
+        self.set_push(state.clone());
+        state
+    }
+
+    /// Réglage `push` demandé et pas de refus définitif : une fusion doit
+    /// être envoyée ou mise en attente.
+    pub(crate) fn push_wanted(&self) -> bool {
+        self.push_requested.load(Ordering::SeqCst) && !self.push_final.load(Ordering::SeqCst)
+    }
+
+    /// Refus définitif de l'envoi pour cette exécution.
+    pub(crate) fn push_refused(&self) -> bool {
+        self.push_final.load(Ordering::SeqCst)
+    }
+
+    /// Envois en attente (échecs précédents), tels que tenus en mémoire.
     pub fn pending_pushes(&self) -> Vec<push::Pending> {
-        self.pending().read()
+        self.pending.lock().map(|v| v.clone()).unwrap_or_default()
     }
 
     /// Refait les envois en attente si l'envoi est activé ; renvoie le
@@ -315,12 +401,12 @@ impl Pipeline {
             return 0;
         };
         let _l = self.push_lock.lock().await;
-        let list = self.pending();
         let mut sent = 0;
-        for p in list.read() {
+        for p in self.pending_pushes() {
             match push::push_branch(
                 &self.repo.dir,
                 &url,
+                &self.push_origin,
                 &p.branch,
                 &p.commit,
                 push::PUSH_TIMEOUT,
@@ -328,7 +414,7 @@ impl Pipeline {
             .await
             {
                 Ok(()) => {
-                    list.remove(&p.branch);
+                    self.pending_remove(&p.branch);
                     sent += 1;
                     tracing::info!(branch = %p.branch, "envoi en attente fait");
                 }
@@ -344,8 +430,54 @@ impl Pipeline {
         }
     }
 
-    pub(crate) fn pending(&self) -> push::PendingList {
-        push::PendingList(self.work_root.join(push::PENDING_FILE))
+    fn pending_file(&self) -> push::PendingFile {
+        push::PendingFile(self.work_root.join(push::PENDING_FILE))
+    }
+
+    /// Ajoute (ou remplace) l'envoi en attente de `p.branch`.
+    pub(crate) fn pending_add(&self, p: push::Pending) {
+        if let Ok(mut v) = self.pending.lock() {
+            v.retain(|x| x.branch != p.branch);
+            v.push(p);
+            self.pending_file().write(&v);
+        }
+    }
+
+    /// Retire l'envoi en attente de `branch`.
+    pub(crate) fn pending_remove(&self, branch: &str) {
+        if let Ok(mut v) = self.pending.lock() {
+            let n = v.len();
+            v.retain(|x| x.branch != branch);
+            if v.len() != n {
+                self.pending_file().write(&v);
+            }
+        }
+    }
+
+    /// Contrôles d'après session sur les fichiers de l'app que la session
+    /// peut atteindre : `config.json` identique à son état au lancement, et
+    /// `push-pending.json` identique à la liste en mémoire (sinon il est
+    /// réécrit depuis la mémoire). `Err` : raison lisible.
+    pub(crate) fn check_app_files(&self) -> Result<(), String> {
+        if let Some(cfg) = &self.config_file {
+            if file_digest(cfg) != self.config_digest {
+                return Err(format!(
+                    "{} a changé depuis le lancement de l'app (modifié pendant la session ?) : \
+                     cycle refusé ; relancer l'app si la modification est voulue",
+                    cfg.display()
+                ));
+            }
+        }
+        let mem = self.pending_pushes();
+        if self.pending_file().read().as_ref() != Some(&mem) {
+            self.pending_file().write(&mem);
+            return Err(format!(
+                "{} modifié pendant la session : cycle refusé (liste des envois en attente \
+                 rétablie)",
+                self.pending_file().0.display()
+            ));
+        }
+        Ok(())
     }
 }
 
