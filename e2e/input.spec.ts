@@ -13,6 +13,8 @@ type Orch = {
     status: string;
     meta: { model: string | null; models: unknown[] };
     question: unknown;
+    putQuestion(q: { requestId: string; toolUseId: null; thread: string; questions: []; canSkip: boolean }): void;
+    removeQuestion(requestId: string): void;
   };
   mock: { send(text: string, replyChars?: number): void; stopStream(): void; streaming: boolean };
   calls: Call[];
@@ -324,14 +326,20 @@ test.describe("Échap (décision 13)", () => {
     for (const canSkip of [false, true]) {
       await page.evaluate(
         (canSkip) =>
-          ((window as unknown as W).__orch.store.question = { requestId: "r1", toolUseId: null, questions: [], canSkip }),
+          (window as unknown as W).__orch.store.putQuestion({
+            requestId: "r1",
+            toolUseId: null,
+            thread: "main",
+            questions: [],
+            canSkip,
+          }),
         canSkip,
       );
       await page.keyboard.press("Escape");
       expect(await calls(page, "interrupt")).toHaveLength(0);
       expect(await page.evaluate(() => (window as unknown as W).__orch.store.question !== null)).toBe(true);
     }
-    await page.evaluate(() => ((window as unknown as W).__orch.store.question = null));
+    await page.evaluate(() => (window as unknown as W).__orch.store.removeQuestion("r1"));
     await page.evaluate(() => (window as unknown as W).__orch.mock.stopStream());
   });
 });

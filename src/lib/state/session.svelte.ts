@@ -148,16 +148,21 @@ export class SessionStore {
 
   /**
    * Remplace la question de même `request_id` (carte remise à zéro après une
-   * erreur d'envoi) ou l'ajoute en fin de file ; `null` retire la question
-   * affichée.
+   * erreur d'envoi : nouvel objet, même requête) ou l'ajoute en fin de file.
    */
-  set question(q: Question | null) {
-    if (q === null) {
-      this.questions = this.questions.slice(1);
-      return;
-    }
+  putQuestion(q: Question): void {
     const i = this.questions.findIndex((x) => x.requestId === q.requestId);
     this.questions = i < 0 ? [...this.questions, q] : this.questions.map((x, k) => (k === i ? q : x));
+  }
+
+  /**
+   * Retire la question `requestId`, qu'elle soit affichée ou non ; rien si
+   * elle n'est pas (ou plus) en attente. Jamais « la question affichée » :
+   * une autre a pu arriver entre-temps.
+   */
+  removeQuestion(requestId: string): void {
+    if (this.questions.some((q) => q.requestId === requestId))
+      this.questions = this.questions.filter((q) => q.requestId !== requestId);
   }
   meta: SessionMeta = $state({
     cwd: null,
@@ -503,17 +508,16 @@ export class SessionStore {
       }
       case "question":
         // Même `request_id` : remplacée ; sinon en fin de file.
-        this.question = {
+        this.putQuestion({
           requestId: ev.request_id,
           toolUseId: ev.tool_use_id,
           thread: ev.thread,
           questions: ev.questions,
           canSkip: ev.can_skip,
-        };
+        });
         break;
       case "question_closed":
-        if (this.questions.some((q) => q.requestId === ev.request_id))
-          this.questions = this.questions.filter((q) => q.requestId !== ev.request_id);
+        this.removeQuestion(ev.request_id);
         break;
       case "turn_result":
         // Un bloc resté ouvert (tour interrompu) est figé tel quel.

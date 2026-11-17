@@ -258,9 +258,52 @@ describe("questions en file (main et sous-agents en parallèle)", () => {
     expect(s.question?.requestId).toBe("r_a");
     expect([...waitingIds(s.questions)]).toEqual(["toolu_a"]);
     // Même request_id : remplacée sur place, pas dupliquée.
-    s.question = { ...s.question! };
+    s.putQuestion({ ...s.question! });
     expect(s.questions).toHaveLength(1);
     s.apply([closed(5, "r_a")]);
     expect(s.question).toBeNull();
+  });
+});
+
+describe("file de questions : fermeture et retrait par request_id", () => {
+  const ask = (seq: number, id: string, thread: string) =>
+    ({ seq, t: 0, session: "s", kind: "question", request_id: id, tool_use_id: `tu_${id}`, thread, questions: [], can_skip: true }) as CoreEvent;
+
+  it("removeQuestion vise la question demandée, pas la question affichée", () => {
+    const s = store();
+    s.apply([ask(0, "r1", "main"), ask(1, "r2", "toolu_a")]);
+    expect(s.question?.requestId).toBe("r1");
+    // Retrait de la seconde (non affichée) : la première reste affichée.
+    s.removeQuestion("r2");
+    expect(s.questions.map((q) => q.requestId)).toEqual(["r1"]);
+    expect([...waitingIds(s.questions)]).toEqual([]);
+    // Id inconnu ou déjà retiré : rien ne bouge.
+    s.removeQuestion("r2");
+    s.removeQuestion("inconnu");
+    expect(s.questions.map((q) => q.requestId)).toEqual(["r1"]);
+  });
+
+  it("une question arrivée entre-temps n'est pas retirée à la place de la bonne", () => {
+    const s = store();
+    s.apply([ask(0, "r1", "main")]);
+    const shown = s.question!;
+    // Une seconde question arrive avant la fermeture de la première.
+    s.apply([ask(1, "r2", "toolu_a")]);
+    s.apply([{ seq: 2, t: 0, session: "s", kind: "question_closed", request_id: shown.requestId, reason: "Answered" } as CoreEvent]);
+    expect(s.question?.requestId).toBe("r2");
+    expect([...waitingIds(s.questions)]).toEqual(["toolu_a"]);
+    // putQuestion après une erreur d'envoi : remplacée sur place, ordre gardé.
+    s.apply([ask(3, "r3", "main")]);
+    const again = { ...s.question! };
+    s.putQuestion(again);
+    expect(s.questions.map((q) => q.requestId)).toEqual(["r2", "r3"]);
+    expect(s.question).toBe(again);
+  });
+
+  it("store.question n'a plus d'écriture", () => {
+    const s = store();
+    expect(() => {
+      (s as unknown as { question: null }).question = null;
+    }).toThrow(TypeError);
   });
 });

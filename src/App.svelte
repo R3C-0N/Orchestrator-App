@@ -288,7 +288,7 @@
     } catch (err) {
       store.addBanner("Error", kind === "answer" ? "answer_question" : "skip_question", describeError(err));
       // Même question : la carte repart de zéro (nouvel objet, même requête).
-      if (store.question?.requestId === q.requestId) store.question = { ...q };
+      if (store.questions.some((x) => x.requestId === q.requestId)) store.putQuestion({ ...q });
     }
   }
 
