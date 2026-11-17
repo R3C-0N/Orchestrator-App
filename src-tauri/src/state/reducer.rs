@@ -194,9 +194,11 @@ impl Reducer {
         })]
     }
 
-    /// Fin du processus : les agents non terminés passent en `Stopped`, puis
-    /// `exited` (avec `during_turn`), puis `status` `Exited`, terminal. Rien
-    /// la seconde fois. L'heure de fin des agents est celle de la dernière
+    /// Fin du processus : les questions en attente sont fermées
+    /// (`question_closed` `Cancelled`, par `request_id` croissant : y
+    /// répondre ne mènerait qu'à `NotRunning`), les agents non terminés
+    /// passent en `Stopped`, puis `exited` (avec `during_turn`), puis
+    /// `status` `Exited`, terminal. Rien la seconde fois. L'heure de fin des agents est celle de la dernière
     /// ligne lue (rejeu déterministe) ; [`Reducer::exited_at`] la précise.
     pub fn exited(&mut self, code: Option<i32>, stderr_tail: Vec<String>) -> Vec<Action> {
         self.exited_at(code, stderr_tail, self.now)
@@ -214,6 +216,12 @@ impl Reducer {
         }
         self.now = t;
         let mut out = Vec::new();
+        let mut open: Vec<String> = self.questions.keys().cloned().collect();
+        open.sort();
+        for id in open {
+            out.extend(self.close_question(&id, QuestionCloseReason::Cancelled));
+        }
+        self.question_tools.clear();
         for a in self.agents.stop_unfinished(t) {
             out.push(Action::Emit(EventBody::Agent(a)));
         }

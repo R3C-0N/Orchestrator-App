@@ -593,6 +593,88 @@ fn question_thread_names_the_waiting_agent() {
     assert_eq!(r.ask_entries(), 0);
 }
 
+/// Mort du processus avec deux questions ouvertes (fil principal et agent) :
+/// chacune est fermée (`Cancelled`) avant `exited`, l'agent passe en
+/// `Stopped`, la table des appels `AskUserQuestion` est vidée ; rien la
+/// seconde fois.
+#[test]
+fn exit_cancels_open_questions_and_forgets_agent_asks() {
+    let mut r = Reducer::new();
+    r.handle_at(
+        &json!({"type":"assistant","message":{"id":"m","content":[
+            {"type":"tool_use","id":"tA","name":"Agent","input":{"subagent_type":"agent-bleu","description":"a"}}
+        ]}}),
+        1,
+    );
+    r.handle_at(
+        &json!({"type":"assistant","parent_tool_use_id":"tA","message":{"id":"m2","content":[
+            {"type":"tool_use","id":"tqA","name":"AskUserQuestion","input":{"questions":[]}}
+        ]}}),
+        2,
+    );
+    for (rid, tool) in [("q_main", "tqM"), ("q_agent", "tqA")] {
+        r.handle_at(
+            &json!({"type":"control_request","request_id":rid,"request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":tool,"input":{"questions":[]}}}),
+            3,
+        );
+    }
+    assert_eq!(r.questions.len(), 2);
+    assert_eq!(r.ask_entries(), 1);
+    let ev = emitted(&r.exited_at(Some(1), vec![], 10));
+    let closed: Vec<(String, QuestionCloseReason)> = ev
+        .iter()
+        .filter_map(|b| match b {
+            EventBody::QuestionClosed { request_id, reason } => Some((request_id.clone(), *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        closed,
+        vec![
+            ("q_agent".to_string(), QuestionCloseReason::Cancelled),
+            ("q_main".to_string(), QuestionCloseReason::Cancelled),
+        ]
+    );
+    // Questions fermées avant `exited`.
+    let pos = |f: &dyn Fn(&EventBody) -> bool| ev.iter().position(f).unwrap();
+    assert!(
+        pos(&|b| matches!(b, EventBody::QuestionClosed { .. }))
+            < pos(&|b| matches!(b, EventBody::Exited { .. }))
+    );
+    assert!(ev
+        .iter()
+        .any(|b| matches!(b, EventBody::Agent(a) if a.tool_use_id == "tA" && a.status == AgentStatus::Stopped)));
+    assert!(r.questions.is_empty());
+    assert_eq!(r.ask_entries(), 0);
+    // Une réponse tardive ne ferme plus rien ; une seconde fin n'émet rien.
+    assert!(r
+        .close_question("q_main", QuestionCloseReason::Answered)
+        .is_empty());
+    assert!(r.exited_at(Some(1), vec![], 11).is_empty());
+}
+
+/// `stop_unfinished` (fin du processus) vide la table des appels
+/// `AskUserQuestion` même sans question ouverte.
+#[test]
+fn exit_forgets_agent_asks_without_open_question() {
+    let mut r = Reducer::new();
+    r.handle_at(
+        &json!({"type":"assistant","message":{"id":"m","content":[
+            {"type":"tool_use","id":"tA","name":"Agent","input":{"subagent_type":"agent-bleu","description":"a"}}
+        ]}}),
+        1,
+    );
+    r.handle_at(
+        &json!({"type":"assistant","parent_tool_use_id":"tA","message":{"id":"m2","content":[
+            {"type":"tool_use","id":"tqA","name":"AskUserQuestion","input":{"questions":[]}}
+        ]}}),
+        2,
+    );
+    assert_eq!(r.ask_entries(), 1);
+    r.exited_at(None, vec![], 3);
+    assert_eq!(r.ask_entries(), 0);
+}
+
 #[test]
 fn cancel_closes_and_history_mode_marks_user_messages() {
     let mut r = Reducer::new();
