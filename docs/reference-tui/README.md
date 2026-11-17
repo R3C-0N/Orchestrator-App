@@ -77,7 +77,7 @@ Captures d'observation du clavier (hors des 10, scénarios `ctrlc`, `ctrlc-tour`
 | k3 | `k3-echap-echap-saisie-vide-apres-tour` | double Échap sur une saisie vide après un tour : **menu Rewind** (premier relevé ; mesuré proprement en `v1` et `v4`) ; hors du prototype 1 |
 | k4 | `k4-echap-apres` | état après fermeture du menu Rewind |
 
-Capture de l'outil Write (hors des 10, scénario `write`, faite au J13 sur le CLI **2.1.326**, mis à jour automatiquement depuis J1 ; bac à sable `.claude-work/j13-sandbox/write`) :
+Capture de l'outil Write (hors des 10, scénario `write`, faite au J13, commit `6d49010`, sur le CLI **2.1.326**, mis à jour automatiquement depuis J1 ; bac à sable `.claude-work/j13-sandbox/write`) :
 
 | Id | Fichier | Ce qu'elle montre |
 | - | - | - |

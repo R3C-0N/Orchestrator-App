@@ -467,6 +467,8 @@ Les 5 questions de la première version de ce plan sont tranchées par les déci
 
 Le prototype 1 est terminé et la recette J12 est faite (`docs/recette-prototype-1.md`). Ce qui n'a pas pu être fait en l'absence de l'utilisateur, ou qui reste à nettoyer :
 
+(Fait depuis, au J13, commit `6d49010` : capture de l'outil Write dans le TUI (`w1`, `w1b`) et rendu recalé, section 1.7 ; suppression de l'ancien scénario `echap` de `tools/capture-tui/scenarios.json`.)
+
 - **Installation du MSI** : elle demande une élévation (installation pour toute la machine). Seul l'installeur NSIS a été installé et désinstallé en silencieux pendant la recette.
 - **Vérification manuelle d'une heure de session réelle avec 4 agents** (section 1.10, point 7).
 - **Croissance mémoire sur 4 h** (critère de la section 1.11, « < 15 % sur 4 h d'usage ») : non mesurée.
