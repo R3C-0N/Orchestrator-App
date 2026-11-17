@@ -596,8 +596,16 @@ export function mockImproveSteps(outcome: MockImproveOutcome): ImproveStep[] {
   return ["preparing", "working", "checking", "testing", outcome];
 }
 
+/** Envoi simulé de la branche après la fusion (`?push=` ; propriétaire de l'app seulement). */
+export type MockPushOutcome = "pushed" | "failed";
+
+/** Raison d'un envoi simulé en échec. */
+export const MOCK_PUSH_FAIL = "ssh: connect to host github.com port 22: Connection timed out";
+
 export type MockSelfUpdateOptions = {
   outcome?: MockImproveOutcome;
+  /** Envoi activé (propriétaire) et son issue ; absent : envoi désactivé (`off`), comme pour tout autre utilisateur. */
+  push?: MockPushOutcome;
   /** État du clone (`disabled` : `/ameliorer` grisé avec la raison). */
   repo?: RepoStatus;
   /** Sessions vivantes rendues par `attachSessions` (rattachement après un rechargement). */
@@ -703,6 +711,7 @@ export function mockLiveSessions(rows: number, historyRows = 0, seed = 15): Sess
 
 /**
  * Paramètres J14 du mode simulé lus dans l'URL : `improve=merged|restart|failed`,
+ * `push=pushed|failed` (envoi de la branche après la fusion, propriétaire),
  * `repo=disabled|cloning`, `attach=<lignes>` (sessions vivantes au montage),
  * `attachFail=<n>` (les n premiers rattachements échouent), `step=<ms>`
  * (durée d'une étape).
@@ -713,6 +722,9 @@ export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & {
   const imp = p.get("improve");
   if (imp === "restart" || imp === "restart_required") out.outcome = "restart_required";
   else if (imp === "failed" || imp === "fail") out.outcome = "failed";
+  const push = p.get("push");
+  if (push === "pushed" || push === "ok") out.push = "pushed";
+  else if (push === "failed" || push === "fail") out.push = "failed";
   const repo = p.get("repo");
   if (repo === "disabled") out.repo = { state: "disabled", reason: "git introuvable dans le PATH (simulé)" };
   else if (repo === "cloning") out.repo = { state: "cloning", path: "C:\\mock\\repo" };
@@ -744,11 +756,13 @@ export class MockSelfUpdate {
     restart_required: null,
     repo: { state: "ready", path: "C:\\mock\\repo", url: "git@example.invalid:mock.git", head: "mock000" },
     improve: null,
+    push: { state: "off" },
   };
   readyCalls: (string | null)[] = [];
   /** Commandes reçues, dans l'ordre (vérifiées par les tests e2e). */
   calls: { cmd: string; args: unknown }[] = [];
   outcome: MockImproveOutcome;
+  pushOutcome: MockPushOutcome | null;
   live: SessionResync[];
   attachFail: number;
   #timers: ReturnType<typeof setTimeout>[] = [];
@@ -762,6 +776,8 @@ export class MockSelfUpdate {
     this.#onStatus = onStatus;
     this.#stepMs = stepMs;
     this.outcome = opts.outcome ?? "merged";
+    this.pushOutcome = opts.push ?? null;
+    if (this.pushOutcome) this.info.push = { state: "enabled", url: "git@example.invalid:mock.git" };
     this.live = opts.live ?? [];
     this.attachFail = opts.attachFail ?? 0;
     if (opts.repo) this.info.repo = opts.repo;
@@ -820,6 +836,7 @@ export class MockSelfUpdate {
       session: step === "preparing" ? null : session,
       commit: step === "preparing" || step === "working" ? null : commit,
       detail: step === "failed" ? MOCK_FAIL_DETAIL : null,
+      push: null,
       t: Date.now(),
     });
     mockImproveSteps(this.outcome).forEach((step, i) => {
@@ -837,12 +854,33 @@ export class MockSelfUpdate {
             this.#improveEvents(session);
           }
           this.#emit(s);
+          if (step === "merged" || step === "restart_required") this.#push(s);
         }, i * this.#stepMs),
       );
     });
     const first = status("preparing");
     this.info.improve = first;
     return Promise.resolve(first);
+  }
+
+  /** Envoi simulé de la branche après la fusion (propriétaire) : « en cours », puis son issue une étape plus tard. */
+  #push(merged: ImproveStatus): void {
+    const outcome = this.pushOutcome;
+    if (!outcome) return;
+    const branch = merged.branch;
+    this.#emit({ ...merged, push: { state: "pushing", branch }, t: Date.now() });
+    this.#timers.push(
+      setTimeout(() => {
+        const cur = this.info.improve;
+        if (!cur || cur.id !== merged.id) return;
+        this.#emit({
+          ...cur,
+          push:
+            outcome === "pushed" ? { state: "pushed", branch } : { state: "failed", branch, reason: MOCK_PUSH_FAIL },
+          t: Date.now(),
+        });
+      }, this.#stepMs),
+    );
   }
 
   /** Quelques événements de la session dédiée, sur le canal du rattachement. */
@@ -873,7 +911,8 @@ export class MockSelfUpdate {
     this.info.previous_hash = null;
     this.info.source = this.info.active_hash ? "disk" : "embedded";
     const cur = this.info.improve;
-    if (cur) this.#emit({ ...cur, step: "rolled_back", commit: from ?? cur.commit, detail: null, t: Date.now() });
+    if (cur)
+      this.#emit({ ...cur, step: "rolled_back", commit: from ?? cur.commit, detail: null, push: null, t: Date.now() });
     return this.getUiInfo();
   }
 

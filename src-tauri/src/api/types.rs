@@ -298,6 +298,43 @@ pub struct UiInfo {
     pub repo: RepoStatus,
     /// Amélioration en cours, ou la dernière terminée.
     pub improve: Option<ImproveStatus>,
+    /// Envoi des branches `auto/…` sur le dépôt distant (propriétaire de
+    /// l'app seulement, décision 16) ; `off` pour tous les autres.
+    pub push: PushStatus,
+}
+
+/// Envoi des améliorations fusionnées sur le dépôt distant (décision 16) :
+/// réservé au propriétaire (réglage `push` de `config.json`), et seulement
+/// si GitHub lui accorde le droit d'écriture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[ts(export)]
+pub enum PushStatus {
+    /// Réglage `push` absent ou faux (cas de tous les utilisateurs sauf le
+    /// propriétaire) : rien n'est envoyé, rien n'est affiché.
+    Off,
+    /// Réglage présent : droit d'écriture en cours de vérification.
+    Checking,
+    /// Droit d'écriture vérifié : la branche `auto/…` d'une amélioration
+    /// fusionnée est envoyée sur `url`.
+    Enabled { url: String },
+    /// Réglage présent mais envoi désactivé (pas de droit d'écriture,
+    /// clone indisponible…) ; `reason` est lisible.
+    Disabled { reason: String },
+}
+
+/// Envoi de la branche d'une amélioration fusionnée (`ImproveStatus::push`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[ts(export)]
+pub enum PushResult {
+    /// Envoi en cours (après la fusion locale).
+    Pushing { branch: String },
+    /// Branche `auto/…` envoyée sous le même nom.
+    Pushed { branch: String },
+    /// Fusionnée localement, envoi échoué : la fusion reste acquise et
+    /// l'envoi est retenté au cycle suivant et au prochain démarrage.
+    Failed { branch: String, reason: String },
 }
 
 /// Étape d'une amélioration (décision 17).
@@ -347,6 +384,9 @@ pub struct ImproveStatus {
     pub commit: Option<String>,
     /// Précision lisible (test en échec, raison d'un échec…).
     pub detail: Option<String>,
+    /// Envoi de la branche après la fusion (`None` : pas d'envoi, cas de
+    /// tous les utilisateurs sauf le propriétaire).
+    pub push: Option<PushResult>,
     /// Heure de la dernière transition (ms depuis l'epoch).
     #[ts(type = "number")]
     pub t: u64,

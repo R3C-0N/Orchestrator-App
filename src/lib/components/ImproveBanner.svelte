@@ -70,6 +70,23 @@
         return `${STEP_LABEL[s.step]}${s.detail ? ` · ${s.detail}` : ""}`;
     }
   }
+
+  /**
+   * Envoi de la branche après la fusion (propriétaire de l'app seulement) ;
+   * `null` sans envoi (cas de tous les autres utilisateurs : rien de nouveau).
+   */
+  export function pushText(s: ImproveStatus): string | null {
+    const p = s.push;
+    if (!p) return null;
+    switch (p.state) {
+      case "pushing":
+        return `envoi sur GitHub : ${p.branch}…`;
+      case "pushed":
+        return `poussé sur GitHub : ${p.branch}`;
+      case "failed":
+        return `fusionné localement, envoi échoué : ${p.reason} (nouvel essai au prochain cycle ou au prochain démarrage)`;
+    }
+  }
 </script>
 
 <script lang="ts">
@@ -208,6 +225,9 @@
       </span>
     </div>
     <div class="msg" data-testid="improve-text">⎿  {bannerText(status, repoPath)}</div>
+    {#if status.push}
+      <div class="msg push {status.push.state}" data-testid="improve-push" data-push={status.push.state}>⎿  {pushText(status)}</div>
+    {/if}
     {#if error}
       <div class="msg err" data-testid="improve-error">⎿  {error}</div>
     {/if}
@@ -269,6 +289,12 @@
   .err .msg,
   .msg.err {
     color: var(--t-error);
+  }
+  .msg.push.pushing {
+    color: var(--t-dim);
+  }
+  .msg.push.failed {
+    color: var(--warn);
   }
   button {
     background: var(--t-bg);

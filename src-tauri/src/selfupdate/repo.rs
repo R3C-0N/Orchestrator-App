@@ -14,7 +14,9 @@ use crate::api::types::RepoStatus;
 /// Nom du dossier du clone (sous le dossier d'installation ou de données).
 pub const REPO_DIR_NAME: &str = "repo";
 
-/// URL de push du clone : le clone ne pousse jamais (décision 16).
+/// URL de push du clone : ni la session dédiée ni un `git push origin` ne
+/// poussent ; l'envoi du propriétaire ([`super::push`]) passe l'URL réelle en
+/// argument (décision 16).
 pub const NO_PUSH_URL: &str = "no-push://orchestrator-ne-pousse-jamais";
 
 /// Outil dont l'auto-amélioration a besoin (décision 19).

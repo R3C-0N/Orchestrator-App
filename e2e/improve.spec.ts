@@ -150,6 +150,35 @@ test("relance requise : message clair et ligne d'état", async ({ page }) => {
   await expect(page.getByTestId("ui-hash")).toContainText("(embarquée)");
 });
 
+test("envoi : rien de nouveau sans le réglage du propriétaire", async ({ page }) => {
+  await open(page);
+  await improve(page, "Sans envoi");
+  await expect(page.locator(BANNER)).toHaveAttribute("data-step", "merged", { timeout: 10_000 });
+  await page.waitForTimeout(400);
+  await expect(page.getByTestId("improve-push")).toHaveCount(0);
+  await expect(page.locator(BANNER)).not.toContainText("GitHub");
+});
+
+test("envoi du propriétaire : « poussé sur GitHub : auto/… » dans le bandeau final", async ({ page }) => {
+  await open(page, "&push=pushed");
+  await improve(page, "Avec envoi");
+  await expect(page.locator(BANNER)).toHaveAttribute("data-step", "merged", { timeout: 10_000 });
+  const push = page.getByTestId("improve-push");
+  await expect(push).toHaveAttribute("data-push", "pushed", { timeout: 5_000 });
+  await expect(push).toHaveText(/^⎿\s+poussé sur GitHub : auto\/\d{8}-\d{4}-avec-envoi$/);
+  await expect(page.getByTestId("improve-text")).toContainText("fusionnée");
+});
+
+test("envoi du propriétaire en échec : fusion locale gardée, raison affichée", async ({ page }) => {
+  await open(page, "&push=failed&improve=restart");
+  await improve(page, "Envoi en panne");
+  await expect(page.locator(BANNER)).toHaveAttribute("data-step", "restart_required", { timeout: 10_000 });
+  const push = page.getByTestId("improve-push");
+  await expect(push).toHaveAttribute("data-push", "failed", { timeout: 5_000 });
+  await expect(push).toContainText("fusionné localement, envoi échoué : ssh: connect to host github.com");
+  await expect(page.getByTestId("improve-text")).toContainText("Relance requise");
+});
+
 test("échec : détail affiché", async ({ page }) => {
   await open(page, "&improve=failed");
   await improve(page, "Casser");

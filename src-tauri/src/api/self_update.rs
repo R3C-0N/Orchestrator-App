@@ -24,7 +24,8 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use super::commands::AppState;
 use super::types::{
-    CoreError, ImproveStatus, ImproveStep, RepoStatus, SessionKey, UiInfo, UiSource, IMPROVE_EVENT,
+    CoreError, ImproveStatus, ImproveStep, PushStatus, RepoStatus, SessionKey, UiInfo, UiSource,
+    IMPROVE_EVENT,
 };
 use crate::process::spawn::LaunchOptions;
 use crate::process::supervisor::{Session, TurnWait};
@@ -608,9 +609,13 @@ fn install_dir() -> Option<PathBuf> {
 }
 
 /// Démarrage (`Builder::setup`) : cycle géré par Tauri, clone en tâche de
-/// fond, puis nettoyage des worktrees fusionnés.
+/// fond, puis nettoyage des worktrees fusionnés et, pour le propriétaire
+/// (réglage `push` de `config.json`), vérification du droit d'écriture
+/// avant d'activer l'envoi des branches `auto/…`.
 pub fn setup<R: Runtime>(app: &AppHandle<R>) {
     let config = RepoConfig::load(install_dir().as_deref());
+    let push_requested =
+        crate::selfupdate::push::push_requested(crate::selfupdate::config_path().as_deref());
     tracing::info!(url = %config.url, dir = %config.dir.display(), commit = %config.commit, "clone de l'app");
     let session = Arc::new(Mutex::new(None));
     let host = Arc::new(AppHost {
@@ -658,11 +663,16 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
             if n > 0 {
                 tracing::info!("{n} worktree(s) d'amélioration fusionné(s) supprimé(s)");
             }
+            pipeline.enable_push(push_requested).await;
+        } else if push_requested {
+            pipeline.set_push(PushStatus::Disabled {
+                reason: "clone de l'app indisponible".into(),
+            });
         }
     });
 }
 
-fn ui_info(ui: &UiHost, su: &SelfUpdate) -> UiInfo {
+fn ui_info(ui: &UiHost, su: &SelfUpdate, improver: Option<&Improver>) -> UiInfo {
     let active = ui.active();
     UiInfo {
         source: active.source,
@@ -673,13 +683,21 @@ fn ui_info(ui: &UiHost, su: &SelfUpdate) -> UiInfo {
         restart_required: su.restart_required.lock().unwrap().clone(),
         repo: su.repo.lock().unwrap().clone(),
         improve: su.current.lock().unwrap().clone(),
+        push: improver
+            .map(|i| i.pipeline.push_status())
+            .unwrap_or(PushStatus::Off),
     }
 }
 
 /// Interface affichée, état du clone et de l'amélioration en cours.
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_ui_info(ui: State<'_, UiHost>, su: State<'_, SelfUpdate>) -> UiInfo {
-    ui_info(&ui, &su)
+pub fn get_ui_info<R: Runtime>(
+    app: AppHandle<R>,
+    ui: State<'_, UiHost>,
+    su: State<'_, SelfUpdate>,
+) -> UiInfo {
+    let improver = app.try_state::<Improver>();
+    ui_info(&ui, &su, improver.as_deref())
 }
 
 /// Signal « prêt » de l'interface, après son montage et `attach_sessions`.
@@ -741,6 +759,7 @@ pub async fn improve_start(
         session: None,
         commit: None,
         detail: None,
+        push: None,
         t: pipeline::now_ms(),
     };
     *su.current.lock().unwrap() = Some(status.clone());
@@ -798,6 +817,7 @@ pub fn ui_rollback(
                                 step: ImproveStep::RolledBack,
                                 session: None,
                                 commit: None,
+                                push: None,
                                 detail: Some(format!(
                                     "interface précédente réactivée ; pas de git revert : {e}"
                                 )),
@@ -811,7 +831,7 @@ pub fn ui_rollback(
             });
         }
     }
-    Ok(ui_info(&ui, &su))
+    Ok(ui_info(&ui, &su, Some(&improver)))
 }
 
 #[cfg(test)]

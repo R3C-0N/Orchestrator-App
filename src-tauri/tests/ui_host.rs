@@ -18,19 +18,80 @@ use orchestrator_lib::ui::{ActiveUi, UiHost, KEEP_RECENT};
 use tauri::utils::assets::{AssetKey, AssetsIter, CspHash};
 use tauri::{Assets, Wry};
 
+/// Préfixe des dossiers temporaires de ces tests (`%TEMP%`).
+const TEMP_PREFIX: &str = "orch-j14-ui-";
+
 /// Dossier temporaire propre à un test, supprimé à la fin (même en cas
 /// d'échec : `Drop` passe pendant le déroulement de la panique).
+///
+/// Sous Windows, `remove_dir_all` échoue parfois juste après les écritures
+/// (« répertoire non vide », os error 145 ; fichier tenu par l'antivirus ou
+/// l'indexeur, suppression en attente) : la suppression est réessayée
+/// pendant 5 s au plus, et un échec final est signalé sur stderr au lieu
+/// d'être ignoré en silence. Un minuteur du watchdog (fil à part) peut aussi
+/// réécrire `state.json` après la fin d'un test qui a échoué : nouvelle
+/// suppression après 1 s dans ce cas, et les dossiers d'exécutions
+/// précédentes sont balayés par [`temp_root`].
 struct TempDir(PathBuf);
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let mut res = remove_dir_retry(&self.0, Duration::from_secs(5));
+        if std::thread::panicking() {
+            // Test en échec : une chaîne de repli du watchdog peut encore
+            // écrire ; on la laisse finir puis on supprime à nouveau.
+            std::thread::sleep(Duration::from_secs(1));
+            res = remove_dir_retry(&self.0, Duration::from_secs(5));
+        }
+        if let Err(e) = res {
+            eprintln!("dossier de test non supprimé {} : {e}", self.0.display());
+        }
+    }
+}
+
+/// `remove_dir_all` réessayé jusqu'à `budget` ; `Ok` si le dossier n'existe
+/// plus.
+fn remove_dir_retry(d: &Path, budget: Duration) -> std::io::Result<()> {
+    let end = Instant::now() + budget;
+    loop {
+        match fs::remove_dir_all(d) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if Instant::now() >= end => return Err(e),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// Supprime les dossiers `orch-j14-ui-*` laissés par une exécution
+/// précédente (autre processus, dossier modifié il y a plus de 10 min).
+fn sweep_stale_temp_roots() {
+    let me = format!("-{}", std::process::id());
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(TEMP_PREFIX) || name.ends_with(&me) {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > Duration::from_secs(600));
+        if old {
+            let _ = remove_dir_retry(&e.path(), Duration::from_secs(1));
+        }
     }
 }
 
 fn temp_root(name: &str) -> TempDir {
-    let d = std::env::temp_dir().join(format!("orch-j14-ui-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&d);
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(sweep_stale_temp_roots);
+    let d = std::env::temp_dir().join(format!("{TEMP_PREFIX}{name}-{}", std::process::id()));
+    let _ = remove_dir_retry(&d, Duration::from_secs(5));
     fs::create_dir_all(&d).unwrap();
     TempDir(d)
 }

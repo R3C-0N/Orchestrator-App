@@ -2,7 +2,8 @@
 //! de l'app, cycle d'une amélioration (worktree `auto/…`, session dédiée,
 //! contrôles, tests, build, bascule, fusion fast-forward) et retour arrière.
 //!
-//! Étape 3 : clone ([`repo`]), git ([`git`]) et cycle ([`pipeline`]).
+//! Étape 3 : clone ([`repo`]), git ([`git`]) et cycle ([`pipeline`]) ; envoi
+//! des branches `auto/…` réservé au propriétaire ([`push`]).
 //! Propriétaire : agent C (`src-tauri/src/selfupdate/**`,
 //! `tools/self-improve/**`). Le pipeline ne connaît ni Tauri ni `AppState` :
 //! la session dédiée et la bascule d'interface passent par [`PipelineHost`],
@@ -11,6 +12,7 @@
 
 pub mod git;
 pub mod pipeline;
+pub mod push;
 pub mod repo;
 
 use std::future::Future;
@@ -18,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use crate::api::types::{CoreError, ImproveStatus, ImproveStep, RepoStatus};
+use crate::api::types::{CoreError, ImproveStatus, ImproveStep, PushStatus, RepoStatus};
 
 /// Dépôt distant cloné au premier lancement (remplaçable dans `config.json`).
 pub const DEFAULT_ORIGIN: &str = "git@github.com:R3C-0N/Orchestrator-App.git";
@@ -163,6 +165,11 @@ pub struct Pipeline {
     /// Empreinte du contrat de l'exe (`build_info::CONTRACT`).
     pub contract: String,
     active: Mutex<Option<pipeline::Active>>,
+    /// Envoi des branches `auto/…` ([`push`]) : `Off` tant que
+    /// [`Pipeline::enable_push`] ne l'a pas activé.
+    push: Mutex<PushStatus>,
+    /// Un seul envoi à la fois (cycle, envois en attente).
+    push_lock: tokio::sync::Mutex<()>,
 }
 
 impl Pipeline {
@@ -176,6 +183,8 @@ impl Pipeline {
             ui_root: data.join("ui"),
             contract: crate::build_info::CONTRACT.into(),
             active: Mutex::new(None),
+            push: Mutex::new(PushStatus::Off),
+            push_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -230,6 +239,113 @@ impl Pipeline {
     ) -> Result<ImproveOutcome, CoreError> {
         let (request, full) = self.revert_request(commit).await?;
         self.run_cycle(request, Some(full), sink).await
+    }
+
+    /// État de l'envoi des branches `auto/…` (affiché par `get_ui_info`).
+    pub fn push_status(&self) -> PushStatus {
+        self.push
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or(PushStatus::Off)
+    }
+
+    /// Active l'envoi si `requested` (réglage `push` de `config.json`) et si
+    /// le dépôt distant accorde le droit d'écriture
+    /// ([`push::check_write_access`]) ; sinon `Off` (réglage absent) ou
+    /// `Disabled { reason }`. Clone prêt requis. Envoi activé : les envois
+    /// en attente sont refaits. Renvoie le nouvel état.
+    pub async fn enable_push(&self, requested: bool) -> PushStatus {
+        self.enable_push_with(requested, push::PUSH_TIMEOUT).await
+    }
+
+    /// [`Pipeline::enable_push`] avec un délai choisi (tests).
+    pub async fn enable_push_with(
+        &self,
+        requested: bool,
+        timeout: std::time::Duration,
+    ) -> PushStatus {
+        if !requested {
+            self.set_push(PushStatus::Off);
+            return PushStatus::Off;
+        }
+        self.set_push(PushStatus::Checking);
+        let state = {
+            let _l = self.push_lock.lock().await;
+            if !repo::is_clone(&self.repo.dir) {
+                PushStatus::Disabled {
+                    reason: "clone de l'app indisponible".into(),
+                }
+            } else {
+                match push::check_write_access(&self.repo.dir, &self.repo.url, timeout).await {
+                    Ok(()) => PushStatus::Enabled {
+                        url: self.repo.url.clone(),
+                    },
+                    Err(e) => PushStatus::Disabled {
+                        reason: e.reason().to_string(),
+                    },
+                }
+            }
+        };
+        self.set_push(state.clone());
+        match &state {
+            PushStatus::Enabled { url } => {
+                tracing::info!("envoi des améliorations activé vers {url}");
+                let n = self.retry_pending().await;
+                if n > 0 {
+                    tracing::info!("{n} envoi(s) en attente refait(s)");
+                }
+            }
+            PushStatus::Disabled { reason } => {
+                tracing::warn!("envoi des améliorations désactivé : {reason}")
+            }
+            _ => {}
+        }
+        state
+    }
+
+    /// Envois en attente (échecs précédents).
+    pub fn pending_pushes(&self) -> Vec<push::Pending> {
+        self.pending().read()
+    }
+
+    /// Refait les envois en attente si l'envoi est activé ; renvoie le
+    /// nombre de branches envoyées.
+    pub async fn retry_pending(&self) -> usize {
+        let PushStatus::Enabled { url } = self.push_status() else {
+            return 0;
+        };
+        let _l = self.push_lock.lock().await;
+        let list = self.pending();
+        let mut sent = 0;
+        for p in list.read() {
+            match push::push_branch(
+                &self.repo.dir,
+                &url,
+                &p.branch,
+                &p.commit,
+                push::PUSH_TIMEOUT,
+            )
+            .await
+            {
+                Ok(()) => {
+                    list.remove(&p.branch);
+                    sent += 1;
+                    tracing::info!(branch = %p.branch, "envoi en attente fait");
+                }
+                Err(e) => tracing::warn!(branch = %p.branch, "envoi en attente échoué : {e}"),
+            }
+        }
+        sent
+    }
+
+    pub(crate) fn set_push(&self, state: PushStatus) {
+        if let Ok(mut p) = self.push.lock() {
+            *p = state;
+        }
+    }
+
+    pub(crate) fn pending(&self) -> push::PendingList {
+        push::PendingList(self.work_root.join(push::PENDING_FILE))
     }
 }
 

@@ -1489,3 +1489,552 @@ async fn improve_lock_during_session_and_recovery_after_crash() {
         "rien à faire ensuite"
     );
 }
+
+// --- Envoi des branches `auto/…` (propriétaire seulement) ------------------------
+//
+// Le dépôt distant est l'« origin » nu local, joint par un faux ssh
+// (`GIT_SSH_COMMAND`, pour tout ce binaire de test : aucun autre test n'utilise
+// ssh). Il imite GitHub : hôte `allow-…` = utilisateur avec droit d'écriture
+// (`git receive-pack` local), hôte `deny-…` = refus à la connexion au service
+// `receive-pack`, comme GitHub pour un utilisateur sans droit d'écriture
+// (message « Permission to … denied to … »), et un fichier `<hôte>.down`
+// simule une panne de réseau. Un `--dry-run` n'exécute pas le hook
+// `pre-receive` : un dépôt nu au hook qui refuse ne simule donc pas l'absence
+// de droit pour la vérification, seulement un refus à l'envoi lui-même.
+// Chaque connexion est consignée dans `<hôte>.log`. Aucun accès à GitHub.
+
+use orchestrator_lib::api::types::{PushResult, PushStatus};
+use orchestrator_lib::selfupdate::push;
+
+const FAKE_SSH: &str = r#"#!/bin/sh
+# Faux ssh des tests d'envoi : `[options…] <hôte> <commande>`.
+[ "$1" = "-G" ] && exit 1
+while [ $# -gt 2 ]; do shift; done
+host="${1#*@}"
+cmd="$2"
+dir="${0%/*}"
+printf '%s\n' "$cmd" >> "$dir/$host.log"
+if [ -e "$dir/$host.down" ]; then
+  echo "ssh: connect to host $host port 22: Connection timed out" >&2
+  exit 255
+fi
+# Le « serveur » ne voit pas la configuration passée au client (`git -c`).
+unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_DIR
+case "$host" in
+  allow-*) eval "git ${cmd#git-}" ;;
+  deny-*)
+    echo "ERROR: Permission to R3C-0N/Orchestrator-App.git denied to autre-utilisateur." >&2
+    exit 1 ;;
+  *) echo "ssh: Could not resolve hostname $host" >&2; exit 255 ;;
+esac
+"#;
+
+/// Dossier du faux ssh (dans `target`, pas dans `%TEMP%`), installé une fois
+/// et branché par `GIT_SSH_COMMAND`.
+fn fake_ssh_dir() -> PathBuf {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fake-ssh");
+    ONCE.call_once(|| {
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        std::fs::write(&script, FAKE_SSH).unwrap();
+        std::env::set_var(
+            "GIT_SSH_COMMAND",
+            script.to_string_lossy().replace('\\', "/"),
+        );
+    });
+    dir
+}
+
+/// Hôte `<mode>-<nom>-<pid>` du faux ssh, journal remis à zéro.
+fn fake_host(mode: &str, name: &str) -> String {
+    let dir = fake_ssh_dir();
+    let host = format!("{mode}-{name}-{}", std::process::id());
+    let _ = std::fs::remove_file(dir.join(format!("{host}.log")));
+    let _ = std::fs::remove_file(dir.join(format!("{host}.down")));
+    host
+}
+
+/// Connexions reçues par le faux ssh pour `host`.
+fn ssh_log(host: &str) -> Vec<String> {
+    std::fs::read_to_string(fake_ssh_dir().join(format!("{host}.log")))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+fn set_down(host: &str, down: bool) {
+    let f = fake_ssh_dir().join(format!("{host}.down"));
+    if down {
+        std::fs::write(f, "").unwrap();
+    } else {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+/// URL ssh (forme `git@hôte:chemin`) de l'origin nu local.
+fn ssh_url(host: &str, bare: &str) -> String {
+    format!("git@{host}:{}", bare.replace('\\', "/"))
+}
+
+/// Références de l'origin nu : `(nom, commit)` triées.
+fn remote_refs(bare: &str) -> Vec<(String, String)> {
+    let out = sh(
+        Path::new(bare),
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
+    let mut v: Vec<(String, String)> = out
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Clone prêt dont l'URL (celle de l'envoi) passe par le faux ssh `host`.
+async fn push_clone(root: &Path, host: &str) -> (RepoConfig, String, String, String) {
+    let (mut cfg, c1, c2) = ready_clone(root).await;
+    let bare = cfg.url.clone();
+    cfg.url = ssh_url(host, &bare);
+    (cfg, bare, c1, c2)
+}
+
+fn pushes(log: &[ImproveStatus]) -> Vec<Option<PushResult>> {
+    log.iter().map(|s| s.push.clone()).collect()
+}
+
+#[test]
+fn push_setting_and_branch_rules() {
+    let root = TempRoot::new("push-setting");
+    let conf = root.join("config.json");
+    assert!(!push::push_requested(None));
+    assert!(!push::push_requested(Some(&conf)), "fichier absent");
+    for (text, want) in [
+        (r#"{ "repo_url": "x" }"#, false),
+        (r#"{ "push": false }"#, false),
+        (r#"{ "push": "true" }"#, false),
+        (r#"{ "push": 1 }"#, false),
+        ("pas du json", false),
+        (r#"{ "push": true }"#, true),
+    ] {
+        std::fs::write(&conf, text).unwrap();
+        assert_eq!(push::push_requested(Some(&conf)), want, "{text}");
+    }
+    assert!(push::valid_branch("auto/20261117-1200-titre"));
+    assert!(push::valid_branch("auto/20261117-1200-revert-abc1234-2"));
+    for bad in [
+        "main",
+        "auto/",
+        "+auto/x",
+        "auto/x:refs/heads/main",
+        "auto/x:main",
+        "auto/../main",
+        "auto/x.lock",
+        "auto/.x",
+        "auto//x",
+        "auto/x y",
+        "refs/heads/auto/x",
+    ] {
+        assert!(!push::valid_branch(bad), "{bad}");
+    }
+    assert!(push::is_denied(
+        "ERROR: Permission to a/b.git denied to c.\nfatal: Could not read from remote repository."
+    ));
+    assert!(push::is_denied(
+        "remote: Write access to repository not granted.\nfatal: unable to access 'https://github.com/a/b.git/': The requested URL returned error: 403"
+    ));
+    assert!(!push::is_denied(
+        "ssh: connect to host github.com port 22: Connection timed out"
+    ));
+}
+
+/// Propriétaire avec droit d'écriture : vérification sans rien écrire, puis
+/// seule la branche `auto/…` est envoyée ; `main` distant inchangé ; le
+/// clone ne pousse toujours pas de lui-même.
+#[tokio::test]
+async fn owner_with_write_access_pushes_auto_branch_only() {
+    let root = TempRoot::new("push-owner");
+    let host = fake_host("allow", "owner");
+    let (cfg, bare, c1, c2) = push_clone(&root, &host).await;
+    let before = remote_refs(&bare);
+    let ship = Arc::new(success_host(vec![commit_src(
+        vec![("src/a.txt", "a\n")],
+        "ajoute a",
+    )]));
+    let p = pipeline(&root, cfg.clone(), ship, Arc::new(FakeToolchain::new()));
+    assert_eq!(p.push_status(), PushStatus::Off);
+
+    let st = p.enable_push(true).await;
+    assert_eq!(
+        st,
+        PushStatus::Enabled {
+            url: cfg.url.clone()
+        }
+    );
+    assert_eq!(p.push_status(), st);
+    // La sonde (`--dry-run`) a joint `receive-pack` sans rien écrire.
+    let log = ssh_log(&host);
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert!(log[0].starts_with("git-receive-pack"), "{log:?}");
+    assert_eq!(remote_refs(&bare), before, "la sonde n'écrit rien");
+
+    let req = p.request("ajouter a").unwrap();
+    let (sink, statuses) = collector();
+    let out = p.run(req.clone(), sink).await.unwrap();
+    let ImproveOutcome::Merged { commit } = out else {
+        panic!("{out:?}")
+    };
+    let statuses = statuses.lock().unwrap().clone();
+    let last = statuses.last().unwrap();
+    assert_eq!(last.step, ImproveStep::Merged);
+    assert_eq!(
+        last.push,
+        Some(PushResult::Pushed {
+            branch: req.branch.clone()
+        })
+    );
+    let push_states = pushes(&statuses);
+    assert_eq!(
+        push_states[push_states.len() - 2],
+        Some(PushResult::Pushing {
+            branch: req.branch.clone()
+        })
+    );
+    // Distant : la branche auto/… en plus, sur la tête fusionnée ; main
+    // distant inchangé (c2, jamais le main du clone).
+    let mut want = before.clone();
+    want.push((format!("refs/heads/{}", req.branch), commit.clone()));
+    want.sort();
+    assert_eq!(remote_refs(&bare), want);
+    assert_eq!(sh(Path::new(&bare), &["rev-parse", "refs/heads/main"]), c2);
+    assert_eq!(sh(&cfg.dir, &["rev-parse", "main~1"]), c1);
+    // Deux connexions de plus : nouvelle vérification puis envoi.
+    let log = ssh_log(&host);
+    assert_eq!(log.len(), 3, "{log:?}");
+    assert!(log.iter().all(|l| l.starts_with("git-receive-pack")));
+    // Le clone garde son URL d'envoi `no-push://` (protection de la session).
+    assert_eq!(
+        sh(&cfg.dir, &["remote", "get-url", "--push", "origin"]),
+        NO_PUSH_URL
+    );
+    assert!(p.pending_pushes().is_empty());
+}
+
+/// Sans droit d'écriture : envoi désactivé avec une raison, aucune tentative
+/// d'envoi pendant le cycle.
+#[tokio::test]
+async fn without_write_access_push_is_disabled_and_never_attempted() {
+    let root = TempRoot::new("push-denied");
+    let host = fake_host("deny", "denied");
+    let (cfg, bare, _, _) = push_clone(&root, &host).await;
+    let before = remote_refs(&bare);
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(success_host(vec![commit_src(
+            vec![("src/a.txt", "a\n")],
+            "a",
+        )])),
+        Arc::new(FakeToolchain::new()),
+    );
+    match p.enable_push(true).await {
+        PushStatus::Disabled { reason } => {
+            assert!(reason.contains("pas de droit d'écriture"), "{reason}");
+            assert!(reason.contains("Permission to"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(ssh_log(&host).len(), 1, "la seule vérification");
+    let (out, statuses) = run(&p, "a").await;
+    assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
+    assert!(pushes(&statuses).iter().all(Option::is_none));
+    assert_eq!(ssh_log(&host).len(), 1, "aucune tentative d'envoi");
+    assert_eq!(remote_refs(&bare), before);
+    assert!(p.pending_pushes().is_empty());
+}
+
+/// Réglage absent : aucune connexion, aucun envoi (cas des autres
+/// utilisateurs), même avec un dépôt distant inscriptible.
+#[tokio::test]
+async fn without_setting_nothing_is_pushed() {
+    let root = TempRoot::new("push-off");
+    let host = fake_host("allow", "off");
+    let (cfg, bare, _, _) = push_clone(&root, &host).await;
+    let before = remote_refs(&bare);
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(success_host(vec![commit_src(
+            vec![("src/a.txt", "a\n")],
+            "a",
+        )])),
+        Arc::new(FakeToolchain::new()),
+    );
+    assert_eq!(p.enable_push(false).await, PushStatus::Off);
+    let (out, statuses) = run(&p, "a").await;
+    assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
+    assert!(pushes(&statuses).iter().all(Option::is_none));
+    assert!(ssh_log(&host).is_empty(), "aucune connexion");
+    assert_eq!(remote_refs(&bare), before);
+}
+
+/// Panne de réseau à l'envoi : fusion locale acquise, statut « envoi
+/// échoué », branche en attente ; envoyée au démarrage suivant.
+#[tokio::test]
+async fn network_failure_keeps_local_merge_and_retries_later() {
+    let root = TempRoot::new("push-down");
+    let host = fake_host("allow", "down");
+    let (cfg, bare, _, c2) = push_clone(&root, &host).await;
+    let before = remote_refs(&bare);
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(success_host(vec![commit_src(
+            vec![("src/a.txt", "a\n")],
+            "a",
+        )])),
+        Arc::new(FakeToolchain::new()),
+    );
+    assert!(matches!(
+        p.enable_push(true).await,
+        PushStatus::Enabled { .. }
+    ));
+    set_down(&host, true);
+    let req = p.request("a").unwrap();
+    let (sink, statuses) = collector();
+    let out = p.run(req.clone(), sink).await.unwrap();
+    let ImproveOutcome::Merged { commit } = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(main_of(&cfg), commit, "fusion locale acquise");
+    let last = statuses.lock().unwrap().last().unwrap().clone();
+    assert_eq!(last.step, ImproveStep::Merged);
+    match last.push {
+        Some(PushResult::Failed { branch, reason }) => {
+            assert_eq!(branch, req.branch);
+            assert!(reason.contains("timed out"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(remote_refs(&bare), before);
+    assert!(
+        matches!(p.push_status(), PushStatus::Enabled { .. }),
+        "panne : envoi toujours activé"
+    );
+    assert_eq!(
+        p.pending_pushes(),
+        vec![push::Pending {
+            branch: req.branch.clone(),
+            commit: commit.clone()
+        }]
+    );
+
+    // Réseau revenu, démarrage suivant : l'envoi en attente est fait.
+    set_down(&host, false);
+    let p2 = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(FakeHost::default()),
+        Arc::new(FakeToolchain::new()),
+    );
+    assert_eq!(p2.pending_pushes().len(), 1, "liste gardée sur disque");
+    assert!(matches!(
+        p2.enable_push(true).await,
+        PushStatus::Enabled { .. }
+    ));
+    assert_eq!(
+        sh(
+            Path::new(&bare),
+            &["rev-parse", &format!("refs/heads/{}", req.branch)]
+        ),
+        commit
+    );
+    assert!(p2.pending_pushes().is_empty());
+    assert_eq!(sh(Path::new(&bare), &["rev-parse", "refs/heads/main"]), c2);
+}
+
+/// Jamais forcé : une branche distante du même nom, d'un autre historique,
+/// n'est pas écrasée (envoi échoué, branche distante intacte) ; un refus du
+/// dépôt distant à l'envoi (hook `pre-receive`) laisse aussi la fusion.
+#[tokio::test]
+async fn push_is_never_forced_and_remote_refusal_keeps_merge() {
+    let root = TempRoot::new("push-noforce");
+    let host = fake_host("allow", "noforce");
+    let (cfg, bare, _, c2) = push_clone(&root, &host).await;
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(success_host(vec![commit_src(
+            vec![("src/a.txt", "a\n")],
+            "a",
+        )])),
+        Arc::new(FakeToolchain::new()),
+    );
+    assert!(matches!(
+        p.enable_push(true).await,
+        PushStatus::Enabled { .. }
+    ));
+    let req = p.request("a").unwrap();
+    let theirs = format!("refs/heads/{}", req.branch);
+    sh(Path::new(&bare), &["update-ref", &theirs, &c2]);
+    let (sink, statuses) = collector();
+    let out = p.run(req.clone(), sink).await.unwrap();
+    let ImproveOutcome::Merged { commit } = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(main_of(&cfg), commit);
+    let last = statuses.lock().unwrap().last().unwrap().clone();
+    assert!(
+        matches!(&last.push, Some(PushResult::Failed { .. })),
+        "{:?}",
+        last.push
+    );
+    assert_eq!(
+        sh(Path::new(&bare), &["rev-parse", &theirs]),
+        c2,
+        "pas écrasée"
+    );
+
+    // Hook `pre-receive` qui refuse tout : la vérification (`--dry-run`)
+    // passe, l'envoi est refusé, la fusion reste.
+    sh(Path::new(&bare), &["update-ref", "-d", &theirs]);
+    write(
+        Path::new(&bare),
+        "hooks/pre-receive",
+        "#!/bin/sh\necho \"refusé par le dépôt distant\" >&2\nexit 1\n",
+    );
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(success_host(vec![commit_src(
+            vec![("src/b.txt", "b\n")],
+            "b",
+        )])),
+        Arc::new(FakeToolchain::new()),
+    );
+    assert!(matches!(
+        p.enable_push(true).await,
+        PushStatus::Enabled { .. }
+    ));
+    let (out, statuses) = run(&p, "b").await;
+    let ImproveOutcome::Merged { commit } = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(main_of(&cfg), commit);
+    let last = statuses.last().unwrap();
+    assert!(
+        matches!(&last.push, Some(PushResult::Failed { reason, .. }) if reason.contains("pre-receive")),
+        "{:?}",
+        last.push
+    );
+    assert_eq!(
+        remote_refs(&bare)
+            .iter()
+            .filter(|(r, _)| r.starts_with("refs/heads/auto/"))
+            .count(),
+        0
+    );
+    assert_eq!(p.pending_pushes().len(), 2, "les deux branches en attente");
+}
+
+/// Retour arrière et « relance requise » : leur branche `auto/…` est
+/// envoyée aussi, une fois fusionnée.
+#[tokio::test]
+async fn revert_and_restart_required_are_pushed() {
+    let root = TempRoot::new("push-revert");
+    let host = fake_host("allow", "revert");
+    let (cfg, bare, _, c2) = push_clone(&root, &host).await;
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(success_host(vec![commit_src(
+            vec![("src/app.txt", "v1 modifiée\n")],
+            "Changer le titre",
+        )])),
+        Arc::new(FakeToolchain::new()),
+    );
+    assert!(matches!(
+        p.enable_push(true).await,
+        PushStatus::Enabled { .. }
+    ));
+    let (out, _) = run(&p, "titre").await;
+    let ImproveOutcome::Merged { commit } = out else {
+        panic!("{out:?}")
+    };
+    let (sink, statuses) = collector();
+    let out = p.revert(&commit, sink).await.unwrap();
+    let ImproveOutcome::Merged { commit: reverted } = out else {
+        panic!("{out:?}")
+    };
+    let last = statuses.lock().unwrap().last().unwrap().clone();
+    assert_eq!(last.step, ImproveStep::RolledBack);
+    let Some(PushResult::Pushed { branch }) = last.push else {
+        panic!("{:?}", last.push)
+    };
+    assert!(branch.contains("-revert-"), "{branch}");
+    assert_eq!(
+        sh(
+            Path::new(&bare),
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        reverted
+    );
+
+    // Cœur Rust modifié : fusionnée sans activation, branche envoyée.
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(success_host(vec![commit_src(
+            vec![("src-tauri/core.rs", "fn main() { println!(); }\n")],
+            "cœur",
+        )])),
+        Arc::new(FakeToolchain::new()),
+    );
+    assert!(matches!(
+        p.enable_push(true).await,
+        PushStatus::Enabled { .. }
+    ));
+    let (out, statuses) = run(&p, "cœur").await;
+    let ImproveOutcome::RestartRequired { commit } = out else {
+        panic!("{out:?}")
+    };
+    let last = statuses.last().unwrap();
+    assert_eq!(last.step, ImproveStep::RestartRequired);
+    let Some(PushResult::Pushed { branch }) = &last.push else {
+        panic!("{:?}", last.push)
+    };
+    assert_eq!(
+        sh(
+            Path::new(&bare),
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        commit
+    );
+    assert_eq!(sh(Path::new(&bare), &["rev-parse", "refs/heads/main"]), c2);
+}
+
+/// `push_branch` refuse ce qui n'est pas une branche `auto/…` fusionnée,
+/// sans rien envoyer.
+#[tokio::test]
+async fn push_branch_refuses_main_unmerged_and_bad_refspecs() {
+    let root = TempRoot::new("push-refuse");
+    let host = fake_host("allow", "refuse");
+    let (cfg, bare, c1, c2) = push_clone(&root, &host).await;
+    let before = remote_refs(&bare);
+    let t = Duration::from_secs(60);
+    for (branch, commit) in [
+        ("main", c1.as_str()),
+        ("auto/x:refs/heads/main", c1.as_str()),
+        ("+auto/x", c1.as_str()),
+        ("auto/x", "HEAD"),
+        // c2 n'est pas dans le main du clone (placé sur c1).
+        ("auto/x", c2.as_str()),
+    ] {
+        let r = push::push_branch(&cfg.dir, &cfg.url, branch, commit, t).await;
+        assert!(r.is_err(), "{branch} {commit}");
+    }
+    assert!(ssh_log(&host).is_empty(), "rien n'a joint le distant");
+    assert_eq!(remote_refs(&bare), before);
+}

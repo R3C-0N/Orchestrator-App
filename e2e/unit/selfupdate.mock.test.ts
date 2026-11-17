@@ -5,6 +5,7 @@ import type { ImproveStatus } from "../../src/lib/core/bindings/ImproveStatus";
 import {
   MOCK_FAIL_DETAIL,
   MOCK_IMPROVE_STEPS,
+  MOCK_PUSH_FAIL,
   MockSelfUpdate,
   mockImproveSteps,
   mockSelfUpdateFromUrl,
@@ -96,6 +97,60 @@ describe("bandeau d'amélioration", () => {
     const { oneLine } = await import("../../src/lib/components/ImproveBanner.svelte");
     expect(oneLine("Bandeau\n  plus\r\ndiscret\t")).toBe("Bandeau plus discret");
     expect(oneLine("x".repeat(300), 10)).toBe(`${"x".repeat(9)}…`);
+  });
+
+  it("envoi : rien pour les autres utilisateurs ; « poussé » ou « envoi échoué » pour le propriétaire", async () => {
+    const { pushText, bannerText } = await import("../../src/lib/components/ImproveBanner.svelte");
+    const base: ImproveStatus = {
+      id: "i",
+      branch: "auto/20261117-1200-x",
+      request: "x",
+      step: "merged",
+      session: null,
+      commit: "abc1234",
+      detail: null,
+      push: null,
+      t: 1,
+    };
+    expect(pushText(base)).toBeNull();
+    expect(pushText({ ...base, push: { state: "pushing", branch: base.branch } })).toContain("envoi sur GitHub");
+    expect(pushText({ ...base, push: { state: "pushed", branch: base.branch } })).toBe(
+      "poussé sur GitHub : auto/20261117-1200-x",
+    );
+    const failed = pushText({ ...base, push: { state: "failed", branch: base.branch, reason: "délai dépassé" } });
+    expect(failed).toContain("fusionné localement, envoi échoué : délai dépassé");
+    // Le texte principal ne change pas.
+    expect(bannerText({ ...base, push: { state: "pushed", branch: base.branch } }, null)).toBe(bannerText(base, null));
+  });
+
+  it("envoi simulé : désactivé par défaut, sinon « en cours » puis son issue après la fusion", async () => {
+    vi.useFakeTimers();
+    const off = new MockSelfUpdate(() => {}, 100);
+    expect((await off.getUiInfo()).push).toEqual({ state: "off" });
+    const seenOff: ImproveStatus[] = [];
+    await off.onImproveStatus((s) => seenOff.push(s));
+    await off.improveStart("x");
+    vi.advanceTimersByTime(2000);
+    expect(seenOff.every((s) => s.push === null)).toBe(true);
+
+    for (const outcome of ["pushed", "failed"] as const) {
+      const o = mockSelfUpdateFromUrl(`?push=${outcome}`);
+      expect(o.push).toBe(outcome);
+      const m = new MockSelfUpdate(() => {}, 100, o);
+      expect((await m.getUiInfo()).push.state).toBe("enabled");
+      const seen: ImproveStatus[] = [];
+      await m.onImproveStatus((s) => seen.push(s));
+      const first = await m.improveStart("y");
+      vi.advanceTimersByTime(2000);
+      const last = seen.at(-1)!;
+      expect(last.step).toBe("merged");
+      expect(seen.at(-2)?.push).toEqual({ state: "pushing", branch: first.branch });
+      expect(last.push).toEqual(
+        outcome === "pushed"
+          ? { state: "pushed", branch: first.branch }
+          : { state: "failed", branch: first.branch, reason: MOCK_PUSH_FAIL },
+      );
+    }
   });
 
   it("attachFail : les n premiers rattachements échouent", async () => {

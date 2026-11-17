@@ -15,9 +15,10 @@ use tokio::sync::watch;
 use super::git::{self, git, git_ok, resolve};
 use super::repo::NO_PUSH_URL;
 use super::{
-    repo, BoxFut, ImproveOutcome, ImproveRequest, Pipeline, StatusSink, ALLOWED_DIRS, BRANCH_PREFIX,
+    push, repo, BoxFut, ImproveOutcome, ImproveRequest, Pipeline, StatusSink, ALLOWED_DIRS,
+    BRANCH_PREFIX,
 };
-use crate::api::types::{CoreError, ImproveStatus, ImproveStep};
+use crate::api::types::{CoreError, ImproveStatus, ImproveStep, PushResult, PushStatus};
 
 /// Prompt versionné de la session dédiée, relu dans le worktree.
 pub const PROMPT_FILE: &str = "tools/self-improve/prompt.md";
@@ -340,6 +341,12 @@ impl Reporter {
     fn emit(&mut self, step: ImproveStep, detail: Option<String>) {
         self.status.step = step;
         self.status.detail = detail;
+        self.status.t = now_ms();
+        (self.sink)(self.status.clone());
+    }
+
+    /// Réémet l'état courant (même étape), par exemple après l'envoi.
+    fn resend(&mut self) {
         self.status.t = now_ms();
         (self.sink)(self.status.clone());
     }
@@ -735,6 +742,7 @@ impl Pipeline {
                 session: None,
                 commit: None,
                 detail: None,
+                push: None,
                 t: now_ms(),
             },
             sink,
@@ -761,7 +769,78 @@ impl Pipeline {
                 ImproveOutcome::Failed { step, reason }
             }
         };
+        // Fusion faite (y compris « relance requise » et retour arrière) :
+        // envoi de la seule branche `auto/…`, par le pipeline, après l'arrêt
+        // de la session et les contrôles. Un échec laisse la fusion acquise.
+        if let ImproveOutcome::Merged { commit } | ImproveOutcome::RestartRequired { commit } =
+            &outcome
+        {
+            if let PushStatus::Enabled { .. } = self.push_status() {
+                rep.status.push = Some(PushResult::Pushing {
+                    branch: request.branch.clone(),
+                });
+                rep.resend();
+                let result = self.push_merged(&request.branch, commit).await;
+                let pushed = matches!(result, PushResult::Pushed { .. });
+                rep.status.push = Some(result);
+                rep.resend();
+                // Envoi réussi : les envois en attente (échecs précédents)
+                // sont refaits, après l'affichage du résultat.
+                if pushed {
+                    self.retry_pending().await;
+                }
+            }
+        }
         Ok(outcome)
+    }
+
+    /// Envoie `branch` (tête `commit`, fusionnée dans le `main` du clone)
+    /// vers le dépôt distant, après une nouvelle vérification du droit
+    /// d'écriture. Échec : branche
+    /// gardée dans les envois en attente ; refus d'écriture : envoi
+    /// désactivé.
+    async fn push_merged(&self, branch: &str, commit: &str) -> PushResult {
+        let PushStatus::Enabled { url } = self.push_status() else {
+            return PushResult::Failed {
+                branch: branch.to_string(),
+                reason: "envoi désactivé".into(),
+            };
+        };
+        let res = {
+            let _l = self.push_lock.lock().await;
+            match push::check_write_access(&self.repo.dir, &url, push::PUSH_TIMEOUT).await {
+                Err(push::CheckError::Denied(r)) => {
+                    self.set_push(PushStatus::Disabled { reason: r.clone() });
+                    Err(r)
+                }
+                Err(push::CheckError::Unavailable(r)) => Err(r),
+                Ok(()) => {
+                    push::push_branch(&self.repo.dir, &url, branch, commit, push::PUSH_TIMEOUT)
+                        .await
+                }
+            }
+        };
+        let pending = self.pending();
+        match res {
+            Ok(()) => {
+                pending.remove(branch);
+                tracing::info!(branch, url = %url, "branche envoyée");
+                PushResult::Pushed {
+                    branch: branch.to_string(),
+                }
+            }
+            Err(reason) => {
+                pending.add(push::Pending {
+                    branch: branch.to_string(),
+                    commit: commit.to_string(),
+                });
+                tracing::warn!(branch, "envoi échoué (fusion locale acquise) : {reason}");
+                PushResult::Failed {
+                    branch: branch.to_string(),
+                    reason,
+                }
+            }
+        }
     }
 
     async fn cycle(
@@ -1299,12 +1378,7 @@ async fn check(
     }
     let sneaky = git(
         clone,
-        &[
-            "config",
-            "--local",
-            "--get-regexp",
-            r"^(url\.|core\.sshcommand|core\.hookspath|core\.fsmonitor|include|credential)",
-        ],
+        &["config", "--local", "--get-regexp", push::SNEAKY_CONFIG],
     )
     .await
     .unwrap_or_default();
