@@ -31,8 +31,12 @@ pub const BASE_ARGS: &[&str] = &[
 pub struct LaunchOptions {
     pub resume: Option<String>,
     pub model: Option<String>,
-    /// Arguments supplémentaires (tests : `--no-session-persistence`).
+    /// Arguments supplémentaires (tests : `--no-session-persistence` ;
+    /// session d'amélioration : `--disallowedTools …`).
     pub extra_args: Vec<String>,
+    /// Variables d'environnement ajoutées à celles de l'app (session
+    /// d'amélioration : git sans réseau, sans hooks, sans invite).
+    pub env: Vec<(String, String)>,
 }
 
 /// Valide les valeurs venues de l'interface avant de les passer en arguments :
@@ -80,9 +84,20 @@ pub struct Spawned {
 }
 
 pub fn spawn_claude(exe: &Path, cwd: &Path, args: &[String]) -> std::io::Result<Spawned> {
+    spawn_claude_env(exe, cwd, args, &[])
+}
+
+/// [`spawn_claude`] avec des variables d'environnement en plus.
+pub fn spawn_claude_env(
+    exe: &Path,
+    cwd: &Path,
+    args: &[String],
+    env: &[(String, String)],
+) -> std::io::Result<Spawned> {
     let job = Job::new()?;
     let mut cmd = Command::new(exe);
     cmd.args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -264,6 +279,7 @@ mod tests {
             resume: Some("abc".into()),
             model: Some("haiku".into()),
             extra_args: vec![],
+            ..LaunchOptions::default()
         });
         let joined = a.join(" ");
         assert!(joined.starts_with(
@@ -279,6 +295,7 @@ mod tests {
             resume: resume.map(str::to_string),
             model: model.map(str::to_string),
             extra_args: vec![],
+            ..LaunchOptions::default()
         }
     }
 

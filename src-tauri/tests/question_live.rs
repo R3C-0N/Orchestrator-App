@@ -55,6 +55,7 @@ async fn start(name: &str, events: &Events) -> Arc<Session> {
             resume: None,
             model: Some("haiku".into()),
             extra_args: vec!["--no-session-persistence".into()],
+            ..LaunchOptions::default()
         },
         sink,
     )

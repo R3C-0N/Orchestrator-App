@@ -137,6 +137,7 @@ async fn live_pipe_end_to_end() {
             resume: None,
             model: Some("haiku".into()),
             extra_args: vec!["--no-session-persistence".into()],
+            ..LaunchOptions::default()
         },
         sink,
     )

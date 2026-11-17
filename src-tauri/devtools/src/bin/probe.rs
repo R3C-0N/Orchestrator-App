@@ -79,6 +79,7 @@ async fn main() {
             resume: None,
             model,
             extra_args: extra,
+            ..LaunchOptions::default()
         },
         sink,
     )

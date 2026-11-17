@@ -43,6 +43,7 @@ async fn start(resume: Option<String>, events: &Events) -> Arc<Session> {
             resume,
             model: Some("haiku".into()),
             extra_args: vec![],
+            ..LaunchOptions::default()
         },
         sink,
     )

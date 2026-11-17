@@ -38,7 +38,7 @@ use crate::logging::{self, RawLog};
 use crate::process::locate::display_path;
 use crate::process::reader::{LineReader, RawLine, MAX_LINE_BYTES};
 use crate::process::spawn::{
-    build_args, spawn_claude, validate_launch_options, Job, LaunchOptions,
+    build_args, spawn_claude_env, validate_launch_options, Job, LaunchOptions,
 };
 use crate::process::writer;
 use crate::protocol::inbound::Inbound;
@@ -694,7 +694,7 @@ impl Session {
         }
         validate_launch_options(&opts).map_err(CoreError::InvalidArgument)?;
         let args = build_args(&opts);
-        let mut spawned = spawn_claude(exe, cwd, &args).map_err(|e| {
+        let mut spawned = spawn_claude_env(exe, cwd, &args, &opts.env).map_err(|e| {
             tracing::error!(exe = %exe.display(), "échec du lancement : {e}");
             CoreError::SpawnFailed(e.to_string())
         })?;

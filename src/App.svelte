@@ -738,6 +738,16 @@
     }
   }
 
+  // Clone de l'app en préparation au montage (premier lancement : clonage en
+  // tâche de fond côté cœur) : état relu toutes les 2 s jusqu'à son issue,
+  // pour dégriser `/ameliorer` sans recharger.
+  $effect(() => {
+    const state = uiInfo?.repo.state;
+    if (state !== "cloning" && state !== "unknown") return;
+    const timer = setInterval(() => void refreshUiInfo(), 2000);
+    return () => clearInterval(timer);
+  });
+
   async function startImprove(request: string): Promise<void> {
     if (!request) {
       draft = "/ameliorer ";

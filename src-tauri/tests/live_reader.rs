@@ -53,6 +53,7 @@ async fn live_turn_through_reader_and_writer() {
             resume: None,
             model: Some("haiku".into()),
             extra_args: vec!["--no-session-persistence".into()],
+            ..LaunchOptions::default()
         },
         sink,
     )

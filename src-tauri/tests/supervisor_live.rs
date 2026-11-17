@@ -68,6 +68,7 @@ async fn live_reload_keeps_the_process_then_closes_it_without_page() {
                 resume: None,
                 model: Some("haiku".into()),
                 extra_args: vec!["--no-session-persistence".into()],
+                ..LaunchOptions::default()
             },
             Some(state.attachment(sink)),
             SessionConfig::default(),

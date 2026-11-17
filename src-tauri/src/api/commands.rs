@@ -3,7 +3,7 @@
 //! J11 : `list_projects`, `list_sessions` et `load_history` lisent les
 //! transcripts du CLI (module `sessions`, lecture seule).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,9 @@ use crate::state::batcher::Sink;
 pub const DETACH_GRACE: Duration = Duration::from_secs(60);
 
 type SessionMap = Arc<Mutex<HashMap<SessionKey, Arc<Session>>>>;
+/// Sessions que la fermeture différée ne touche pas (session d'amélioration
+/// tenue par le cycle, même sans page rattachée).
+type Protected = Arc<Mutex<HashSet<SessionKey>>>;
 
 /// État partagé de l'app.
 pub struct AppState {
@@ -46,6 +49,21 @@ pub struct AppState {
     /// Canal de la page courante, donné par `attach_sessions` : destination
     /// des sessions lancées par le cœur (rôle `Improve`).
     ui: Mutex<Option<Attachment>>,
+    /// Sessions protégées de la fermeture différée ([`AppState::protect`]).
+    protected: Protected,
+}
+
+/// Protection d'une session contre la fermeture différée, levée à la
+/// destruction (voir [`AppState::protect`]).
+pub struct Protection {
+    key: SessionKey,
+    protected: Protected,
+}
+
+impl Drop for Protection {
+    fn drop(&mut self) {
+        self.protected.lock().unwrap().remove(&self.key);
+    }
 }
 
 impl AppState {
@@ -73,6 +91,7 @@ impl AppState {
             detach_grace: DETACH_GRACE,
             page_gen: Arc::new(AtomicU64::new(0)),
             ui: Mutex::new(None),
+            protected: Arc::default(),
         }
     }
 
@@ -161,6 +180,7 @@ impl AppState {
             sessions: self.sessions.clone(),
             last: self.last.clone(),
             grace: self.detach_grace,
+            protected: self.protected.clone(),
         }
     }
 
@@ -273,6 +293,53 @@ impl AppState {
         Ok(s)
     }
 
+    /// Protège la session `key` de la fermeture différée tant que la garde
+    /// rendue vit (J14, étape 5) : la session d'amélioration n'a souvent
+    /// aucune page rattachée, et serait sinon fermée après
+    /// [`DETACH_GRACE`] alors que le cycle l'attend. À la levée de la
+    /// protection, une session toujours détachée suit la règle commune.
+    pub fn protect(&self, key: &SessionKey) -> Protection {
+        self.protected.lock().unwrap().insert(key.clone());
+        Protection {
+            key: key.clone(),
+            protected: self.protected.clone(),
+        }
+    }
+
+    /// Ferme les sessions principales vivantes autres que `keep` (J14,
+    /// étape 5) : le cœur garde au plus une session `Main`. L'interface
+    /// n'en affiche qu'une (`mainOf` au rattachement) ; une deuxième
+    /// (nouvelle session lancée à côté de la courante) continuerait sinon
+    /// invisible jusqu'à la fermeture de l'app. Renvoie le nombre de
+    /// sessions fermées.
+    pub async fn close_other_mains(&self, keep: &SessionKey) -> usize {
+        let others: Vec<SessionKey> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, s)| *k != keep && s.role == SessionRole::Main)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut n = 0;
+        for k in others {
+            if self.close_session(&k).await.is_some() {
+                tracing::info!(session = %k.0, "session principale remplacée : fermée");
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Attend que toutes les sessions principales soient au repos
+    /// ([`AppState::main_idle`]) ; vérifié toutes les 250 ms. Sans fin
+    /// propre : l'appelant borne ou annule (cycle d'amélioration).
+    pub async fn wait_main_idle(&self) {
+        while !self.main_idle() {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     /// Vrai si toutes les sessions principales vivantes sont au repos (pas de
     /// tour en cours, pas de question ouverte) : condition de la bascule
     /// automatique d'interface (décision 15). Vrai s'il n'y en a aucune.
@@ -311,6 +378,7 @@ struct Reaper {
     sessions: SessionMap,
     last: Arc<Mutex<Option<Arc<Session>>>>,
     grace: Duration,
+    protected: Protected,
 }
 
 impl Reaper {
@@ -346,9 +414,17 @@ impl Reaper {
     async fn sweep(&self) -> Option<Duration> {
         let mut next: Option<Duration> = None;
         let expired: Vec<Arc<Session>> = {
+            let protected = self.protected.lock().unwrap().clone();
             let mut map = self.sessions.lock().unwrap();
             let mut keys = Vec::new();
             for (k, s) in map.iter() {
+                if protected.contains(k) {
+                    // Tenue par le cycle d'amélioration : repasser plus tard.
+                    if s.outlet().detached_for().is_some() {
+                        next = Some(next.map_or(self.grace, |n| n.min(self.grace)));
+                    }
+                    continue;
+                }
                 match s.outlet().detached_for() {
                     Some(d) if d >= self.grace => keys.push(k.clone()),
                     Some(d) => {
@@ -447,11 +523,14 @@ pub async fn start_session(
                 resume,
                 model,
                 extra_args: vec![],
+                ..LaunchOptions::default()
             },
             Some(page),
             SessionConfig::default(),
         )
         .await?;
+    // Au plus une session principale (J14, étape 5).
+    state.close_other_mains(&session.key).await;
     Ok(SessionStarted {
         session: session.key.clone(),
         pid: session.pid,

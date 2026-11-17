@@ -159,6 +159,7 @@ async fn start(
             resume: None,
             model: None,
             extra_args: args.iter().map(|s| s.to_string()).collect(),
+            ..LaunchOptions::default()
         },
         ev.sink(),
         config,
@@ -517,6 +518,7 @@ fn opts(args: &[&str]) -> LaunchOptions {
         resume: None,
         model: None,
         extra_args: args.iter().map(|s| s.to_string()).collect(),
+        ..LaunchOptions::default()
     }
 }
 
@@ -901,4 +903,78 @@ async fn dead_sessions_leave_the_table() {
         second.is_empty(),
         "journal d'une session morte rendu une seule fois"
     );
+}
+
+/// J14, étape 5 : une session `Improve` tenue par le cycle (`protect`) n'est
+/// pas fermée par le délai de détachement ; la protection levée, elle suit
+/// la règle commune.
+#[tokio::test]
+async fn protected_improve_survives_the_delay_then_follows_the_rule() {
+    let mut state = AppState::new(std::env::temp_dir());
+    state.detach_grace = Duration::from_millis(400);
+    let imp = state
+        .start_improve_with(
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "améliore",
+            opts(&["--fake-ignore-stdin-eof"]),
+            fast(),
+        )
+        .await
+        .unwrap();
+    let guard = state.protect(&imp.key);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(alive(imp.pid), "protégée : toujours vivante après 3 délais");
+    assert_eq!(state.sessions.lock().unwrap().len(), 1);
+    drop(guard);
+    let took = wait_gone(&state, &[imp.pid], Duration::from_secs(10)).await;
+    println!("protection levée : fermée en {took:?}");
+}
+
+/// J14, étape 5 : le cœur garde au plus une session `Main`
+/// (`close_other_mains`, appelé par `start_session`) ; les sessions
+/// `Improve` ne sont pas touchées.
+#[tokio::test]
+async fn only_one_main_session_is_kept() {
+    let state = AppState::new(std::env::temp_dir());
+    let page = Events::default();
+    let mut mains = Vec::new();
+    for _ in 0..2 {
+        let s = state
+            .spawn_session(
+                SessionRole::Main,
+                &fake_exe(),
+                &std::env::temp_dir(),
+                opts(&[]),
+                Some(state.attachment(page.sink())),
+                fast(),
+            )
+            .await
+            .unwrap();
+        mains.push(s);
+    }
+    let imp = state
+        .start_improve_with(
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "améliore",
+            opts(&[]),
+            fast(),
+        )
+        .await
+        .unwrap();
+    let _keep_imp = state.protect(&imp.key);
+    let closed = state.close_other_mains(&mains[1].key).await;
+    assert_eq!(closed, 1);
+    assert!(!alive(mains[0].pid), "ancienne session principale fermée");
+    assert!(alive(mains[1].pid));
+    assert!(alive(imp.pid), "session d'amélioration gardée");
+    let roles: Vec<SessionRole> = {
+        let map = state.sessions.lock().unwrap();
+        let mut r: Vec<_> = map.values().map(|s| s.role).collect();
+        r.sort_by_key(|r| *r == SessionRole::Improve);
+        r
+    };
+    assert_eq!(roles, vec![SessionRole::Main, SessionRole::Improve]);
+    state.stop_all().await;
 }
