@@ -187,7 +187,9 @@ pub struct Pipeline {
     /// absent) : une session qui le modifie fait refuser le cycle.
     config_file: Option<PathBuf>,
     config_digest: Option<Vec<u8>>,
-    /// Programme ssh de l'envoi (`ssh` ; faux ssh dans les tests).
+    /// Programmes de l'envoi, chemins absolus résolus au lancement
+    /// ([`push::resolve_program`]) ; faux ssh dans les tests.
+    git_program: String,
     ssh_program: String,
     /// `~/.ssh/config` lu une seule fois au lancement (clés `IdentityFile`
     /// de l'envoi, [`push::ssh_identities`]).
@@ -204,6 +206,23 @@ fn load_pending(file: &push::PendingFile) -> Vec<push::Pending> {
             tracing::warn!("{} illisible : remis à vide", file.0.display());
             file.write(&[]);
             Vec::new()
+        }
+    }
+}
+
+/// Chemin absolu de `name` dans le `PATH` du lancement (`name.exe` sous
+/// Windows), sinon `name`.
+fn program_at_launch(name: &str) -> String {
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    match push::resolve_program(&file) {
+        Some(p) => p.to_string_lossy().replace('\\', "/"),
+        None => {
+            tracing::warn!("{file} introuvable dans le PATH : envoi par « {name} »");
+            name.to_string()
         }
     }
 }
@@ -244,7 +263,8 @@ impl Pipeline {
             pending: Mutex::new(pending),
             config_file,
             config_digest,
-            ssh_program: "ssh".into(),
+            git_program: program_at_launch("git"),
+            ssh_program: program_at_launch("ssh"),
             ssh_config_text,
         }
     }
@@ -295,6 +315,7 @@ impl Pipeline {
         };
         push::PushEnv {
             dir: self.work_root.join(".push-env"),
+            git_program: self.git_program.clone(),
             ssh_program: self.ssh_program.clone(),
             host,
             identities,

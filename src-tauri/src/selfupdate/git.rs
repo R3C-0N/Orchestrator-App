@@ -157,7 +157,17 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut c = command("git");
+    git_command_with("git", dir, args)
+}
+
+/// [`git_command`] avec un programme git choisi (chemin absolu de l'envoi).
+pub fn git_command_with<P, I, S>(program: P, dir: &Path, args: I) -> Command
+where
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut c = command(program);
     c.arg("-C")
         .arg(dir)
         .args(["-c", "core.quotepath=off"])

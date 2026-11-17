@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::git::{self, git, git_ok, resolve};
+use super::git::{self, git};
 use super::BRANCH_PREFIX;
 
 /// Délai d'une vérification de droit ou d'un envoi.
@@ -129,7 +129,16 @@ pub fn is_sneaky_key(name: &str) -> bool {
 /// Réglages refusés ([`is_sneaky_key`]) dans la configuration locale du
 /// clone, s'il y en a (une ligne `nom=valeur` par réglage).
 pub async fn sneaky_config(clone: &Path) -> Option<String> {
-    let listed = match git(clone, &["config", "--local", "--list", "-z"]).await {
+    sneaky_in(git(clone, &["config", "--local", "--list", "-z"]).await)
+}
+
+/// [`sneaky_config`] lu par la commande de l'envoi ([`PushEnv::git`]).
+pub async fn sneaky_config_env(env: &PushEnv, clone: &Path) -> Option<String> {
+    sneaky_in(env.git(clone, &["config", "--local", "--list", "-z"]).await)
+}
+
+fn sneaky_in(listed: Result<String, String>) -> Option<String> {
+    let listed = match listed {
         Ok(s) => s,
         Err(e) => return Some(format!("configuration illisible : {e}")),
     };
@@ -258,20 +267,28 @@ impl CheckError {
 
 /// Destination et clone acceptables pour un envoi : `url` est le dépôt
 /// `canonical`, l'URL d'origine du clone aussi (une seule valeur), et la
-/// configuration locale du clone n'a aucun réglage refusé.
-pub async fn check_target(clone: &Path, url: &str, canonical: &str) -> Result<(), String> {
+/// configuration locale du clone n'a aucun réglage refusé. Lu par la
+/// commande de l'envoi ([`PushEnv::git`]) : rien d'hérité ne peut faire lire
+/// un autre dépôt (`GIT_DIR`…) ou une autre configuration.
+pub async fn check_target(
+    env: &PushEnv,
+    clone: &Path,
+    url: &str,
+    canonical: &str,
+) -> Result<(), String> {
     if !same_repo(url, canonical) {
         return Err(format!(
             "envoi réservé au dépôt {canonical} ; repo_url = {url} : envoi désactivé \
              (un fork ou un miroir ne reçoit jamais d'envoi)"
         ));
     }
-    let origin = git(
-        clone,
-        &["config", "--local", "--get-all", "remote.origin.url"],
-    )
-    .await
-    .unwrap_or_default();
+    let origin = env
+        .git(
+            clone,
+            &["config", "--local", "--get-all", "remote.origin.url"],
+        )
+        .await
+        .unwrap_or_default();
     let origins: Vec<&str> = origin.lines().map(str::trim).collect();
     if origins.len() != 1 || !same_repo(origins[0], canonical) {
         return Err(format!(
@@ -279,7 +296,7 @@ pub async fn check_target(clone: &Path, url: &str, canonical: &str) -> Result<()
             origins.join(", ")
         ));
     }
-    if let Some(bad) = sneaky_config(clone).await {
+    if let Some(bad) = sneaky_config_env(env, clone).await {
         return Err(format!("réglage git refusé dans le clone : {bad}"));
     }
     Ok(())
@@ -296,12 +313,24 @@ pub async fn check_write_access(
     timeout: Duration,
 ) -> Result<(), CheckError> {
     super::repo::check_url(url).map_err(CheckError::Refused)?;
-    check_target(clone, url, canonical)
+    check_target(env, clone, url, canonical)
         .await
         .map_err(CheckError::Refused)?;
-    let commit = resolve(clone, "refs/heads/main")
+    let commit = env
+        .git(
+            clone,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/main^{commit}",
+            ],
+        )
         .await
+        .ok()
+        .filter(|c| !c.trim().is_empty())
         .ok_or_else(|| CheckError::Unavailable("branche main absente du clone".into()))?;
+    let commit = commit.trim();
     let probe = format!("{commit}:{PROBE_PREFIX}{}", uuid::Uuid::new_v4().simple());
     let mut args: Vec<&str> = PUSH_CONFIG.to_vec();
     args.extend(["push", "--dry-run", "--porcelain", "--", url, &probe]);
@@ -356,16 +385,17 @@ pub async fn push_branch(
         return Err(format!("commit invalide : {commit}"));
     }
     super::repo::check_url(url)?;
-    if !git_ok(clone, &["merge-base", "--is-ancestor", commit, "main"])
+    if env
+        .git(clone, &["merge-base", "--is-ancestor", commit, "main"])
         .await
-        .unwrap_or(false)
+        .is_err()
     {
         return Err(format!(
             "{} n'est pas dans le main du clone : envoi refusé",
             &commit[..10]
         ));
     }
-    check_target(clone, url, canonical).await?;
+    check_target(env, clone, url, canonical).await?;
     let refspec = format!("{commit}:refs/heads/{branch}");
     let mut args: Vec<&str> = PUSH_CONFIG.to_vec();
     args.extend(["push", "--porcelain", "--", url, &refspec]);
@@ -374,10 +404,24 @@ pub async fn push_branch(
         .map_err(|e| summarize(&e))
 }
 
+/// Préfixes de variables héritées retirées de la sonde et de l'envoi.
+pub const PUSH_ENV_REMOVED_PREFIXES: &[&str] = &[
+    "GIT_CONFIG_KEY_",
+    "GIT_CONFIG_VALUE_",
+    "GIT_SSL_",
+    "GIT_TRACE",
+];
+
 /// Variables d'environnement héritées retirées de la sonde et de l'envoi
-/// (en plus de `GIT_CONFIG_KEY_*` et `GIT_CONFIG_VALUE_*`) : configuration
-/// passée par l'environnement, ssh choisi ailleurs, dépôt imposé.
+/// (en plus de [`PUSH_ENV_REMOVED_PREFIXES`]) : configuration passée par
+/// l'environnement, ssh ou programmes git choisis ailleurs, dépôt, objets
+/// ou index imposés.
 pub const PUSH_ENV_REMOVED: &[&str] = &[
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
     "GIT_CONFIG",
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
@@ -407,7 +451,11 @@ pub const PUSH_ENV_REMOVED: &[&str] = &[
 pub struct PushEnv {
     /// Dossier des fichiers vides (`empty.gitconfig`, `empty.ssh_config`).
     pub dir: PathBuf,
-    /// Programme ssh (`ssh` ; un faux ssh dans les tests).
+    /// `git.exe`, chemin absolu résolu une fois au lancement de l'app
+    /// ([`resolve_program`] ; `git` s'il n'a pas été trouvé).
+    pub git_program: String,
+    /// `ssh.exe`, chemin absolu résolu une fois au lancement de l'app (un
+    /// faux ssh dans les tests ; `ssh` s'il n'a pas été trouvé).
     pub ssh_program: String,
     /// Hôte du dépôt canonique (`github.com`).
     pub host: String,
@@ -448,7 +496,9 @@ impl PushEnv {
         if !self.identities.is_empty() {
             opts.push("IdentitiesOnly=yes".into());
             for id in &self.identities {
-                opts.push(format!("IdentityFile={}", slash(id)));
+                // Valeur entre guillemets doubles : OpenSSH coupe sinon un
+                // chemin qui contient une espace (vérifié par `ssh -G`).
+                opts.push(format!("IdentityFile=\"{}\"", slash(id)));
             }
         }
         for o in opts {
@@ -475,13 +525,13 @@ impl PushEnv {
         let safe = format!("safe.directory={}", slash(clone));
         let mut full: Vec<&str> = vec!["-c", &safe];
         full.extend_from_slice(args);
-        let mut c = git::git_command(clone, &full);
+        let mut c = git::git_command_with(&self.git_program, clone, &full);
         for k in PUSH_ENV_REMOVED {
             c.env_remove(k);
         }
         for (k, _) in std::env::vars_os() {
             let k = k.to_string_lossy().to_ascii_uppercase();
-            if k.starts_with("GIT_CONFIG_KEY_") || k.starts_with("GIT_CONFIG_VALUE_") {
+            if PUSH_ENV_REMOVED_PREFIXES.iter().any(|p| k.starts_with(p)) {
                 c.env_remove(&k);
             }
         }
@@ -490,6 +540,31 @@ impl PushEnv {
             .env("GIT_SSH_VARIANT", "ssh")
             .env("GIT_SSH_COMMAND", self.ssh_command(&ssh_config));
         Ok(c)
+    }
+}
+
+/// Chemin absolu de `name` (`git.exe`, `ssh.exe`) dans le `PATH` actuel ;
+/// appelé une fois au lancement de l'app, pour que la sonde et l'envoi ne
+/// dépendent pas d'un `PATH` modifié ensuite.
+pub fn resolve_program(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+impl PushEnv {
+    /// `git -C dir args` local (lecture du clone) par la commande de
+    /// l'envoi ; `Ok(stdout)` si le code de sortie est 0.
+    pub async fn git(&self, dir: &Path, args: &[&str]) -> Result<String, String> {
+        let what = format!("git {}", args.join(" "));
+        let out = git::run(self.command(dir, args)?, git::GIT_TIMEOUT, &what).await?;
+        if out.ok {
+            Ok(out.stdout)
+        } else {
+            Err(format!("{what} : {}", out.tail(6)))
+        }
     }
 }
 
@@ -552,7 +627,7 @@ pub fn ssh_identities(config: &str, host: &str, home: &Path) -> Vec<PathBuf> {
                 } else {
                     v.replace("%d", &home.to_string_lossy())
                 };
-                if v.is_empty() || v.contains('%') || v.contains("${") {
+                if v.is_empty() || v.contains('%') || v.contains("${") || v.contains('"') {
                     continue;
                 }
                 let p = PathBuf::from(v);

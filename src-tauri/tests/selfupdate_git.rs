@@ -2151,6 +2151,7 @@ async fn push_branch_refuses_main_unmerged_and_bad_refspecs() {
     let t = Duration::from_secs(60);
     let env = push::PushEnv {
         dir: root.join("push-env"),
+        git_program: "git".into(),
         ssh_program: fake_ssh_program(&fake_ssh_dir()),
         host: host.clone(),
         identities: Vec::new(),
@@ -2499,7 +2500,9 @@ async fn push_ssh_ignores_user_ssh_config_but_keeps_identity() {
     let root = TempRoot::new("push-b2");
     let host = fake_host("allow", "b2");
     let (cfg, _, _, _) = push_clone(&root, &host).await;
-    let key = root.join("id_test");
+    // Chemin avec une espace (profil « Jean Dupont »).
+    let key = root.join("Jean Dupont").join("id_test");
+    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
     std::fs::write(&key, "clé de test").unwrap();
     let key_s = key.to_string_lossy().replace('\\', "/");
     let ssh_config = format!(
@@ -2536,7 +2539,7 @@ async fn push_ssh_ignores_user_ssh_config_but_keeps_identity() {
         "BatchMode=yes".into(),
         "StrictHostKeyChecking=yes".into(),
         "IdentitiesOnly=yes".into(),
-        format!("IdentityFile={key_s}"),
+        format!("IdentityFile=\"{key_s}\""),
     ] {
         assert!(a.contains(&format!("-o {o}")), "{o} absent de : {a}");
     }
