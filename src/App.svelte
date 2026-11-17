@@ -23,6 +23,7 @@
   import QuestionCard from "./lib/components/QuestionCard.svelte";
   import SessionPicker from "./lib/components/SessionPicker.svelte";
   import StatusLine from "./lib/components/StatusLine.svelte";
+  import VersionNotice from "./lib/components/VersionNotice.svelte";
   import {
     answerQuestion,
     describeError,
@@ -43,6 +44,7 @@
   import { Keys, keyInput, type KeyAction, type Overlay } from "./lib/state/keys.svelte";
   import { SessionStore } from "./lib/state/session.svelte";
   import { resumeSession } from "./lib/state/sessions.svelte";
+  import { VERSION_NOTICE_CODE } from "./lib/state/versionNotice";
 
   // Mode simulé : `?mock=…`, ou d'office hors de Tauri. `mock.ts` n'est
   // chargé qu'à ce moment (import dynamique, hors du bundle principal).
@@ -712,7 +714,11 @@
 
 <main>
   {#each store.banners as b (b.id)}
-    <div class="banner {b.level.toLowerCase()}">{b.message}</div>
+    {#if b.code === VERSION_NOTICE_CODE}
+      <VersionNotice message={b.message} version={store.meta.version} />
+    {:else}
+      <div class="banner {b.level.toLowerCase()}">{b.message}</div>
+    {/if}
   {/each}
   {#if startError}
     <div class="banner error">{startError}</div>

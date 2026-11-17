@@ -4,7 +4,9 @@
 // configuration du scénario est lue dans `window.__cfg` :
 // - `fromArgs`, `launchError` : réponse de `get_launch_info` ;
 // - `failStarts` : nombre de `start_session` qui échouent d'abord (`SpawnFailed`) ;
-// - `historyError` : `load_history` illisible ; `omitted` : lignes omises.
+// - `historyError` : `load_history` illisible ; `omitted` : lignes omises ;
+// - `version` : version de claude.exe annoncée par `init` (2.1.325 par défaut) ;
+//   autre que 2.1.325, la notice `unexpected_version` suit, comme du réducteur.
 // Les commandes reçues sont gardées dans `window.__calls`.
 import { mockIPC } from "@tauri-apps/api/mocks";
 
@@ -14,6 +16,7 @@ type Cfg = {
   failStarts?: number;
   historyError?: boolean;
   omitted?: number;
+  version?: string;
 };
 type Call = { cmd: string; args: unknown };
 type Events = { onmessage: (batch: unknown[]) => void };
@@ -48,15 +51,27 @@ mockIPC((cmd, payload) => {
       if (starts++ < (cfg.failStarts ?? 0)) throw { kind: "spawn_failed", message: "claude.exe absent (simulé)" };
       const events = args.events as Events;
       const key = `k${starts}`;
+      const version = cfg.version ?? "2.1.325";
+      const notice =
+        version === "2.1.325"
+          ? []
+          : [
+              {
+                seq: 2, t: Date.now(), session: key, kind: "notice", level: "Warn", code: "unexpected_version",
+                message: `claude.exe ${version} n'est pas la version testée (2.1.325) ; l'app continue.`,
+                detail: { found: version, expected: "2.1.325" },
+              },
+            ];
       setTimeout(
         () =>
           events.onmessage([
             { seq: 0, t: Date.now(), session: key, kind: "status", state: "Idle" },
             {
-              seq: 1, t: Date.now(), session: key, kind: "init", session_id: "s", version: "2.1.325", model: "claude-haiku-5-5",
+              seq: 1, t: Date.now(), session: key, kind: "init", session_id: "s", version, model: "claude-haiku-5-5",
               permission_mode: "bypassPermissions", capabilities: [], tools: [], mcp_servers: [],
               skills: [`skill-de-${key}`], slash_commands: [],
             },
+            ...notice,
           ]),
         10,
       );
