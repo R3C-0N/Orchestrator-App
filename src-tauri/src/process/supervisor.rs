@@ -694,11 +694,11 @@ impl Session {
         }
         validate_launch_options(&opts).map_err(CoreError::InvalidArgument)?;
         let args = build_args(&opts);
-        let mut spawned =
-            spawn_claude_env(exe, cwd, &args, &opts.env, &opts.env_remove).map_err(|e| {
-                tracing::error!(exe = %exe.display(), "échec du lancement : {e}");
-                CoreError::SpawnFailed(e.to_string())
-            })?;
+        let mut spawned = spawn_claude_env(exe, cwd, &args, &opts.env, opts.env_allow.as_deref())
+            .map_err(|e| {
+            tracing::error!(exe = %exe.display(), "échec du lancement : {e}");
+            CoreError::SpawnFailed(e.to_string())
+        })?;
         tracing::info!(
             session = %key.0,
             pid = spawned.pid,

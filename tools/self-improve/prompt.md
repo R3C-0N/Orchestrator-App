@@ -18,6 +18,7 @@ Tu travailles sur le code source de l'app Orchestrator elle-même, dans un workt
 5. Commite **uniquement les fichiers que tu as touchés**, en les nommant :
    `git commit -m "<message en français>" -- <fichier1> <fichier2>`
    (ou `git commit -F <fichier de message> -- <fichiers>`). Un ou plusieurs commits, tous sur la branche `{{BRANCHE}}`.
+   Si le message contient le mot « push », écris-le dans un fichier et passe-le par `git commit -F <fichier> -- <fichiers>` : certaines commandes git qui contiennent « push » sont refusées. N'utilise pas `git -c` ni `git -C` (les commandes tournent déjà dans le worktree).
 6. Termine avec un arbre propre : `git status --porcelain` ne doit rien afficher. Supprime tes fichiers temporaires, ne laisse rien de non commité.
 
 ## Périmètre

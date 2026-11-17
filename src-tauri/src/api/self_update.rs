@@ -27,7 +27,7 @@ use super::types::{
     CoreError, ImproveStatus, ImproveStep, RepoStatus, SessionKey, UiInfo, UiSource, IMPROVE_EVENT,
 };
 use crate::process::spawn::LaunchOptions;
-use crate::process::supervisor::TurnWait;
+use crate::process::supervisor::{Session, TurnWait};
 use crate::selfupdate::pipeline::{self, NpmToolchain, Toolchain};
 use crate::selfupdate::{
     BoxFut, ImproveOutcome, ImproveRequest, Pipeline, PipelineHost, RepoConfig, SelfUpdate,
@@ -39,20 +39,36 @@ use crate::ui::{UiHost, READY_TIMEOUT};
 pub const IMPROVE_SESSION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Outils refusés à la session d'amélioration (relecture de sécurité de
-/// l'étape 3, puis relecture finale B1) : rien qui pousse ou parle au
-/// réseau (git push sous toutes ses formes écrites, `gh`, `ssh`, `curl`),
-/// change les dépôts distants, la configuration git (`git config`,
-/// `git -c`), les sous-modules, les worktrees ou les références à la main ;
-/// et pas de question (personne ne la verrait). Refus tenus même en
-/// `bypassPermissions`, jokers `*` acceptés par le CLI 2.1.326 (vérifié, test
-/// `improve_live`). Ce filtre porte sur le texte des commandes : il ne voit
-/// pas un `git push` lancé par un autre programme (`cmd /c`, `node -e`) ;
-/// ceux-là échouent sur l'environnement de [`improve_env`].
+/// l'étape 3, puis relectures finales) : `git push` sous ses formes
+/// écrites (`git push`, `git -C … push`, `git --… push`, `git -c`,
+/// `git.exe`), les identifiants (`git credential`, `credential-manager`),
+/// la configuration passée autrement (`git --config-env`,
+/// `GIT_CONFIG_PARAMETERS`, `GIT_ALLOW_PROTOCOL`), `gh`, `ssh`, `curl`, les
+/// dépôts distants, `git config`, les sous-modules, les worktrees, les
+/// références à la main ; et pas de question (personne ne la verrait).
+/// Refus tenus en `bypassPermissions`, jokers `*` acceptés par le CLI
+/// 2.1.326 (vérifié, test `improve_live`). Ce filtre porte sur le texte des
+/// commandes : il ne voit pas un `git push` lancé par un autre programme
+/// (`cmd /c`, `node -e`), qui échoue sur l'environnement de
+/// [`improve_env`]. Ce n'est pas une isolation : la session garde les droits
+/// Windows de l'utilisateur (spec, décision 17).
+///
+/// Formes précises plutôt que `git * push*` : celle-ci refusait aussi
+/// `git commit -m "…push…"` ou `git grep push` (le prompt demande de passer
+/// un tel message par `git commit -F`).
 pub const DISALLOWED_TOOLS: &[&str] = &[
     "Bash(git push:*)",
-    "Bash(git * push*)",
-    "Bash(*git -c*)",
+    "Bash(git push*)",
+    "Bash(git -C * push*)",
+    "Bash(git --* push*)",
+    "Bash(git -c*)",
+    "Bash(*git -c *)",
     "Bash(*git.exe*)",
+    "Bash(git credential*)",
+    "Bash(*credential-manager*)",
+    "Bash(git --config-env*)",
+    "Bash(*GIT_CONFIG_PARAMETERS*)",
+    "Bash(*GIT_ALLOW_PROTOCOL*)",
     "Bash(git remote:*)",
     "Bash(git config:*)",
     "Bash(git submodule:*)",
@@ -70,16 +86,44 @@ pub const DISALLOWED_TOOLS: &[&str] = &[
 /// aussi.
 pub const PUSH_PREFIXES: &[&str] = &["https://", "http://", "ssh://", "git@", "git://", "file://"];
 
-/// Variables héritées de l'app retirées de l'environnement de la session
-/// d'amélioration (jetons, agents et commandes SSH).
-pub const IMPROVE_ENV_REMOVE: &[&str] = &[
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_ENTERPRISE_TOKEN",
-    "GITHUB_ENTERPRISE_TOKEN",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "SSH_AUTH_SOCK",
+/// Liste blanche de l'environnement hérité par la session d'amélioration
+/// (noms sans casse, `*` final = préfixe) : le système, les dossiers de
+/// l'utilisateur et ce dont `claude.exe` a besoin pour joindre l'API. Le
+/// CLI s'authentifie par `%USERPROFILE%\.claude\.credentials.json`
+/// (`USERPROFILE`), ou par une clé `ANTHROPIC_*` ; `CLAUDE_CONFIG_DIR` et
+/// `CLAUDE_CODE_GIT_BASH_PATH` s'ils sont réglés ; mandataire et autorités
+/// de certification pour les réseaux d'entreprise. Rien d'autre : ni jeton
+/// (`GH_TOKEN`…), ni agent SSH, ni variable git de l'utilisateur. La session
+/// principale reçoit tout l'environnement (inchangé).
+pub const IMPROVE_ENV_ALLOW: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "ComSpec",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramFiles*",
+    "ProgramW6432",
+    "CommonProgramFiles*",
+    "CommonProgramW6432",
+    "ProgramData",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_*",
+    "OS",
+    "ANTHROPIC_*",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_GIT_BASH_PATH",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "NODE_EXTRA_CA_CERTS",
 ];
 
 /// Environnement de la session d'amélioration : git sans SSH ni invite ni
@@ -145,7 +189,7 @@ pub fn improve_launch_options(model: Option<String>, global_config: &Path) -> La
         model,
         extra_args,
         env: improve_env(global_config),
-        env_remove: IMPROVE_ENV_REMOVE.iter().map(|k| k.to_string()).collect(),
+        env_allow: Some(IMPROVE_ENV_ALLOW.iter().map(|k| k.to_string()).collect()),
     }
 }
 
@@ -397,7 +441,13 @@ pub struct AppHost<R: Runtime> {
     pub app: AppHandle<R>,
     pub model: Option<String>,
     session: Arc<Mutex<Option<SessionKey>>>,
+    /// Session dédiée du cycle en cours, pour attendre son arrêt effectif
+    /// (`session_stopped`).
+    running: Mutex<Option<Arc<Session>>>,
 }
+
+/// Attente maximale de l'arrêt effectif de la session dédiée.
+pub const IMPROVE_STOP_WAIT: Duration = Duration::from_secs(30);
 
 impl<R: Runtime> AppHost<R> {
     /// Attend le signal « prêt » de `hash` après `activate` : vrai s'il est
@@ -451,6 +501,7 @@ impl<R: Runtime> PipelineHost for AppHost<R> {
                 key: s.key.clone(),
             };
             *self.session.lock().unwrap() = Some(s.key.clone());
+            *self.running.lock().unwrap() = Some(s.clone());
             // Le bandeau voit la session dès maintenant.
             let cur = self
                 .app
@@ -515,6 +566,34 @@ impl<R: Runtime> PipelineHost for AppHost<R> {
             Ok(())
         })
     }
+
+    fn session_stopped(&self) -> BoxFut<'_, ()> {
+        Box::pin(async move {
+            let Some(s) = self.running.lock().unwrap().take() else {
+                return;
+            };
+            // Arrêt demandé ici aussi (sans attendre la tâche de `StopOnDrop`) :
+            // `stop` ferme stdin, attend, puis ferme le Job (arbre tué).
+            if self
+                .app
+                .state::<AppState>()
+                .close_session(&s.key)
+                .await
+                .is_none()
+                && tokio::time::timeout(IMPROVE_STOP_WAIT, s.exited())
+                    .await
+                    .is_err()
+            {
+                tracing::error!(
+                    session = %s.key.0,
+                    "session d'amélioration toujours vivante après {} s : processus tué",
+                    IMPROVE_STOP_WAIT.as_secs()
+                );
+                s.kill();
+                let _ = tokio::time::timeout(IMPROVE_STOP_WAIT, s.exited()).await;
+            }
+        })
+    }
 }
 
 /// Dossier de l'exe (clone en release, décision 16) ; `None` en debug, sinon
@@ -538,6 +617,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
         app: app.clone(),
         model: configured_model(),
         session: session.clone(),
+        running: Mutex::new(None),
     });
     let ui_root = app.state::<UiHost>().root().to_path_buf();
     let data = crate::selfupdate::data_dir().unwrap_or_else(std::env::temp_dir);
@@ -561,6 +641,9 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
     };
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        // Session dédiée interrompue par un arrêt brutal : `.git/config`
+        // rendu inscriptible, verrou retiré (consigné au journal).
+        crate::selfupdate::pipeline::recover_interrupted_session(&config.dir);
         let status = crate::selfupdate::ensure_clone(&config).await;
         match &status {
             RepoStatus::Disabled { reason } => {
@@ -742,9 +825,16 @@ mod tests {
         assert_eq!(o.extra_args[0], "--disallowedTools");
         for t in [
             "Bash(git push:*)",
-            "Bash(git * push*)",
-            "Bash(*git -c*)",
+            "Bash(git push*)",
+            "Bash(git -C * push*)",
+            "Bash(git --* push*)",
+            "Bash(git -c*)",
             "Bash(*git.exe*)",
+            "Bash(git credential*)",
+            "Bash(*credential-manager*)",
+            "Bash(git --config-env*)",
+            "Bash(*GIT_CONFIG_PARAMETERS*)",
+            "Bash(*GIT_ALLOW_PROTOCOL*)",
             "Bash(git remote:*)",
             "Bash(git config:*)",
             "Bash(git submodule:*)",
@@ -757,14 +847,36 @@ mod tests {
         ] {
             assert!(o.extra_args.iter().any(|a| a == t), "{t}");
         }
-        for k in [
+        // La forme large, qui refusait `git commit -m "…push…"`, a disparu.
+        assert!(!o.extra_args.iter().any(|a| a == "Bash(git * push*)"));
+        // Liste blanche : système et authentification de l'API, rien d'autre.
+        let allow = o.env_allow.as_deref().expect("liste blanche");
+        use crate::process::spawn::env_allowed;
+        for ok in [
+            "PATH",
+            "Path",
+            "SystemRoot",
+            "USERPROFILE",
+            "ProgramFiles(x86)",
+            "PROCESSOR_ARCHITECTURE",
+            "ANTHROPIC_API_KEY",
+            "TEMP",
+        ] {
+            assert!(env_allowed(ok, allow), "{ok}");
+        }
+        for no in [
             "GH_TOKEN",
             "GITHUB_TOKEN",
             "GIT_SSH",
-            "SSH_AUTH_SOCK",
             "GIT_SSH_COMMAND",
+            "SSH_AUTH_SOCK",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_ASKPASS",
+            "AWS_SECRET_ACCESS_KEY",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "OSX",
         ] {
-            assert!(o.env_remove.iter().any(|r| r == k), "{k}");
+            assert!(!env_allowed(no, allow), "{no}");
         }
         let env: std::collections::HashMap<_, _> = o.env.iter().cloned().collect();
         assert_eq!(env["GIT_SSH_COMMAND"], "false");

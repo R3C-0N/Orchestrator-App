@@ -56,6 +56,59 @@ pub const SKIP_MARKERS: &[&str] = &[
     "describe.skip",
     "#[ignore]",
 ];
+/// Verrou posé dans le dossier git commun du clone (`.git\improve-active`)
+/// pendant la session dédiée : resté après un arrêt brutal, il signale au
+/// démarrage suivant que `.git/config` est peut-être encore en lecture seule
+/// ([`recover_interrupted_session`]).
+pub const IMPROVE_LOCK: &str = "improve-active";
+
+/// Démarrage : une session dédiée a été interrompue (verrou
+/// [`IMPROVE_LOCK`] resté dans `.git` du clone) ; l'attribut lecture seule
+/// de `.git/config` est retiré, le verrou supprimé, et c'est consigné dans le
+/// journal. Renvoie vrai si un verrou a été trouvé.
+pub fn recover_interrupted_session(clone: &Path) -> bool {
+    let common = clone.join(".git");
+    let lock = common.join(IMPROVE_LOCK);
+    if !lock.is_file() {
+        return false;
+    }
+    let config = common.join("config");
+    if let Ok(m) = std::fs::metadata(&config) {
+        let mut perm = m.permissions();
+        if perm.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(false);
+            if let Err(e) = std::fs::set_permissions(&config, perm) {
+                tracing::error!("{} : lecture seule non retirée : {e}", config.display());
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&lock);
+    tracing::warn!(
+        "session d'amélioration interrompue (arrêt brutal) : verrou {} retiré, \
+         .git/config rendu inscriptible",
+        lock.display()
+    );
+    true
+}
+
+/// Verrou [`IMPROVE_LOCK`], supprimé à la destruction.
+struct ActiveLock(PathBuf);
+
+impl ActiveLock {
+    fn create(common: &Path) -> std::io::Result<ActiveLock> {
+        let p = common.join(IMPROVE_LOCK);
+        std::fs::write(&p, format!("{}\n", std::process::id()))?;
+        Ok(ActiveLock(p))
+    }
+}
+
+impl Drop for ActiveLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Dossier (sous `work_root`) des worktrees jetables des tests.
 pub const TESTS_DIR: &str = ".tests";
 
@@ -776,11 +829,19 @@ impl Pipeline {
             let prompt = build_prompt(&wt, req);
             // `.git/config` en lecture seule pendant la session (rétabli à la
             // destruction de la garde, erreur ou annulation comprises).
+            // Verrou posé avant : un arrêt brutal pendant la session laisse
+            // de quoi rétablir l'attribut au démarrage suivant.
+            let lock = ActiveLock::create(&common)
+                .map_err(|e| Stop::Failed(S::Working, format!("verrou {IMPROVE_LOCK} : {e}")))?;
             let ro = ReadOnly::set(&common.join("config")).map_err(|e| {
                 Stop::Failed(S::Working, format!(".git/config en lecture seule : {e}"))
             })?;
             let done = guarded(cancel, self.host.run_session(req, &wt, &prompt)).await;
+            // Arrêt effectif de la session (fin ou annulation) avant de
+            // rendre `.git/config` inscriptible et avant les contrôles.
+            self.host.session_stopped().await;
             drop(ro);
+            drop(lock);
             done?.map_err(|e| Stop::Failed(S::Working, e.to_string()))?;
         }
 

@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use orchestrator_lib::api::types::{CoreError, ImproveStatus, ImproveStep, RepoStatus};
-use orchestrator_lib::selfupdate::pipeline::{NpmToolchain, Toolchain};
+use orchestrator_lib::selfupdate::pipeline::{
+    recover_interrupted_session, NpmToolchain, Toolchain, IMPROVE_LOCK,
+};
 use orchestrator_lib::selfupdate::repo::{
     check_url, ensure_clone_with, load_from, CloneOptions, ToolCheck, NO_PUSH_URL,
 };
@@ -175,6 +177,10 @@ struct FakeHost {
     prompts: Mutex<Vec<String>>,
     /// `node_modules` du worktree était une jonction pendant la session.
     junction_seen: Mutex<Option<bool>>,
+    /// `.git` du clone observé par `session_stopped` : (config en lecture
+    /// seule, verrou `improve-active` présent) à ce moment.
+    watch_git: Option<PathBuf>,
+    stopped_seen: Mutex<Option<(bool, bool)>>,
 }
 
 impl PipelineHost for FakeHost {
@@ -238,6 +244,18 @@ impl PipelineHost for FakeHost {
         Box::pin(async move {
             self.rollbacks.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        })
+    }
+
+    fn session_stopped(&self) -> BoxFut<'_, ()> {
+        Box::pin(async move {
+            if let Some(git) = &self.watch_git {
+                let ro = std::fs::metadata(git.join("config"))
+                    .map(|m| m.permissions().readonly())
+                    .unwrap_or(false);
+                let lock = git.join(IMPROVE_LOCK).is_file();
+                *self.stopped_seen.lock().unwrap() = Some((ro, lock));
+            }
         })
     }
 }
@@ -1412,5 +1430,62 @@ async fn git_config_changed_then_restored_is_refused() {
     assert!(
         !std::fs::metadata(&config).unwrap().permissions().readonly(),
         "attribut rétabli après la session"
+    );
+}
+
+/// Relecture finale : verrou `improve-active` pendant la session, retiré
+/// après ; `session_stopped` appelé avant de rendre `.git/config`
+/// inscriptible ; au démarrage, un verrou resté (arrêt brutal) fait retirer
+/// la lecture seule.
+#[tokio::test]
+async fn improve_lock_during_session_and_recovery_after_crash() {
+    let root = TempRoot::new("improve-lock");
+    let (cfg, _, _) = ready_clone(&root).await;
+    let git_dir = cfg.dir.join(".git");
+    let seen_lock = Arc::new(Mutex::new(None));
+    let seen = seen_lock.clone();
+    let lock_path = git_dir.join(IMPROVE_LOCK);
+    let host = Arc::new(FakeHost {
+        commits: vec![commit_src(vec![("src/a.txt", "a\n")], "a")],
+        extra: Some(Box::new(move |_wt| {
+            *seen.lock().unwrap() = Some(lock_path.is_file());
+        })),
+        switch_ok: true,
+        watch_git: Some(git_dir.clone()),
+        ..Default::default()
+    });
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        host.clone(),
+        Arc::new(FakeToolchain::new()),
+    );
+    let (out, _) = run(&p, "verrou").await;
+    assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
+    assert_eq!(
+        *seen_lock.lock().unwrap(),
+        Some(true),
+        "verrou pendant la session"
+    );
+    assert_eq!(
+        *host.stopped_seen.lock().unwrap(),
+        Some((true, true)),
+        "session_stopped avant la levée de la lecture seule et du verrou"
+    );
+    assert!(!git_dir.join(IMPROVE_LOCK).exists(), "verrou retiré");
+    let config = git_dir.join("config");
+    assert!(!std::fs::metadata(&config).unwrap().permissions().readonly());
+
+    // Arrêt brutal simulé : verrou resté, config en lecture seule.
+    std::fs::write(git_dir.join(IMPROVE_LOCK), "1\n").unwrap();
+    let mut perm = std::fs::metadata(&config).unwrap().permissions();
+    perm.set_readonly(true);
+    std::fs::set_permissions(&config, perm).unwrap();
+    assert!(recover_interrupted_session(&cfg.dir));
+    assert!(!git_dir.join(IMPROVE_LOCK).exists());
+    assert!(!std::fs::metadata(&config).unwrap().permissions().readonly());
+    assert!(
+        !recover_interrupted_session(&cfg.dir),
+        "rien à faire ensuite"
     );
 }

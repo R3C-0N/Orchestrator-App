@@ -139,6 +139,14 @@ pub trait PipelineHost: Send + Sync {
     fn wait_idle(&self) -> BoxFut<'_, Result<(), CoreError>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Attend l'arrêt effectif de la session dédiée (processus terminé, Job
+    /// fermé), après [`PipelineHost::run_session`], qu'il ait abouti ou été
+    /// abandonné (annulation) ; appelé avant de rendre `.git/config`
+    /// inscriptible et avant les contrôles. Par défaut : immédiat.
+    fn session_stopped(&self) -> BoxFut<'_, ()> {
+        Box::pin(async {})
+    }
 }
 
 /// Cycle d'amélioration sur un clone. Un seul cycle à la fois.

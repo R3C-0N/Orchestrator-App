@@ -37,9 +37,23 @@ pub struct LaunchOptions {
     /// Variables d'environnement ajoutées à celles de l'app (session
     /// d'amélioration : git sans réseau, sans hooks, sans invite).
     pub env: Vec<(String, String)>,
-    /// Variables d'environnement de l'app **retirées** de celles du
-    /// processus (session d'amélioration : jetons et agents SSH hérités).
-    pub env_remove: Vec<String>,
+    /// Liste blanche de l'environnement hérité (session d'amélioration) :
+    /// `Some` → le processus ne reçoit de l'app que les variables dont le
+    /// nom (sans casse) est dans la liste, ou commence par le préfixe d'une
+    /// entrée finie par `*` ; puis `env`. `None` : tout l'environnement.
+    pub env_allow: Option<Vec<String>>,
+}
+
+/// Le nom `name` passe la liste blanche `allow` (sans casse ; `PREFIXE*`).
+pub fn env_allowed(name: &str, allow: &[String]) -> bool {
+    let n = name.to_ascii_uppercase();
+    allow.iter().any(|a| {
+        let a = a.to_ascii_uppercase();
+        match a.strip_suffix('*') {
+            Some(prefix) => n.starts_with(prefix),
+            None => n == a,
+        }
+    })
 }
 
 /// Valide les valeurs venues de l'interface avant de les passer en arguments :
@@ -87,22 +101,28 @@ pub struct Spawned {
 }
 
 pub fn spawn_claude(exe: &Path, cwd: &Path, args: &[String]) -> std::io::Result<Spawned> {
-    spawn_claude_env(exe, cwd, args, &[], &[])
+    spawn_claude_env(exe, cwd, args, &[], None)
 }
 
 /// [`spawn_claude`] avec des variables d'environnement en plus (`env`) et en
-/// moins (`env_remove`, appliqué avant `env`).
+/// liste blanche de l'environnement hérité (`env_allow`, appliquée avant
+/// `env`).
 pub fn spawn_claude_env(
     exe: &Path,
     cwd: &Path,
     args: &[String],
     env: &[(String, String)],
-    env_remove: &[String],
+    env_allow: Option<&[String]>,
 ) -> std::io::Result<Spawned> {
     let job = Job::new()?;
     let mut cmd = Command::new(exe);
-    for k in env_remove {
-        cmd.env_remove(k);
+    if let Some(allow) = env_allow {
+        cmd.env_clear();
+        for (k, v) in std::env::vars_os() {
+            if env_allowed(&k.to_string_lossy(), allow) {
+                cmd.env(k, v);
+            }
+        }
     }
     cmd.args(args)
         .envs(env.iter().map(|(k, v)| (k, v)))
