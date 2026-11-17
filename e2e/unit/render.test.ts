@@ -451,6 +451,10 @@ describe("libellés", () => {
     // Sans zéro initial (« done 8:08 », capture w1) ; l'horodatage de la vue détaillée garde le sien.
     const m = new Date(2026, 10, 17, 8, 8).getTime();
     expect([hhmm(m), clock12(m)]).toEqual(["8:08", "08:08 AM"]);
+    // Midi et minuit : format 24 h sans zéro de tête. Midi suit les captures (« done 12:20 », 02) ;
+    // minuit (« 0:05 ») n'a pas été vérifié contre le vrai TUI.
+    expect(hhmm(new Date(2026, 10, 17, 12, 5).getTime())).toBe("12:05");
+    expect(hhmm(new Date(2026, 10, 17, 0, 5).getTime())).toBe("0:05");
     expect(clock12(t)).toBe("01:13 PM");
   });
 });

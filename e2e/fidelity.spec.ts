@@ -8,7 +8,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { expect, test, type Page } from "@playwright/test";
-import { scenarios, type Scenario } from "./scenarios";
+import { scenarios, writeHostile, type Scenario } from "./scenarios";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const REF_DIR = `${ROOT}.claude-work/j1/captures`;
@@ -41,7 +41,7 @@ const EXPECT: Record<string, string[]> = {
     "12:29 PM claude-haiku-5-5",
   ],
   k1: ["Running ping for 90 requests to localhost ·", "$ ping -n 90 127.0.0.1", "tokens · thought for 1s)"],
-  w1: ["Write(liste.txt)", "Wrote 12 lines to liste.txt", "1 alpha", "10 kappa", "… +2 lines", "ok", "for 15s · done 8:08"],
+  w1: ["Write(liste.txt)", "Wrote 12 lines to liste.txt", "1 alpha", "10 kappa", "… +2 lines", "● ok", "for 15s · done 8:08"],
   w1b: [
     "Write(C:\\projets\\demo\\write\\liste.txt)",
     "Wrote 12 lines to C:\\projets\\demo\\write\\liste.txt",
@@ -109,6 +109,12 @@ const STYLE: Record<string, (page: Page) => Promise<void>> = {
     expect(await css(page, ".rc .ln", "color")).toBe("rgb(102, 102, 102)");
     expect(await css(page, ".rc.x:not(.dim)", "color")).toBe("rgb(204, 204, 204)");
     expect(await css(page, ".rc.x.dim", "color")).toBe("rgb(153, 153, 153)");
+    // Libellé « Write(liste.txt) » : « Write » en gras blanc vif, chemin souligné en pointillé.
+    const title = page.locator(".l .x .b", { hasText: "Write" }).first();
+    expect(await title.evaluate((el) => getComputedStyle(el).fontWeight)).toBe("700");
+    expect(await title.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(242, 242, 242)");
+    const argLink = page.locator(".l .x .link", { hasText: "liste.txt" }).first();
+    expect(await argLink.evaluate((el) => getComputedStyle(el).textDecorationStyle)).toBe("dotted");
   },
   "09b": async (page) => {
     expect(await css(page, ".g.err", "color")).toBe("rgb(255, 107, 128)");
@@ -162,13 +168,26 @@ for (const sc of scenarios()) {
     const side = await browser.newPage({ viewport: { width: 2300, height: 900 } });
     await side.setContent(`<!doctype html><html><body style="margin:0;background:#202020;color:#ddd;font:14px sans-serif">
       <div style="display:flex;gap:16px;padding:8px">
-        <figure style="margin:0"><figcaption>Référence TUI 2.1.325 : ${sc.ref}.png</figcaption><img src="${dataUrl(ref)}"></figure>
+        <figure style="margin:0"><figcaption>Référence TUI ${sc.cli ?? "2.1.325"} : ${sc.ref}.png</figcaption><img src="${dataUrl(ref)}"></figure>
         <figure style="margin:0"><figcaption>App (mode simulé) : ${sc.id}${sc.verbose ? " (Ctrl+O)" : ""}</figcaption><img src="${dataUrl(app)}"></figure>
       </div></body></html>`);
     await side.screenshot({ path: `${OUT_DIR}/${sc.id}-comparaison.png`, fullPage: true });
     await side.close();
   });
 }
+
+test("Write : chemin et contenu hostiles restent du texte (libellé et {@html})", async ({ page }) => {
+  await page.setViewportSize({ width: 1136, height: 813 });
+  await play(page, writeHostile());
+  const conv = page.locator(".conversation");
+  await expect(conv.locator("img")).toHaveCount(0);
+  await expect(conv.locator("script")).toHaveCount(0);
+  const text = (await conv.innerText()).replace(/\s+/g, " ");
+  expect(text).toContain("Write(<img src=x onerror=alert(1)> & co.txt)");
+  expect(text).toContain("Wrote 2 lines to <img src=x onerror=alert(1)> & co.txt");
+  expect(text).toContain("1 a < b && c > d");
+  expect(text).toContain("2 <script>alert(2)</script>");
+});
 
 test("Ctrl+O bascule et revient sans perdre la ligne lue", async ({ page }) => {
   await page.setViewportSize({ width: 1136, height: 813 });

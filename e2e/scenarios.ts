@@ -19,6 +19,8 @@ export type Scenario = {
   relative?: boolean;
   /** Attente avant la capture (durées vivantes). */
   settleMs?: number;
+  /** Version du CLI de la capture de référence, si ce n'est pas 2.1.325 (J1). */
+  cli?: string;
 };
 
 const SANDBOX = "C:\\projets\\demo";
@@ -433,7 +435,30 @@ function sW1(verbose: boolean): Scenario {
     .setTime(at(8, 8, 0))
     .text("ok")
     .turn(15000, at(8, 8, 1));
-  return { id: verbose ? "w1b" : "w1", ref: verbose ? "w1b-write-detail-ctrl-o" : "w1-write-normal", verbose, steps: b.steps };
+  return {
+    id: verbose ? "w1b" : "w1",
+    ref: verbose ? "w1b-write-detail-ctrl-o" : "w1-write-normal",
+    verbose,
+    steps: b.steps,
+    cli: "2.1.326",
+  };
+}
+
+/** Write au chemin et au contenu hostiles (échappement, hors des captures). */
+export function writeHostile(): Scenario {
+  const cwd = `${SANDBOX}\\write`;
+  const path = `${cwd}\\<img src=x onerror=alert(1)> & co.txt`;
+  const content = "a < b && c > d\n<script>alert(2)</script>\n";
+  const b = new Builder(at(8, 8, 0) - 5000)
+    .boot(cwd)
+    .user("Write hostile")
+    .tool(
+      "Write",
+      { file_path: path, content },
+      { text: "ok", meta: { type: "create", filePath: path, content, structuredPatch: [], originalFile: null } },
+    )
+    .turn(5000, at(8, 8, 0));
+  return { id: "write-hostile", ref: "", verbose: false, steps: b.steps };
 }
 
 export function scenarios(): Scenario[] {
