@@ -44,7 +44,7 @@
   import { Keys, keyInput, type KeyAction, type Overlay } from "./lib/state/keys.svelte";
   import { SessionStore } from "./lib/state/session.svelte";
   import { resumeSession } from "./lib/state/sessions.svelte";
-  import { VERSION_NOTICE_CODE } from "./lib/state/versionNotice";
+  import { VERSION_NOTICE_CODE, noticeVersion } from "./lib/state/versionNotice";
 
   // Mode simulé : `?mock=…`, ou d'office hors de Tauri. `mock.ts` n'est
   // chargé qu'à ce moment (import dynamique, hors du bundle principal).
@@ -715,7 +715,11 @@
 <main>
   {#each store.banners as b (b.id)}
     {#if b.code === VERSION_NOTICE_CODE}
-      <VersionNotice message={b.message} version={store.meta.version} />
+      <VersionNotice
+        message={b.message}
+        version={noticeVersion(b.detail) ?? store.meta.version}
+        onclose={() => prompt?.focus()}
+      />
     {:else}
       <div class="banner {b.level.toLowerCase()}">{b.message}</div>
     {/if}

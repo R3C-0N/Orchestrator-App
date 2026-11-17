@@ -1,7 +1,14 @@
 // Avertissement « version non testée » : masqué pour la version fermée,
 // affiché pour toute autre, et affiché sans erreur si le stockage manque.
 import { describe, expect, it } from "vitest";
-import { DISMISSED_KEY, dismissVersionNotice, isVersionNoticeDismissed } from "../../src/lib/state/versionNotice";
+import { EventFactory } from "../../src/lib/core/mock";
+import { SessionStore } from "../../src/lib/state/session.svelte";
+import {
+  DISMISSED_KEY,
+  dismissVersionNotice,
+  isVersionNoticeDismissed,
+  noticeVersion,
+} from "../../src/lib/state/versionNotice";
 
 function memory(): Pick<Storage, "getItem" | "setItem"> & { data: Map<string, string> } {
   const data = new Map<string, string>();
@@ -69,5 +76,32 @@ describe("versionNotice", () => {
       if (before) Object.defineProperty(globalThis, "localStorage", before);
       else delete (globalThis as { localStorage?: unknown }).localStorage;
     }
+  });
+
+  it("version lue dans detail.found de la notice", () => {
+    expect(noticeVersion({ found: "2.1.326", expected: "2.1.325" })).toBe("2.1.326");
+    expect(noticeVersion(null)).toBeNull();
+    expect(noticeVersion({ found: 3 })).toBeNull();
+    expect(noticeVersion({ found: "" })).toBeNull();
+    expect(noticeVersion("2.1.326")).toBeNull();
+  });
+
+  it("le bandeau garde detail : la version est connue avant ready/init (ordre du cœur)", () => {
+    const f = new EventFactory();
+    const s = new SessionStore(() => {
+      throw new Error("planificateur non attendu");
+    });
+    s.apply([
+      f.make({
+        kind: "notice",
+        level: "Warn",
+        code: "unexpected_version",
+        message: "v",
+        detail: { found: "2.1.326", expected: "2.1.325" },
+      }),
+    ]);
+    expect(s.meta.version).toBeNull();
+    expect(s.banners).toHaveLength(1);
+    expect(noticeVersion(s.banners[0].detail)).toBe("2.1.326");
   });
 });

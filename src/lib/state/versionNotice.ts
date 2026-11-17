@@ -11,6 +11,18 @@ export const DISMISSED_KEY = "orchestrator.versionNotice.dismissed";
 
 type Store = Pick<Storage, "getItem" | "setItem">;
 
+/**
+ * Version trouvée, lue dans `detail.found` de la notice : le cœur l'émet
+ * avant `ready`/`init`, donc avant que `meta.version` ne soit connu.
+ */
+export function noticeVersion(detail: unknown): string | null {
+  if (detail && typeof detail === "object" && "found" in detail) {
+    const found = (detail as { found: unknown }).found;
+    if (typeof found === "string" && found) return found;
+  }
+  return null;
+}
+
 /** `localStorage` s'il est accessible (son simple accès peut lever). */
 function defaultStorage(): Store | null {
   try {

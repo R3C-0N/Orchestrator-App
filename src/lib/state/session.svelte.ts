@@ -82,7 +82,7 @@ export type Row =
   | PlainTextRow;
 
 /** `id` : unique dans la session (clé d'affichage), `seq` : événement source ou -1. */
-export type Notice = { id: number; level: NoticeLevel; code: string; message: string; seq: number };
+export type Notice = { id: number; level: NoticeLevel; code: string; message: string; seq: number; detail?: unknown };
 export type Question = {
   requestId: string;
   toolUseId: string | null;
@@ -268,8 +268,8 @@ export class SessionStore {
   }
 
   /** Bandeau en tête de la conversation (erreur locale de l'interface, par exemple). */
-  addBanner(level: NoticeLevel, code: string, message: string, seq = -1): void {
-    this.banners.push({ id: this.#noticeId++, level, code, message, seq });
+  addBanner(level: NoticeLevel, code: string, message: string, seq = -1, detail: unknown = null): void {
+    this.banners.push({ id: this.#noticeId++, level, code, message, seq, detail });
   }
 
   /** Nombre d'événements en attente de la prochaine image. */
@@ -532,7 +532,7 @@ export class SessionStore {
       case "notice": {
         if (ev.level === "Info") {
           this.infos.push({ id: this.#noticeId++, level: ev.level, code: ev.code, message: ev.message, seq: ev.seq });
-        } else this.addBanner(ev.level, ev.code, ev.message, ev.seq);
+        } else this.addBanner(ev.level, ev.code, ev.message, ev.seq, ev.detail);
         break;
       }
       case "rate_limit":

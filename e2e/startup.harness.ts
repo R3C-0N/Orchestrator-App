@@ -6,7 +6,8 @@
 // - `failStarts` : nombre de `start_session` qui échouent d'abord (`SpawnFailed`) ;
 // - `historyError` : `load_history` illisible ; `omitted` : lignes omises ;
 // - `version` : version de claude.exe annoncée par `init` (2.1.325 par défaut) ;
-//   autre que 2.1.325, la notice `unexpected_version` suit, comme du réducteur.
+//   autre que 2.1.325, la notice `unexpected_version` est émise AVANT `ready`
+//   et `init`, dans l'ordre du réducteur Rust (`check_version`).
 // Les commandes reçues sont gardées dans `window.__calls`.
 import { mockIPC } from "@tauri-apps/api/mocks";
 
@@ -57,7 +58,7 @@ mockIPC((cmd, payload) => {
           ? []
           : [
               {
-                seq: 2, t: Date.now(), session: key, kind: "notice", level: "Warn", code: "unexpected_version",
+                seq: 1, t: Date.now(), session: key, kind: "notice", level: "Warn", code: "unexpected_version",
                 message: `claude.exe ${version} n'est pas la version testée (2.1.325) ; l'app continue.`,
                 detail: { found: version, expected: "2.1.325" },
               },
@@ -66,12 +67,16 @@ mockIPC((cmd, payload) => {
         () =>
           events.onmessage([
             { seq: 0, t: Date.now(), session: key, kind: "status", state: "Idle" },
+            ...notice,
             {
-              seq: 1, t: Date.now(), session: key, kind: "init", session_id: "s", version, model: "claude-haiku-5-5",
+              seq: 2, t: Date.now(), session: key, kind: "ready", version, capabilities: [], commands: [],
+              agents: [], models: [], permission_mode: "bypassPermissions",
+            },
+            {
+              seq: 3, t: Date.now(), session: key, kind: "init", session_id: "s", version, model: "claude-haiku-5-5",
               permission_mode: "bypassPermissions", capabilities: [], tools: [], mcp_servers: [],
               skills: [`skill-de-${key}`], slash_commands: [],
             },
-            ...notice,
           ]),
         10,
       );

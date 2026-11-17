@@ -81,3 +81,49 @@ test("croix atteinte au clavier par Maj+Tab depuis la saisie", async ({ page }) 
   for (let i = 0; i < 20 && !(await focused()); i++) await page.keyboard.press("Shift+Tab");
   await expect(close).toBeFocused();
 });
+
+test("modificateurs : Entrée et Espace avec Ctrl, Maj ou Alt ne ferment pas", async ({ page }) => {
+  await open(page, "2.1.326");
+  const close = page.getByTestId(CLOSE);
+  for (const k of ["Control+Enter", "Shift+Enter", "Alt+Enter", "Control+Space", "Shift+Space"]) {
+    await close.focus();
+    await page.keyboard.press(k);
+    await expect(page.getByTestId(NOTICE), k).toBeVisible();
+  }
+  expect(await stored(page)).toBeNull();
+});
+
+for (const how of ["clic", "Entrée"]) {
+  test(`après fermeture (${how}), le focus revient à la saisie`, async ({ page }) => {
+    await open(page, "2.1.326");
+    const close = page.getByTestId(CLOSE);
+    if (how === "clic") await close.click();
+    else {
+      await close.focus();
+      await page.keyboard.press("Enter");
+    }
+    await expect(page.getByTestId(NOTICE)).toHaveCount(0);
+    await expect(page.locator(PROMPT)).toBeFocused();
+  });
+}
+
+test("bandeau déjà fermé : jamais affiché au relancement, pas même une image", async ({ page }) => {
+  // Relevé de toute apparition dans le DOM, posé avant le chargement de l'app
+  // (vaut pour chaque navigation de la page).
+  await page.addInitScript(() => {
+    const w = window as unknown as { __seen: number };
+    w.__seen = 0;
+    new MutationObserver(() => {
+      if (document.querySelector('[data-testid="version-notice"]')) w.__seen++;
+    }).observe(document, { childList: true, subtree: true });
+  });
+  const seen = () => page.evaluate(() => (window as unknown as { __seen: number }).__seen);
+  // Témoin : non fermé, le relevé voit bien le bandeau.
+  await open(page, "2.1.326");
+  expect(await seen()).toBeGreaterThan(0);
+  await page.getByTestId(CLOSE).click();
+  await page.reload();
+  await ready(page);
+  expect(await seen()).toBe(0);
+  await expect(page.locator(".banner")).toHaveCount(0);
+});

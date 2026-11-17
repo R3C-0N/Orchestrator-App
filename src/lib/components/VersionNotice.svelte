@@ -5,7 +5,11 @@
   // au prochain changement de version (spec, décision 12).
   import { dismissVersionNotice, isVersionNoticeDismissed } from "../state/versionNotice";
 
-  let { message, version }: { message: string; version: string | null } = $props();
+  let {
+    message,
+    version,
+    onclose,
+  }: { message: string; version: string | null; onclose?: () => void } = $props();
 
   /** Version fermée pendant cette exécution (vaut même si le stockage échoue). */
   let closed: string | null = $state(null);
@@ -14,12 +18,21 @@
   function close(): void {
     dismissVersionNotice(version);
     closed = version;
+    // Le bouton disparaît : le focus revient à la saisie.
+    onclose?.();
   }
 
   function onkeydown(e: KeyboardEvent): void {
     // Entrée et Espace ferment ici : le gestionnaire global renverrait
     // l'Espace vers la saisie avant que le bouton ne le reçoive.
     if (e.key !== "Enter" && e.key !== " ") return;
+    // Avec un modificateur, la touche est ignorée : pas de fermeture, ni par
+    // l'activation native du bouton (Maj+Entrée le cliquerait) ; elle
+    // continue vers les raccourcis globaux.
+    if (e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) {
+      e.preventDefault();
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     close();
