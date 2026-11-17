@@ -510,7 +510,8 @@ Le prototype 1 est terminé et la recette J12 est faite (`docs/recette-prototype
 - **Serveur Vite resté ouvert sur le port 1430** : à fermer.
 - **Décisions à valider** : spec section 8.
 - **J14, auto-amélioration** : fait (section 2, `docs/recette-prototype-1.md` section J14). Restent :
-  - **Reprise au lancement suivant** après une « relance requise » (`%LOCALAPPDATA%\orchestrator\resume.json` écrit à la sortie, critère 5 de J14) : non faite.
+  - **Reprise au lancement suivant** après une « relance requise » (`%LOCALAPPDATA%\orchestrator\resume.json` écrit à la sortie, critère 5 de J14) : non faite, reportée à J15 (spec, décision 18).
+  - **Push depuis la session d'amélioration** (relecture finale B1) : filtre élargi et environnement isolé (spec, décision 17) ; reste hors portée une commande qui défait elle-même son environnement. Parade complète possible : session dans un clone jetable sans remote, branche rapatriée par `git fetch`.
   - **Premier clone depuis GitHub** : le clonage SSH fonctionne (≈ 10 s), mais le commit de compilation doit être sur `origin` ; tant que les commits du dépôt de développement ne sont pas poussés, `/ameliorer` est grisé avec la raison « commit de compilation … introuvable ». La recette a utilisé un clone local (`config.json`, `repo_url` = `file:///` du dépôt de développement).
   - **Changement Rust → relance requise** et **8 cycles → au plus 7 dossiers** : couverts par les tests (`selfupdate_git`, `ui_host`), pas mesurés sur l'exe (un `cargo test` complet dans le clone demande plusieurs Go et plusieurs minutes).
   - Transcripts laissés par la recette dans `~/.claude/projects` : dossier encodé de `.claude-work/j14/sandbox` (session principale) et ceux des worktrees `%LOCALAPPDATA%\orchestrator\work\auto\…` (sessions d'amélioration), à supprimer à la main.
