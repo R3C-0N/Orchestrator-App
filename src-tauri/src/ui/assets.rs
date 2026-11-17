@@ -5,24 +5,46 @@
 //! le remplace par `index.html` de la même version).
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use tauri::utils::assets::{AssetKey, AssetsIter, CspHash};
+#[cfg(not(dev))]
+use tauri::Manager;
 use tauri::{App, Assets, Runtime};
 
 use super::store::{clean_path, read_inside, sha256, Version};
-use super::Inner;
+use super::watchdog::Mode;
+#[cfg(not(dev))]
+use super::ActiveUi;
+use super::{Inner, OnFallback, STARTUP_TIMEOUT};
 
 /// Lit `key` (une `AssetKey`, `/` initial facultatif) dans la version
 /// `v` : chemin propre ([`clean_path`]), présent dans le manifeste, lu sans
 /// suivre de lien sous le dossier de la version, empreinte identique à
-/// celle du manifeste. Sinon `None`.
+/// celle du manifeste. Sinon `None`, avec un avertissement au journal.
 pub fn read_version_file(v: &Version, key: &str) -> Option<Vec<u8>> {
-    let parts = clean_path(key)?;
+    let Some(parts) = clean_path(key) else {
+        tracing::warn!("interface {} : chemin refusé {key:?}", v.hash);
+        return None;
+    };
     let rel = parts.join("/");
-    let want = v.files.get(&rel)?;
-    let bytes = read_inside(&v.dir, &parts)?;
-    (sha256(&bytes) == *want).then_some(bytes)
+    let Some(want) = v.files.get(&rel) else {
+        tracing::warn!("interface {} : {rel} absent du manifeste", v.hash);
+        return None;
+    };
+    let Some(bytes) = read_inside(&v.dir, &parts) else {
+        tracing::warn!("interface {} : {rel} illisible (absent ou lien)", v.hash);
+        return None;
+    };
+    if sha256(&bytes) != *want {
+        tracing::warn!(
+            "interface {} : {rel} modifié depuis l'installation (empreinte différente)",
+            v.hash
+        );
+        return None;
+    }
+    Some(bytes)
 }
 
 /// Assets embarqués vides : bouche-trou le temps de sortir les vrais
@@ -43,28 +65,72 @@ impl<R: Runtime> Assets<R> for NoAssets {
 
 /// Fournisseur installé par `Context::set_assets`.
 pub struct DiskAssets<R: Runtime> {
-    pub(crate) inner: Arc<Inner>,
-    pub(crate) embedded: Box<dyn Assets<R>>,
+    inner: Arc<Inner>,
+    embedded: Box<dyn Assets<R>>,
+    /// Rechargement des webviews, posé par `setup` (ou par les tests) :
+    /// sans lui, le watchdog de démarrage n'est pas armé.
+    reload: OnceLock<OnFallback>,
+    /// Watchdog de démarrage déjà armé (premier `index.html`).
+    startup_armed: AtomicBool,
+}
+
+impl<R: Runtime> DiskAssets<R> {
+    pub(crate) fn new(
+        inner: Arc<Inner>,
+        embedded: Box<dyn Assets<R>>,
+        reload: Option<OnFallback>,
+    ) -> Self {
+        let cell = OnceLock::new();
+        if let Some(r) = reload {
+            let _ = cell.set(r);
+        }
+        DiskAssets {
+            inner,
+            embedded,
+            reload: cell,
+            startup_armed: AtomicBool::new(false),
+        }
+    }
+
+    /// Premier chargement de page (`index.html`) : watchdog de démarrage
+    /// armé pour la version servie (rien pour l'embarquée).
+    fn arm_startup_once(&self) {
+        let Some(reload) = self.reload.get() else {
+            return;
+        };
+        if self.startup_armed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        super::arm(
+            self.inner.clone(),
+            self.inner.active().hash,
+            STARTUP_TIMEOUT,
+            Mode::Startup,
+            reload.clone(),
+        );
+    }
 }
 
 impl<R: Runtime> Assets<R> for DiskAssets<R> {
-    /// Démarrage de l'app : watchdog armé si une version disque est active
-    /// (pas en `tauri dev`, où l'interface vient du serveur Vite).
+    /// Démarrage : retient de quoi recharger les webviews. Hors `tauri
+    /// dev` seulement (l'interface vient alors de Vite ; et les binaires de
+    /// test n'instancient pas ainsi le code de la webview, dont l'import de
+    /// `comctl32` v6 les empêcherait de démarrer).
     fn setup(&self, app: &App<R>) {
         self.embedded.setup(app);
         #[cfg(not(dev))]
         {
-            let hash = self.inner.active().hash;
-            super::arm_with_reload(
-                self.inner.clone(),
-                app.handle().clone(),
-                hash,
-                super::READY_TIMEOUT,
-            );
+            let handle = app.app_handle().clone();
+            let _ = self
+                .reload
+                .set(Arc::new(move |_ui: &ActiveUi| super::reload_all(&handle)));
         }
     }
 
     fn get(&self, key: &AssetKey) -> Option<Cow<'_, [u8]>> {
+        if key.as_ref() == "/index.html" {
+            self.arm_startup_once();
+        }
         match self.inner.serving() {
             Some(v) => read_version_file(&v, key.as_ref()).map(Cow::Owned),
             None => self.embedded.get(key),

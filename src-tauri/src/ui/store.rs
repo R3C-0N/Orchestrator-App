@@ -30,6 +30,14 @@ pub const STATE_FILE: &str = "state.json";
 pub const MANIFEST_FILE: &str = "manifest.json";
 /// Suffixe d'un dossier en cours d'installation.
 pub const TMP_SUFFIX: &str = ".tmp";
+/// Suffixe d'une version mise de côté pendant son remplacement.
+pub const OLD_SUFFIX: &str = ".old";
+/// Suffixe du verrou d'un build en cours (`<hash>.lock`, fichier).
+pub const LOCK_SUFFIX: &str = ".lock";
+/// Suffixe d'un fichier temporaire de [`write_atomic`].
+pub const PART_SUFFIX: &str = ".part";
+/// Âge au-delà duquel un `.tmp` sans verrou ou un `.part` est abandonné.
+pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// Version du format du manifeste.
 pub const MANIFEST_VERSION: u32 = 1;
 /// Activations gardées dans `state.json` (chaîne des retours arrière).
@@ -53,6 +61,9 @@ pub struct UiState {
     /// Ordre des activations, la plus récente à la fin : la précédente
     /// d'une version est la dernière activation valide avant elle.
     pub activations: Vec<String>,
+    /// Échecs consécutifs du signal « prêt » au démarrage, par version
+    /// (remis à zéro par un « prêt ») : fautive au deuxième.
+    pub startup_failures: BTreeMap<String, u32>,
 }
 
 /// `manifest.json` : chemin relatif (séparateur `/`) → SHA-256 en hexa.
@@ -111,16 +122,39 @@ pub enum InstallStage {
     Renamed,
 }
 
-/// Hash de version accepté : 1 à 64 caractères ASCII alphanumériques
-/// (un hash de commit git, court ou long).
+/// Longueur minimale d'un hash de version (hash court de git).
+pub const HASH_MIN: usize = 7;
+/// Longueur maximale d'un hash de version (SHA-256 en hexa).
+pub const HASH_MAX: usize = 64;
+
+/// Hash de version accepté : hexadécimal minuscule, de [`HASH_MIN`] à
+/// [`HASH_MAX`] caractères (un hash de commit git, court ou long). Exclut
+/// d'office la casse mêlée, les noms réservés de Windows et les noms de
+/// dossiers ordinaires (`logs`, `cache`…).
 pub fn valid_hash(hash: &str) -> bool {
-    !hash.is_empty() && hash.len() <= 64 && hash.bytes().all(|b| b.is_ascii_alphanumeric())
+    (HASH_MIN..=HASH_MAX).contains(&hash.len())
+        && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Nom réservé de Windows (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`,
+/// `LPT0-9`), avec ou sans extension, quelle que soit la casse.
+fn reserved_name(part: &str) -> bool {
+    let stem = part.split('.').next().unwrap_or(part).to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        s if s.len() == 4 && (s.starts_with("COM") || s.starts_with("LPT")) => {
+            s.as_bytes()[3].is_ascii_digit()
+        }
+        _ => false,
+    }
 }
 
 /// Chemin relatif réduit à des composants normaux, séparés par `/` :
 /// refuse vide, `.`, `..`, `\`, `:` (lecteur, flux NTFS), `%` (encodage
 /// résiduel, dont `%2e%2e`), caractères de contrôle, chemin absolu
-/// (`/` initial accepté une fois, comme dans une `AssetKey`, mais pas `//`).
+/// (`/` initial accepté une fois, comme dans une `AssetKey`, mais pas `//`),
+/// composant finissant par un point ou une espace (Windows les retire en
+/// silence), noms réservés de Windows.
 pub fn clean_path(raw: &str) -> Option<Vec<&str>> {
     let rel = raw.strip_prefix('/').unwrap_or(raw);
     if rel.is_empty() || rel.starts_with('/') {
@@ -135,7 +169,7 @@ pub fn clean_path(raw: &str) -> Option<Vec<&str>> {
     let parts: Vec<&str> = rel.split('/').collect();
     if parts
         .iter()
-        .any(|p| p.is_empty() || *p == "." || *p == "..")
+        .any(|p| p.is_empty() || p.ends_with(['.', ' ']) || reserved_name(p))
     {
         return None;
     }
@@ -196,7 +230,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!("{name}.{}-{n}.part", std::process::id()));
+    let tmp = path.with_file_name(format!("{name}.{}-{n}{PART_SUFFIX}", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
@@ -219,6 +253,51 @@ fn rename_retry(from: &Path, to: &Path) -> io::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(20 * (i + 1)));
     }
     Err(last.unwrap())
+}
+
+/// Date de modification la plus récente de l'arborescence `p` (un build
+/// en cours écrit dans des sous-dossiers sans toucher la racine).
+fn tree_mtime(p: &Path) -> SystemTime {
+    let mut newest = std::fs::symlink_metadata(p)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    if let Ok(entries) = std::fs::read_dir(p) {
+        for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            let t = if ft.is_dir() {
+                tree_mtime(&e.path())
+            } else {
+                e.metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH)
+            };
+            newest = newest.max(t);
+        }
+    }
+    newest
+}
+
+fn stale(t: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(t).is_ok_and(|age| age > STALE_AFTER)
+}
+
+/// Verrou d'un build en cours (`<root>\<hash>.lock`) : tant qu'il existe,
+/// le nettoyage ne touche pas `<hash>.tmp`. Retiré à la destruction.
+#[derive(Debug)]
+pub struct BuildLock {
+    path: PathBuf,
+}
+
+impl BuildLock {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
@@ -300,6 +379,43 @@ impl Store {
         self.root.join(hash)
     }
 
+    /// Pose le verrou de build de `hash` (échoue s'il est déjà posé).
+    pub fn build_lock(&self, hash: &str) -> io::Result<BuildLock> {
+        if !valid_hash(hash) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("hash invalide : {hash:?}"),
+            ));
+        }
+        std::fs::create_dir_all(&self.root)?;
+        let path = self.root.join(format!("{hash}{LOCK_SUFFIX}"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(BuildLock { path })
+    }
+
+    /// Le dossier `dir` porte un manifeste lisible du hash `hash` (sans
+    /// vérifier les fichiers) : c'est une version à nous.
+    pub fn has_manifest(&self, hash: &str, dir: &Path) -> bool {
+        valid_hash(hash)
+            && !is_link(dir)
+            && read_inside(dir, &[MANIFEST_FILE])
+                .and_then(|b| serde_json::from_slice::<Manifest>(&b).ok())
+                .is_some_and(|m| m.hash == hash)
+    }
+
+    /// Arrêt brutal pendant un remplacement : `<hash>` absent mais
+    /// `<hash>.old` présent → remis en place.
+    fn restore_old(&self, hash: &str) {
+        let fin = self.version_dir(hash);
+        let old = self.root.join(format!("{hash}{OLD_SUFFIX}"));
+        if std::fs::symlink_metadata(&fin).is_err() && self.has_manifest(hash, &old) {
+            let _ = rename_retry(&old, &fin);
+        }
+    }
+
     /// `active.json` ; absent ou illisible : aucun (interface embarquée).
     pub fn read_pointer(&self) -> Pointer {
         std::fs::read(self.root.join(ACTIVE_FILE))
@@ -340,6 +456,26 @@ impl Store {
     pub fn mark_bad(&self, hash: &str) -> io::Result<()> {
         let mut s = self.read_state();
         if s.bad.insert(hash.to_string()) {
+            self.write_state(&s)?;
+        }
+        Ok(())
+    }
+
+    /// Un échec de plus au démarrage pour `hash` ; renvoie le total
+    /// consécutif.
+    pub fn record_startup_failure(&self, hash: &str) -> io::Result<u32> {
+        let mut s = self.read_state();
+        let n = s.startup_failures.entry(hash.to_string()).or_insert(0);
+        *n += 1;
+        let n = *n;
+        self.write_state(&s)?;
+        Ok(n)
+    }
+
+    /// « Prêt » reçu au démarrage : compteur d'échecs de `hash` remis à 0.
+    pub fn reset_startup_failures(&self, hash: &str) -> io::Result<()> {
+        let mut s = self.read_state();
+        if s.startup_failures.remove(hash).is_some() {
             self.write_state(&s)?;
         }
         Ok(())
@@ -404,6 +540,7 @@ impl Store {
         if self.read_state().bad.contains(hash) {
             return Err(Invalid::MarkedBad);
         }
+        self.restore_old(hash);
         self.verify_dir(hash, &self.version_dir(hash))
     }
 
@@ -415,7 +552,10 @@ impl Store {
             .iter()
             .rev()
             .filter(|h| Some(h.as_str()) != current && !state.bad.contains(*h))
-            .find(|h| self.verify_dir(h, &self.version_dir(h)).is_ok())
+            .find(|h| {
+                self.restore_old(h);
+                self.verify_dir(h, &self.version_dir(h)).is_ok()
+            })
             .cloned()
     }
 
@@ -444,6 +584,7 @@ impl Store {
         if let Some(cur) = current {
             if bad {
                 s.bad.insert(cur.to_string());
+                s.startup_failures.remove(cur);
             }
             s.activations.retain(|h| h != cur);
         }
@@ -517,16 +658,32 @@ impl Store {
             .map_err(|e| invalid(format!("vérification : {e}")))?;
         hook(InstallStage::Verified)?;
 
+        // Remplacement : l'ancienne version est mise de côté (`.old`) puis
+        // supprimée après le renommage ; un arrêt brutal entre les deux la
+        // laisse récupérable (`restore_old`, nettoyage).
         let fin = self.version_dir(hash);
-        if std::fs::symlink_metadata(&fin).is_ok() {
-            if is_link(&fin) {
+        let old = self.root.join(format!("{hash}{OLD_SUFFIX}"));
+        let replaced = match std::fs::symlink_metadata(&fin) {
+            Ok(meta) if meta.file_type().is_symlink() => {
                 std::fs::remove_file(&fin).or_else(|_| std::fs::remove_dir(&fin))?;
-            } else {
-                std::fs::remove_dir_all(&fin)?;
+                false
             }
-        }
+            Ok(_) => {
+                if let Ok(m) = std::fs::symlink_metadata(&old) {
+                    remove_entry(&old, &m);
+                }
+                rename_retry(&fin, &old)?;
+                true
+            }
+            Err(_) => false,
+        };
         rename_retry(&tmp, &fin)?;
         hook(InstallStage::Renamed)?;
+        if replaced {
+            if let Ok(m) = std::fs::symlink_metadata(&old) {
+                remove_entry(&old, &m);
+            }
+        }
 
         let mut s = self.read_state();
         s.installs.retain(|h| h != hash);
@@ -535,11 +692,20 @@ impl Store {
         Ok(fin)
     }
 
-    /// Supprime les `.tmp` abandonnés et les versions hors de `keep`
-    /// (active, précédente) et des `keep_recent` dernières installations
-    /// non fautives. Les noms qui ne sont ni un hash ni un `.tmp` sont
-    /// laissés. Renvoie le nombre de dossiers supprimés.
+    /// [`Store::cleanup_at`] à l'instant présent.
     pub fn cleanup(&self, keep: &[&str], keep_recent: usize) -> usize {
+        self.cleanup_at(keep, keep_recent, SystemTime::now())
+    }
+
+    /// Supprime les versions hors de `keep` (active, précédente) et des
+    /// `keep_recent` dernières installations non fautives ; les
+    /// `<hash>.tmp` abandonnés (sans verrou `<hash>.lock` et sans écriture
+    /// depuis [`STALE_AFTER`] à la date `now`) ; les `.part` de même âge ;
+    /// les `<hash>.old` dont la version est en place (sinon `.old` est
+    /// remis en place). Seul un dossier `<hash>` avec un manifeste de ce
+    /// hash est une version : tout autre nom est laissé. Renvoie le nombre
+    /// de dossiers supprimés.
+    pub fn cleanup_at(&self, keep: &[&str], keep_recent: usize, now: SystemTime) -> usize {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return 0;
         };
@@ -553,15 +719,37 @@ impl Store {
                 continue;
             };
             if meta.is_file() {
+                if name.ends_with(PART_SUFFIX)
+                    && stale(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), now)
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
                 continue;
             }
             if let Some(base) = name.strip_suffix(TMP_SUFFIX) {
-                if valid_hash(base) && remove_entry(&path, &meta) {
+                let locked = self.root.join(format!("{base}{LOCK_SUFFIX}")).exists();
+                if valid_hash(base)
+                    && !locked
+                    && stale(tree_mtime(&path), now)
+                    && remove_entry(&path, &meta)
+                {
                     removed += 1;
                 }
                 continue;
             }
-            if valid_hash(&name) {
+            if let Some(base) = name.strip_suffix(OLD_SUFFIX) {
+                if self.has_manifest(base, &path) {
+                    if self.version_dir(base).exists() {
+                        if remove_entry(&path, &meta) {
+                            removed += 1;
+                        }
+                    } else {
+                        self.restore_old(base);
+                    }
+                }
+                continue;
+            }
+            if self.has_manifest(&name, &path) {
                 let t = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 versions.push((name, t));
             }

@@ -1,7 +1,7 @@
 //! Hébergement de l'interface (J14, spec décision 15) : versions compilées
 //! dans `%LOCALAPPDATA%\orchestrator\ui\<hash>\`, pointeur `active.json`,
 //! fournisseur d'assets disque avec repli **en bloc** sur l'interface
-//! embarquée, signal « prêt » et watchdog de 5 s, nettoyage des versions.
+//! embarquée, signal « prêt » surveillé, nettoyage des versions.
 //!
 //! Découpage : `store` (disque : manifeste, pointeur, état, installation,
 //! nettoyage), `watchdog` (générations d'armement), `assets` (fournisseur
@@ -9,9 +9,17 @@
 //! rappel : `switch_to`, `step_back`, `arm_watchdog_with` se testent sans
 //! Tauri (`tests/ui_host.rs`).
 //!
+//! Règle du watchdog : après une bascule (`activate`, `rollback`), pas de
+//! « prêt » en [`READY_TIMEOUT`] → version fautive tout de suite, retour à
+//! la précédente puis à l'embarquée. Au démarrage (armé au premier
+//! chargement de `index.html` par le fournisseur), délai
+//! [`STARTUP_TIMEOUT`] : premier échec → interface embarquée pour cette
+//! exécution seulement ; deuxième échec consécutif → version fautive et
+//! retour à la précédente. Un « prêt » remet le compteur à zéro.
+//!
 //! Branchement dans `lib.rs` (étape 5) : `ui.install_assets(&mut context)`
-//! avant `build` (le fournisseur arme lui-même le watchdog au démarrage,
-//! hors `tauri dev`), puis `app.manage(ui)`.
+//! avant `build`, puis `app.manage(ui)`. Le cycle d'amélioration tient
+//! `ui.build_lock(hash)` pendant le `vite build` vers `<root>\<hash>.tmp`.
 
 pub mod assets;
 pub mod store;
@@ -19,16 +27,20 @@ pub mod watchdog;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tauri::{AppHandle, Assets, Manager, Runtime};
 
 use crate::api::types::{CoreError, UiSource};
-use store::{Store, Version};
-use watchdog::Watchdog;
+use store::{BuildLock, Store, Version};
+use watchdog::{Mode, Watchdog};
 
-/// Délai du signal « prêt » après une bascule ou un démarrage.
+/// Délai du signal « prêt » après une bascule.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Délai du signal « prêt » au démarrage de l'app (WebView2 à froid).
+pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Échecs consécutifs au démarrage avant de marquer une version fautive.
+pub const STARTUP_STRIKES: u32 = 2;
 /// Versions gardées en plus de l'active et de la précédente.
 pub const KEEP_RECENT: usize = 5;
 
@@ -70,7 +82,7 @@ fn io_err(e: std::io::Error) -> CoreError {
 }
 
 impl Inner {
-    fn active(&self) -> ActiveUi {
+    pub(crate) fn active(&self) -> ActiveUi {
         self.active
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -142,20 +154,35 @@ impl Inner {
         Ok(self.set(version, p.previous))
     }
 
-    /// Délai écoulé sans « prêt » de `hash` : version marquée fautive,
-    /// retour à la précédente (ou à l'embarquée). `None` si `hash` n'est
-    /// plus l'active (bascule entre-temps).
-    fn fail(&self, hash: &str) -> Option<ActiveUi> {
+    /// Délai écoulé sans « prêt » de `hash` (armé en `mode`). Renvoie la
+    /// nouvelle interface, ou `None` si `hash` n'est plus l'active
+    /// (bascule entre-temps) : rien à faire.
+    fn fail(&self, hash: &str, mode: Mode) -> Option<ActiveUi> {
         if self.active().hash.as_deref() != Some(hash) {
             return None;
         }
-        tracing::warn!("interface {hash} : pas de signal « prêt », retour arrière");
+        if mode == Mode::Startup {
+            let n = self
+                .store
+                .record_startup_failure(hash)
+                .unwrap_or(STARTUP_STRIKES);
+            if n < STARTUP_STRIKES {
+                tracing::warn!(
+                    "interface {hash} : pas de « prêt » au démarrage ({n}/{STARTUP_STRIKES}), \
+                     interface embarquée pour cette exécution"
+                );
+                // Pointeur et version inchangés : retentée au prochain
+                // lancement.
+                return Some(self.set(None, None));
+            }
+        }
+        tracing::warn!("interface {hash} : pas de « prêt », version fautive, retour arrière");
         match self.step_back(Some(hash), true) {
             Ok(ui) => Some(ui),
             Err(e) => {
                 tracing::error!("retour arrière impossible : {e}");
-                // Au pire : interface embarquée en mémoire, état disque
-                // inchangé (la version reste au moins marquée).
+                // Au pire : interface embarquée en mémoire, la version reste
+                // au moins marquée.
                 let _ = self.store.mark_bad(hash);
                 Some(self.set(None, None))
             }
@@ -164,23 +191,29 @@ impl Inner {
 }
 
 /// Arme le watchdog pour `hash` : à l'échéance sans « prêt », `fail`, puis
-/// `on_fallback`, puis réarmement pour la nouvelle version disque (chaîne
-/// finie : chaque échec marque une version fautive, jamais réactivée).
-fn arm(inner: Arc<Inner>, hash: Option<String>, timeout: Duration, on_fallback: OnFallback) {
+/// réarmement (même contexte) pour la nouvelle version disque, puis
+/// `on_fallback`. Chaîne finie : on ne fait que reculer, jusqu'à
+/// l'embarquée, qui n'arme rien.
+fn arm(
+    inner: Arc<Inner>,
+    hash: Option<String>,
+    timeout: Duration,
+    mode: Mode,
+    on_fallback: OnFallback,
+) {
     let Some(hash) = hash else {
-        // Interface embarquée : rien vers quoi revenir.
         inner.watchdog.disarm();
         return;
     };
-    let token = inner.watchdog.arm(&hash);
+    let token = inner.watchdog.arm(&hash, mode);
     watchdog::after(timeout, move || {
-        let Some(expected) = inner.watchdog.expire(token) else {
+        let Some((expected, mode)) = inner.watchdog.expire(token) else {
             return;
         };
-        if let Some(ui) = inner.fail(&expected) {
+        if let Some(ui) = inner.fail(&expected, mode) {
             // Armer avant de recharger : le « prêt » de la page rechargée
             // ne doit pas arriver avant l'armement.
-            arm(inner, ui.hash.clone(), timeout, on_fallback.clone());
+            arm(inner, ui.hash.clone(), timeout, mode, on_fallback.clone());
             on_fallback(&ui);
         }
     });
@@ -200,11 +233,13 @@ pub(crate) fn arm_with_reload<R: Runtime>(
     app: AppHandle<R>,
     hash: Option<String>,
     timeout: Duration,
+    mode: Mode,
 ) {
     arm(
         inner,
         hash,
         timeout,
+        mode,
         Arc::new(move |_ui: &ActiveUi| reload_all(&app)),
     );
 }
@@ -267,13 +302,31 @@ impl UiHost {
     }
 
     /// Fournisseur disque, quel que soit le mode de compilation (`load`
-    /// fait ici).
+    /// fait ici). Il arme le watchdog de démarrage au premier chargement
+    /// de `index.html`, une fois `Assets::setup` passé.
     pub fn provider<R: Runtime>(&self, embedded: Box<dyn Assets<R>>) -> Box<dyn Assets<R>> {
         self.load();
-        Box::new(assets::DiskAssets {
-            inner: self.inner.clone(),
+        Box::new(assets::DiskAssets::new(self.inner.clone(), embedded, None))
+    }
+
+    /// [`UiHost::provider`] avec le rappel de repli déjà posé (tests : le
+    /// premier `index.html` arme le watchdog de démarrage sans `setup`).
+    pub fn provider_with_reload<R: Runtime>(
+        &self,
+        embedded: Box<dyn Assets<R>>,
+        on_fallback: OnFallback,
+    ) -> Box<dyn Assets<R>> {
+        self.load();
+        Box::new(assets::DiskAssets::new(
+            self.inner.clone(),
             embedded,
-        })
+            Some(on_fallback),
+        ))
+    }
+
+    /// Hash attendu par le watchdog, s'il est armé.
+    pub fn watchdog_expected(&self) -> Option<String> {
+        self.inner.watchdog.expected().map(|(h, _)| h)
     }
 
     /// Remplace les assets de `context` par [`UiHost::assets`] (à faire
@@ -283,16 +336,31 @@ impl UiHost {
         context.set_assets(self.assets(embedded));
     }
 
-    /// Arme le watchdog : sans `ready(hash)` dans `timeout`, retour à la
-    /// version précédente puis à l'embarquée, version marquée fautive,
-    /// webviews rechargées. `hash` `None` (embarquée) : désarme.
+    /// Arme le watchdog après une bascule : sans `ready(hash)` dans
+    /// `timeout`, version marquée fautive, retour à la précédente puis à
+    /// l'embarquée, webviews rechargées. `hash` `None` (embarquée) :
+    /// désarme.
     pub fn arm_watchdog<R: Runtime>(
         &self,
         app: &AppHandle<R>,
         hash: Option<String>,
         timeout: Duration,
     ) {
-        arm_with_reload(self.inner.clone(), app.clone(), hash, timeout);
+        arm_with_reload(self.inner.clone(), app.clone(), hash, timeout, Mode::Switch);
+    }
+
+    /// Arme le watchdog de démarrage pour l'interface servie
+    /// ([`STARTUP_TIMEOUT`], règle des deux échecs). Le fournisseur le fait
+    /// seul au premier chargement de page ; à n'appeler qu'à défaut.
+    pub fn arm_startup_watchdog<R: Runtime>(&self, app: &AppHandle<R>) {
+        let hash = self.active().hash;
+        arm_with_reload(
+            self.inner.clone(),
+            app.clone(),
+            hash,
+            STARTUP_TIMEOUT,
+            Mode::Startup,
+        );
     }
 
     /// [`UiHost::arm_watchdog`] sans Tauri : `on_fallback` remplace le
@@ -303,18 +371,47 @@ impl UiHost {
         timeout: Duration,
         on_fallback: OnFallback,
     ) {
-        arm(self.inner.clone(), hash, timeout, on_fallback);
+        arm(self.inner.clone(), hash, timeout, Mode::Switch, on_fallback);
+    }
+
+    /// [`UiHost::arm_startup_watchdog`] sans Tauri.
+    pub fn arm_startup_watchdog_with(
+        &self,
+        hash: Option<String>,
+        timeout: Duration,
+        on_fallback: OnFallback,
+    ) {
+        arm(
+            self.inner.clone(),
+            hash,
+            timeout,
+            Mode::Startup,
+            on_fallback,
+        );
     }
 
     /// Signal « prêt » de l'interface (`ui_ready`) : désarme le watchdog si
-    /// `hash` est celui attendu. Renvoie vrai s'il était attendu.
+    /// `hash` est celui attendu (et remet à zéro ses échecs au démarrage).
+    /// Renvoie vrai s'il était attendu.
     pub fn ready(&self, hash: Option<&str>) -> bool {
-        self.inner.watchdog.ready(hash)
+        match (self.inner.watchdog.ready(hash), hash) {
+            (Some(_), Some(h)) => {
+                let _ = self.inner.store.reset_startup_failures(h);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Verrou de build de `hash`, à tenir pendant l'écriture de
+    /// `<root>\<hash>.tmp` : le nettoyage n'y touche pas tant qu'il existe.
+    pub fn build_lock(&self, hash: &str) -> Result<BuildLock, CoreError> {
+        self.inner.store.build_lock(hash).map_err(io_err)
     }
 
     /// Installe le build `dir` (déjà écrit ; `<root>\<hash>.tmp` évite une
     /// copie) comme version `hash` : manifeste vérifié, renommage atomique.
-    /// Ne l'active pas. Refusé pour la version servie.
+    /// Ne l'active pas. Refusé pour la version servie et la précédente.
     pub fn install(&self, hash: &str, dir: &Path) -> Result<PathBuf, CoreError> {
         self.install_with(hash, dir, &mut |_| Ok(()))
     }
@@ -328,9 +425,14 @@ impl UiHost {
         hook: &mut dyn FnMut(store::InstallStage) -> std::io::Result<()>,
     ) -> Result<PathBuf, CoreError> {
         let _g = self.inner.op.lock().unwrap_or_else(|e| e.into_inner());
-        if self.inner.active().hash.as_deref() == Some(hash) {
+        let ui = self.inner.active();
+        let p = self.inner.store.read_pointer();
+        if [&ui.hash, &ui.previous, &p.active, &p.previous]
+            .iter()
+            .any(|h| h.as_deref() == Some(hash))
+        {
             return Err(CoreError::InvalidArgument(format!(
-                "interface {hash} : version affichée, pas de réinstallation"
+                "interface {hash} : version active ou précédente, pas de réinstallation"
             )));
         }
         self.inner
@@ -345,11 +447,20 @@ impl UiHost {
         self.inner.switch_to(hash)
     }
 
-    /// Retour arrière sans toucher la webview : la version affichée est
+    /// Retour arrière sans toucher la webview : la version quittée est
     /// retirée des activations (pas marquée fautive) ; la précédente
     /// valide, sinon l'embarquée, est servie.
+    ///
+    /// Depuis l'interface embarquée : si le pointeur désigne encore une
+    /// version (repli de démarrage pour cette exécution), c'est elle qui
+    /// est quittée ; on active alors la dernière version disque valide
+    /// **précédente** s'il y en a une, sinon on reste sur l'embarquée.
     pub fn step_back(&self) -> Result<ActiveUi, CoreError> {
-        let cur = self.inner.active().hash;
+        let cur = self
+            .inner
+            .active()
+            .hash
+            .or_else(|| self.inner.store.read_pointer().active);
         self.inner.step_back(cur.as_deref(), false)
     }
 
@@ -371,9 +482,15 @@ impl UiHost {
     }
 
     /// Supprime les versions au-delà de l'active, de la précédente et des
-    /// [`KEEP_RECENT`] plus récentes valides, et les `.tmp` abandonnés (à
-    /// appeler hors d'un build en cours). Renvoie le nombre supprimé.
+    /// [`KEEP_RECENT`] plus récentes valides, les `.tmp` abandonnés (sans
+    /// verrou de build, 30 min sans écriture) et les `.part` orphelins.
+    /// Renvoie le nombre de dossiers supprimés.
     pub fn cleanup(&self) -> usize {
+        self.cleanup_at(SystemTime::now())
+    }
+
+    /// [`UiHost::cleanup`] à la date `now` (tests).
+    pub fn cleanup_at(&self, now: SystemTime) -> usize {
         let _g = self.inner.op.lock().unwrap_or_else(|e| e.into_inner());
         let ui = self.inner.active();
         let p = self.inner.store.read_pointer();
@@ -381,6 +498,6 @@ impl UiHost {
             .into_iter()
             .filter_map(|h| h.as_deref())
             .collect();
-        self.inner.store.cleanup(&keep, KEEP_RECENT)
+        self.inner.store.cleanup_at(&keep, KEEP_RECENT, now)
     }
 }
