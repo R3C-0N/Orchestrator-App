@@ -214,7 +214,7 @@ test("Ctrl+O puis molette pendant le recalage : la molette n'est pas écrasée",
   await readAbove(page);
   const m = await page.evaluate(
     () =>
-      new Promise<{ j: string; afterWheel: number; scrollTops: number[]; tops: number[] }>((resolve) => {
+      new Promise<{ j: string; jTop0: number; afterWheel: number; scrollTops: number[]; tops: number[] }>((resolve) => {
         const ctrlO = () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "o", ctrlKey: true, bubbles: true }));
         // Appelle `fn` à l'image qui suit celle où la vue détaillée apparaît.
         const afterDetailBar = (fn: () => void) => {
@@ -225,17 +225,25 @@ test("Ctrl+O puis molette pendant le recalage : la molette n'est pas écrasée",
           requestAnimationFrame(poll);
         };
         ctrlO();
-        // Image F où la vue détaillée est montée : le rAF de `restore` passe
-        // dans F (après celui-ci), la première image de `settle` dans F + 1,
-        // avant le rAF demandé ici ; la molette tombe donc en pleine boucle.
+        // Ordre des images : `poll` est demandé ici de façon synchrone, avant
+        // le rAF de `restore`, que Svelte ne demande qu'à son rendu (microtâche
+        // après ce code). Image F : `poll` voit la vue détaillée et demande
+        // `fn` pour F + 1, puis le rAF de `restore` place la ligne lue en haut
+        // et demande la première image de `settle`, elle aussi pour F + 1.
+        // Image F + 1 : `fn` passe avant `settle` ; la molette tombe donc
+        // après la mise en place, avant la première image de la boucle, qui
+        // doit s'arrêter sans rien réécrire.
         afterDetailBar(() => {
           const el = document.querySelector<HTMLElement>(".vlist")!;
           const vTop = el.getBoundingClientRect().top;
           // Ligne j recalée en haut par la boucle.
-          const j = [...el.querySelectorAll<HTMLElement>("[data-index]")].find((r) => {
+          const jRow = [...el.querySelectorAll<HTMLElement>("[data-index]")].find((r) => {
             const b = r.getBoundingClientRect();
             return b.top <= vTop + 4 && b.bottom > vTop + 4;
-          })!.dataset.index!;
+          })!;
+          const j = jRow.dataset.index!;
+          // Position de j avant la molette (pas encore recalée : hauteurs estimées).
+          const jTop0 = jRow.getBoundingClientRect().top - vTop;
           // Molette : l'événement pour l'écouteur, le défilement appliqué à la main.
           el.dispatchEvent(new WheelEvent("wheel", { deltaY: -300, bubbles: true }));
           el.scrollTop -= 300;
@@ -247,7 +255,7 @@ test("Ctrl+O puis molette pendant le recalage : la molette n'est pas écrasée",
             scrollTops.push(el.scrollTop);
             tops.push(it ? it.getBoundingClientRect().top - vTop : Infinity);
             if (tops.length < 15) requestAnimationFrame(watch);
-            else resolve({ j, afterWheel, scrollTops, tops });
+            else resolve({ j, jTop0, afterWheel, scrollTops, tops });
           };
           requestAnimationFrame(watch);
         });
@@ -255,13 +263,85 @@ test("Ctrl+O puis molette pendant le recalage : la molette n'est pas écrasée",
   );
   console.log(`MESURE ctrl-o-molette-pendant-recalage ${JSON.stringify(m)}`);
   await expect(page.getByTestId("detail-bar")).toBeVisible();
-  // La boucle ramènerait la ligne j en haut en augmentant `scrollTop` (vers
-  // le bas). Après la molette, `scrollTop` ne doit jamais remonter au-dessus
-  // de sa valeur ; il peut baisser un peu quand virtua corrige les hauteurs
-  // estimées des lignes au-dessus (compensation de défilement).
+  // Après la molette, la ligne j est sous le haut de la vue : la boucle ne
+  // pourrait que l'y ramener en augmentant `scrollTop` (`scrollTop += d`,
+  // d > 0). `scrollTop` ne doit donc jamais dépasser sa valeur après la
+  // molette ni augmenter d'une image à l'autre. Il baisse, lui, quand virtua
+  // mesure les lignes au-dessus de la vue, plus petites que leur estimation
+  // (compensation de défilement, ≈ 250 px ici) : cette baisse dépend des
+  // estimations, pas d'une borne sur la molette, d'où la borne visuelle
+  // ci-dessous plutôt qu'une borne sur `scrollTop`.
   for (const top of m.scrollTops) expect(top).toBeLessThanOrEqual(m.afterWheel + 1);
-  expect(m.scrollTops[m.scrollTops.length - 1]).toBeGreaterThan(m.afterWheel - 300);
+  for (let i = 1; i < m.scrollTops.length; i++) expect(m.scrollTops[i]).toBeLessThanOrEqual(m.scrollTops[i - 1] + 1);
+  // Ce qui est vu : j reste plus bas qu'avant la molette (la vue a monté),
+  // même après la mesure des lignes découvertes, plus petites qu'estimé.
+  expect(m.tops[m.tops.length - 1]).toBeGreaterThan(m.jTop0);
   expect(await sticky(page)).toBe(false);
+});
+
+/**
+ * Bascule Ctrl+O puis geste (molette vers le haut) dans la même tâche, après
+ * le rendu de la nouvelle vue (microtâche) mais avant toute image : avant le
+ * premier rAF de `restore`. Le geste arrête le recalage, pas la mise en place.
+ */
+const ctrlOThenEarlyWheel = (page: Page) =>
+  page.evaluate(async () => {
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "o", ctrlKey: true, bubbles: true }));
+    // Rendu de Svelte : microtâche demandée pendant l'événement, donc avant celle-ci.
+    await new Promise<void>((r) => queueMicrotask(r));
+    const mounted = document.querySelector('[data-testid="detail-bar"]') !== null;
+    const el = document.querySelector<HTMLElement>(".vlist")!;
+    el.dispatchEvent(new WheelEvent("wheel", { deltaY: -300, bubbles: true }));
+    return mounted;
+  });
+
+test("Ctrl+O puis geste avant la première image : la ligne lue est quand même mise en haut", async ({ page }) => {
+  await readAbove(page);
+  const read = await rowAtTopOf(page);
+  expect(await ctrlOThenEarlyWheel(page)).toBe(true);
+  await page.waitForTimeout(600);
+  // Sans mise en place, la nouvelle liste reste à un décalage quelconque.
+  expect(await rowAtTopOf(page)).toBe(read);
+  expect(await sticky(page)).toBe(false);
+});
+
+test("collé en bas, Ctrl+O puis molette avant la première image : la vue détaillée part du bas", async ({ page }) => {
+  await open(page, 600);
+  await page.evaluate(() => (window as unknown as { __orch: Orch }).__orch.conversation().scrollToBottom());
+  await page.waitForTimeout(300);
+  expect(await sticky(page)).toBe(true);
+  expect(await ctrlOThenEarlyWheel(page)).toBe(true);
+  await page.waitForTimeout(600);
+  const d = await page.evaluate(() => {
+    const el = document.querySelector<HTMLElement>(".vlist")!;
+    return el.scrollHeight - el.clientHeight - el.scrollTop;
+  });
+  expect(d).toBeLessThanOrEqual(1);
+  expect(await sticky(page)).toBe(true);
+});
+
+test("après une bascule, molette vers le haut depuis le bas : la vue n'est pas réalignée", async ({ page }) => {
+  await readAbove(page);
+  await page.keyboard.press("Control+o");
+  await expect(page.getByTestId("detail-bar")).toBeVisible();
+  await page.waitForTimeout(500);
+  // Retour en bas (collé), puis un cran de molette vers le haut (décollé).
+  await page.evaluate(() => (window as unknown as { __orch: Orch }).__orch.conversation().scrollToBottom());
+  await page.waitForTimeout(300);
+  expect(await sticky(page)).toBe(true);
+  await page.mouse.wheel(0, -200);
+  await page.waitForTimeout(500);
+  expect(await sticky(page)).toBe(false);
+  const d = await page.evaluate(() => {
+    const el = document.querySelector<HTMLElement>(".vlist")!;
+    return el.scrollHeight - el.clientHeight - el.scrollTop;
+  });
+  console.log(`MESURE molette-apres-bascule ${JSON.stringify({ d })}`);
+  // Sans streaming, la vue est exactement 200 px au-dessus du bas. Quand
+  // `restore` lisait `sticky` en étant suivi, le décollage relançait
+  // l'attache, qui recalait la ligne du haut sur le haut de la vue
+  // (224 px mesurés), contre la molette.
+  expect(Math.abs(d - 200)).toBeLessThanOrEqual(2);
 });
 
 test("deux Ctrl+O rapprochés : retour sur la ligne lue", async ({ page }) => {

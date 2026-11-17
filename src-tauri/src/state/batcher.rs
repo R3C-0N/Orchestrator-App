@@ -61,14 +61,12 @@ pub async fn run_batcher(mut rx: UnboundedReceiver<CoreEvent>, sink: Sink) {
         let mut buf = vec![first];
         if leading_edge {
             // Bord avant : on part tout de suite avec ce qui est déjà là.
-            // Les événements vidés ici comptent comme reçus maintenant : le
-            // suivant mesure son écart à eux, pas seulement à `first`.
+            // Les événements vidés ici sont reçus au même instant que
+            // `first` (`try_recv` ne cède pas la main) : `last_event`, posé
+            // ci-dessus, vaut déjà pour eux (test `drained_events_extend_the_burst`).
             while buf.len() < BATCH_MAX {
                 match rx.try_recv() {
-                    Ok(ev) => {
-                        last_event = Some(Instant::now());
-                        buf.push(ev);
-                    }
+                    Ok(ev) => buf.push(ev),
                     Err(_) => break,
                 }
             }
@@ -323,6 +321,39 @@ mod tests {
         let (at, seqs) = b.iter().find(|(_, s)| s.contains(&3)).unwrap();
         assert_eq!(seqs, &vec![1, 2, 3]);
         assert_eq!(*at, typed_at, "écho retenu {:?}", *at - typed_at);
+    }
+
+    /// Événements vidés au bord avant puis événement à moins de `BURST_GAP` :
+    /// 0 et 1 arrivent ensemble (1 est vidé par `try_recv` avec 0), puis 2
+    /// arrive 3 ms après eux. 2 continue la rafale : il attend l'échéance du
+    /// lot (16 ms après le départ de 0 et 1) au lieu de partir seul. L'écart
+    /// se mesure à la réception par le regroupeur : 1, vidé avec 0, compte
+    /// comme reçu au même instant que lui.
+    #[tokio::test(start_paused = true)]
+    async fn drained_events_extend_the_burst() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let batches: Batches = Arc::default();
+        let bb = batches.clone();
+        let sink: Sink = Arc::new(move |batch: Vec<CoreEvent>| {
+            bb.lock()
+                .unwrap()
+                .push((Instant::now(), batch.iter().map(|e| e.seq).collect()));
+            true
+        });
+        let task = tokio::spawn(run_batcher(rx, sink));
+        let t0 = Instant::now();
+        tx.send(ev(0)).unwrap();
+        tx.send(ev(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        tx.send(ev(2)).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(tx);
+        task.await.unwrap();
+        let b = batches.lock().unwrap().clone();
+        all_in_order(&b, 3);
+        assert_eq!(b.len(), 2, "{b:?}");
+        assert_eq!((b[0].0 - t0, &b[0].1), (Duration::ZERO, &vec![0, 1]));
+        assert_eq!((b[1].0 - t0, &b[1].1), (BATCH_WINDOW, &vec![2]));
     }
 
     /// Écho tapé en tête de boucle (`urgent(&first)`) : 1 ms après un lot,

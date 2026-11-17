@@ -18,7 +18,7 @@
   //   et aucun geste ne l'annule ; pendant un streaming, la ligne vivante
   //   grandit sans arrêt et il ramenait la liste en bas contre la molette.
   //   Le recollage est direct (`toBottom`) et chaque essai revérifie `sticky`.
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { VList } from "virtua/svelte";
   import { ItemCache, firstRowId, itemIndexOfRow, type Item } from "../render/group";
   import type { SessionStore } from "../state/session.svelte";
@@ -217,13 +217,22 @@
   /** Ligne source en haut de la vue au moment de la bascule. */
   let anchor: string | null = null;
   /**
-   * Jeton de génération du recalage de `restore` : un geste de l'utilisateur
-   * (molette, touche de défilement, clic) ou un nouveau `restore`
-   * l'incrémente, et la boucle en cours s'arrête à sa prochaine image. Sans
-   * lui, la boucle réécrivait `scrollTop` pendant ses 10 images contre la
-   * molette, et deux Ctrl+O rapprochés faisaient tourner deux boucles.
+   * Jeton de génération de `restore` : un nouveau `restore` (ou la
+   * destruction de sa vue) l'incrémente, et l'ancien s'arrête à sa prochaine
+   * image, mise en place comprise. Sans lui, deux Ctrl+O rapprochés faisaient
+   * tourner deux boucles.
    */
   let restoreGen = 0;
+  /**
+   * Jeton des gestes de l'utilisateur (molette, touche de défilement, clic) :
+   * un geste l'incrémente et la boucle de recalage (`settle`) s'arrête à sa
+   * prochaine image. Sans lui, la boucle réécrivait `scrollTop` pendant ses
+   * 10 images contre la molette. Seuls comptent les gestes faits après la
+   * mise en place (première image de `restore`) : un geste antérieur visait
+   * une vue pas encore placée, et l'annulation laissait la nouvelle vue à une
+   * position quelconque (hauteurs encore estimées).
+   */
+  let gestureGen = 0;
   /**
    * Ligne source du recalage en cours (`null` : aucun). Une bascule qui
    * arrive avant la fin la reprend, au lieu de lire le haut d'une vue pas
@@ -232,7 +241,7 @@
   let settling: string | null = null;
 
   function stopRestore() {
-    restoreGen++;
+    gestureGen++;
     settling = null;
   }
 
@@ -257,18 +266,39 @@
   function restore(_el: HTMLElement) {
     const a = anchor;
     const gen = ++restoreGen;
-    settling = sticky ? null : a;
+    const g0 = gestureGen;
+    /**
+     * Collé en bas au moment de la bascule. Lu hors suivi : l'attache tourne
+     * dans un effet, et lire `sticky` (état réactif) l'y abonnait ; chaque
+     * collage ou décollage relançait alors `restore` (nettoyage compris) avec
+     * l'ancre de la dernière bascule, qui ramenait la vue sur elle.
+     */
+    const stuck = untrack(() => sticky);
+    settling = stuck ? null : a;
     requestAnimationFrame(() => {
       if (gen !== restoreGen) return;
+      // Gestes comptés à partir d'ici : un geste antérieur (entre la bascule
+      // et cette image) visait une vue pas encore placée, il est sans effet.
+      const g = gestureGen;
+      /** Recalage encore voulu : ni nouvelle bascule, ni geste depuis la mise en place. */
+      const live = () => gen === restoreGen && g === gestureGen;
       if (!list) {
         settling = null;
         return;
+      }
+      if (stuck && g !== g0) {
+        // Collé à la bascule : la nouvelle vue part du bas, même si un geste
+        // vers le haut l'a décrochée avant cette image, et son intention ne
+        // doit pas décrocher sur les mesures qui suivent.
+        sticky = true;
+        intentUntil = 0;
       }
       if (sticky || a === null) {
         settling = null;
         toBottom();
         return;
       }
+      settling = a;
       const j = itemIndexOfRow(items, a);
       if (j < 0) settling = null;
       else {
@@ -282,11 +312,12 @@
         // lignes mesurées, on recale l'item en haut. Tant qu'il n'est pas
         // rendu, son décalage (que virtua affine à chaque mesure) sert de
         // cible. Au plus 10 images, et arrêt dès un geste de l'utilisateur
-        // ou une nouvelle bascule (`restoreGen`) : un geste n'est jamais contré.
+        // (`gestureGen`) ou une nouvelle bascule (`restoreGen`) : un geste
+        // n'est jamais contré.
         let n = 0;
         let aligned = 0;
         const settle = () => {
-          if (gen !== restoreGen) return;
+          if (!live()) return;
           const el = root?.querySelector<HTMLElement>(".vlist");
           const it = el?.querySelector<HTMLElement>(`[data-index="${j}"]`);
           if (el && it) {
@@ -302,11 +333,21 @@
             aligned = 0;
           }
           if (++n < 10 && aligned < 2) requestAnimationFrame(settle);
-          else if (gen === restoreGen) settling = null;
+          else if (live()) settling = null;
         };
         requestAnimationFrame(settle);
       }
     });
+    // Vue détruite (bascule suivante, fermeture) : sa mise en place et son
+    // recalage s'arrêtent. Seulement si aucun `restore` plus récent n'a pris
+    // le jeton : l'ordre entre ce nettoyage et l'attache de la vue suivante
+    // n'a alors pas d'importance.
+    return () => {
+      if (gen === restoreGen) {
+        restoreGen++;
+        settling = null;
+      }
+    };
   }
 
   // --- Indicateur de tour (`k1`) ------------------------------------------------
