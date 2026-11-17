@@ -7,6 +7,9 @@
 // - `applyHistory` : applique au magasin de session les `CoreEvent` relus
 //   dans le transcript (`load_history`), sans compter de trou de `seq`.
 // - `resumeSession` : enchaînement complet de la reprise.
+// - J14 : `resyncStore` / `SessionRouter` (rattachement aux sessions vivantes
+//   après un rechargement de l'interface) et `UiSnapshot` (saisie, historique
+//   ↑↓, agents dépliés, Ctrl+O gardés dans `sessionStorage`).
 
 import { invoke } from "@tauri-apps/api/core";
 import type { CoreEvent } from "../core/bindings/CoreEvent";
@@ -14,6 +17,8 @@ import type { ExitInfo } from "../core/bindings/ExitInfo";
 import type { HistoryLoaded } from "../core/bindings/HistoryLoaded";
 import type { ProjectSummary } from "../core/bindings/ProjectSummary";
 import type { SessionKey } from "../core/bindings/SessionKey";
+import type { SessionResync } from "../core/bindings/SessionResync";
+import type { SessionRole } from "../core/bindings/SessionRole";
 import type { SessionStarted } from "../core/bindings/SessionStarted";
 import type { SessionSummary } from "../core/bindings/SessionSummary";
 import type { SessionStore } from "./session.svelte";
@@ -242,4 +247,184 @@ export async function resumeSession(
     );
   }
   return { started, history };
+}
+
+// --- rattachement après un rechargement (J14, décision 15) ---------------------
+
+/**
+ * Reconstruit le magasin d'une session vivante à partir de `attach_sessions` :
+ * historique repris (comme `applyHistory`), puis journal complet des
+ * `CoreEvent` (`seq` continus depuis 0), appliqués tout de suite. La mesure
+ * de latence (`onApplied`) est suspendue : ces événements ne sont pas peints
+ * « en direct ».
+ */
+export function resyncStore(store: SessionStore, r: Pick<SessionResync, "history" | "events">): void {
+  const hook = store.onApplied;
+  store.onApplied = null;
+  try {
+    if (r.history) applyHistory(store, r.history);
+    if (r.events.length > 0) store.apply(r.events);
+  } finally {
+    store.onApplied = hook;
+  }
+}
+
+/**
+ * Aiguillage des lots du canal de `attach_sessions` (toutes les sessions) vers
+ * le magasin de chacune.
+ *
+ * - Avant `resync`, les lots reçus sont gardés : le canal peut livrer avant la
+ *   réponse de la commande.
+ * - Après, un événement dont le `seq` est déjà couvert par le journal (ou déjà
+ *   reçu) est écarté : ni trou, ni doublon, quel que soit le recouvrement
+ *   entre le journal et le canal.
+ * - Une session inconnue (lancée après le rattachement, une amélioration par
+ *   exemple) reçoit un magasin à la volée, de rôle `improve` sauf indication.
+ */
+export class SessionRouter {
+  readonly stores = new Map<SessionKey, SessionStore>();
+  readonly roles = new Map<SessionKey, SessionRole>();
+  readonly info = new Map<SessionKey, SessionResync>();
+  /** Événements écartés parce que déjà appliqués (recouvrement journal / canal). */
+  duplicates = 0;
+  #last = new Map<SessionKey, number>();
+  #buffer: CoreEvent[][] | null = [];
+  readonly #make: (key: SessionKey, role: SessionRole) => SessionStore;
+
+  constructor(make: (key: SessionKey, role: SessionRole) => SessionStore) {
+    this.#make = make;
+  }
+
+  /** Vrai une fois `resync` fait (les lots passent alors directement). */
+  get attached(): boolean {
+    return this.#buffer === null;
+  }
+
+  /** À passer comme `onEvents` de `attachSessions`. */
+  onBatch = (batch: CoreEvent[]): void => {
+    if (this.#buffer) this.#buffer.push(batch);
+    else this.#route(batch);
+  };
+
+  /** Reconstruit chaque session, puis applique les lots gardés depuis l'appel. */
+  resync(list: SessionResync[]): void {
+    for (const r of list) {
+      const s = this.#make(r.session, r.role);
+      resyncStore(s, r);
+      this.stores.set(r.session, s);
+      this.roles.set(r.session, r.role);
+      this.info.set(r.session, r);
+      const last = r.events.length > 0 ? r.events[r.events.length - 1].seq : -1;
+      this.#last.set(r.session, last);
+    }
+    const buf = this.#buffer ?? [];
+    this.#buffer = null;
+    for (const b of buf) this.#route(b);
+  }
+
+  /** Magasin de la session `key`, s'il existe. */
+  get(key: SessionKey): SessionStore | undefined {
+    return this.stores.get(key);
+  }
+
+  #route(batch: CoreEvent[]): void {
+    let key: SessionKey | null = null;
+    let run: CoreEvent[] = [];
+    const flush = () => {
+      if (key !== null && run.length > 0) this.#storeOf(key).push(run);
+      run = [];
+    };
+    for (const ev of batch) {
+      const last = this.#last.get(ev.session);
+      if (last !== undefined && ev.seq <= last) {
+        this.duplicates++;
+        continue;
+      }
+      this.#last.set(ev.session, ev.seq);
+      if (ev.session !== key) {
+        flush();
+        key = ev.session;
+      }
+      run.push(ev);
+    }
+    flush();
+  }
+
+  #storeOf(key: SessionKey): SessionStore {
+    let s = this.stores.get(key);
+    if (!s) {
+      const role = this.roles.get(key) ?? "improve";
+      s = this.#make(key, role);
+      this.stores.set(key, s);
+      this.roles.set(key, role);
+    }
+    return s;
+  }
+}
+
+/**
+ * Session principale à afficher après un rattachement : la dernière de rôle
+ * `main` encore en cours, sinon la dernière de rôle `main`.
+ */
+export function mainOf(list: SessionResync[]): SessionResync | null {
+  const mains = list.filter((r) => r.role === "main");
+  return mains.filter((r) => r.running).at(-1) ?? mains.at(-1) ?? null;
+}
+
+// --- état de l'interface gardé à travers un rechargement -------------------------
+
+/** Ce que l'interface garde d'une page à l'autre (`sessionStorage`, décision 15). */
+export type UiSnapshot = {
+  /** Session principale à laquelle cet état appartient. */
+  session: SessionKey | null;
+  draft: string;
+  /** Historique ↑↓ des envois de cette saisie. */
+  sent: string[];
+  agentsOpen: string[];
+  agentsDoneOpen: boolean;
+  /** Vue détaillée (Ctrl+O). */
+  verbose: boolean;
+  /** Bandeau d'amélioration fermé (id de l'amélioration). */
+  improveDismissed: string | null;
+};
+
+export const UI_SNAPSHOT_KEY = "orchestrator.ui.v1";
+
+function sessionStore(): Storage | null {
+  try {
+    return globalThis.sessionStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Écrit l'état ; sans effet si le stockage est inaccessible ou plein. */
+export function saveUiSnapshot(s: UiSnapshot): void {
+  try {
+    sessionStore()?.setItem(UI_SNAPSHOT_KEY, JSON.stringify(s));
+  } catch {
+    // Stockage plein ou refusé : l'état sera perdu au rechargement, rien de plus.
+  }
+}
+
+/** Relit l'état, validé champ par champ ; `null` s'il manque ou est illisible. */
+export function loadUiSnapshot(): UiSnapshot | null {
+  try {
+    const raw = sessionStore()?.getItem(UI_SNAPSHOT_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw) as Partial<UiSnapshot>;
+    if (!v || typeof v !== "object") return null;
+    const strings = (x: unknown): string[] => (Array.isArray(x) ? x.filter((y): y is string => typeof y === "string") : []);
+    return {
+      session: typeof v.session === "string" ? v.session : null,
+      draft: typeof v.draft === "string" ? v.draft : "",
+      sent: strings(v.sent).slice(-500),
+      agentsOpen: strings(v.agentsOpen),
+      agentsDoneOpen: v.agentsDoneOpen === true,
+      verbose: v.verbose === true,
+      improveDismissed: typeof v.improveDismissed === "string" ? v.improveDismissed : null,
+    };
+  } catch {
+    return null;
+  }
 }

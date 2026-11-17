@@ -13,9 +13,35 @@
   // - « ← N agents » et « /tasks to see subagents » renvoient à des vues du
   //   TUI que l'app remplace par la colonne des agents (décision 4, J9).
   // Mode `default` : « ? for shortcuts », comme le TUI hors mode spécial.
+  //
+  // J14 (décision 15) : à droite, le hash de l'interface exécutée
+  // (`__UI_HASH__`), « embarquée » ou « disque » d'après `get_ui_info`, et les
+  // écarts : hash actif différent de celui de cette page, empreinte du contrat
+  // différente de celle de l'exe, commit fusionné qui attend une relance.
+  import type { UiInfo } from "../core/bindings/UiInfo";
   import type { SessionStore } from "../state/session.svelte";
 
-  let { store }: { store: SessionStore } = $props();
+  let {
+    store,
+    uiHash = null,
+    uiInfo = null,
+    contract = null,
+  }: {
+    store: SessionStore;
+    /** `__UI_HASH__` de cette interface. */
+    uiHash?: string | null;
+    uiInfo?: UiInfo | null;
+    /** `__CONTRACT__` de cette interface. */
+    contract?: string | null;
+  } = $props();
+
+  const short = (h: string) => h.slice(0, 7);
+  /** Même commit, l'un des deux pouvant être abrégé. */
+  const same = (a: string, b: string) => a.startsWith(b) || b.startsWith(a);
+  const activeDiffers = $derived(
+    !!uiHash && !!uiInfo?.active_hash && uiInfo.source === "disk" && !same(uiHash, uiInfo.active_hash),
+  );
+  const contractDiffers = $derived(!!contract && !!uiInfo && uiInfo.contract !== contract);
 
   /** Libellé et couleur de chaque mode (seul `auto` est mesuré ; les autres suivent le thème `dark`). */
   const MODES: Record<string, { label: string; color: string }> = {
@@ -34,12 +60,34 @@
   {:else}
     <span class="dim">? for shortcuts</span>
   {/if}
+  {#if uiHash}
+    <span class="ui" data-testid="ui-hash">
+      {#if uiInfo?.restart_required}
+        <span class="warn" data-testid="ui-restart">relance requise ({short(uiInfo.restart_required)}) · </span>
+      {/if}
+      {#if activeDiffers && uiInfo?.active_hash}
+        <span class="warn" data-testid="ui-mismatch">actif {short(uiInfo.active_hash)} ≠ </span>
+      {/if}
+      {#if contractDiffers}
+        <span class="warn" data-testid="ui-contract">contrat ≠ exe · </span>
+      {/if}
+      <span class="dim">ui {short(uiHash)}{uiInfo ? (uiInfo.source === "disk" ? " (disque)" : " (embarquée)") : ""}</span>
+    </span>
+  {/if}
 </div>
 
 <style>
   .status-line {
+    display: flex;
     padding: 0 1ch 0 3ch;
     white-space: pre;
     overflow: hidden;
+  }
+  .ui {
+    margin-left: auto;
+    padding-left: 2ch;
+  }
+  .warn {
+    color: var(--warn);
   }
 </style>

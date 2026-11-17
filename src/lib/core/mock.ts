@@ -16,9 +16,11 @@
 import type { AgentEvent } from "./bindings/AgentEvent";
 import type { CoreEvent } from "./bindings/CoreEvent";
 import type { EventBody } from "./bindings/EventBody";
+import type { HistoryLoaded } from "./bindings/HistoryLoaded";
 import type { ImproveStatus } from "./bindings/ImproveStatus";
 import type { ImproveStep } from "./bindings/ImproveStep";
 import type { QuestionItem } from "./bindings/QuestionItem";
+import type { RepoStatus } from "./bindings/RepoStatus";
 import type { SessionResync } from "./bindings/SessionResync";
 import type { UiInfo } from "./bindings/UiInfo";
 
@@ -345,6 +347,15 @@ export class MockCore {
     onEvents([f.make({ kind: "status", state: "Idle" })]);
   }
 
+  /**
+   * Rattachement (J14) : reprend une session déjà en cours (son journal est
+   * rejoué par l'interface) sans rien réémettre ; la suite va à `onEvents`.
+   */
+  attach(onEvents: (batch: CoreEvent[]) => void): void {
+    this.#onEvents = onEvents;
+    this.#caps = ["ask_user_question_unanswered_v1"];
+  }
+
   /** Comme `send_message` : écho `user_message`, puis une réponse en streaming. */
   send(text: string, replyChars = 1200): void {
     this.stopStream();
@@ -576,12 +587,147 @@ export const MOCK_IMPROVE_STEPS: ImproveStep[] = [
   "merged",
 ];
 
+/** Issue simulée d'un cycle (`?improve=` en mode simulé). */
+export type MockImproveOutcome = "merged" | "restart_required" | "failed";
+
+/** Étapes simulées pour chaque issue (relance requise : pas de build ni de bascule, décision 18). */
+export function mockImproveSteps(outcome: MockImproveOutcome): ImproveStep[] {
+  if (outcome === "merged") return MOCK_IMPROVE_STEPS;
+  return ["preparing", "working", "checking", "testing", outcome];
+}
+
+export type MockSelfUpdateOptions = {
+  outcome?: MockImproveOutcome;
+  /** État du clone (`disabled` : `/ameliorer` grisé avec la raison). */
+  repo?: RepoStatus;
+  /** Sessions vivantes rendues par `attachSessions` (rattachement après un rechargement). */
+  live?: SessionResync[];
+};
+
+/** Détail d'un échec simulé (étape `testing`). */
+export const MOCK_FAIL_DETAIL = "npm test : 2 tests en échec (e2e/unit/resync.test.ts)";
+
+/**
+ * Sessions vivantes simulées pour `attachSessions` : la session principale
+ * (`mock-1`, historique repris de `historyRows` lignes puis journal d'environ
+ * `rows` lignes) et une session d'amélioration `improve-0` (rôle `improve`).
+ */
+export function mockLiveSessions(rows: number, historyRows = 0, seed = 15): SessionResync[] {
+  const hf = new EventFactory();
+  const history: HistoryLoaded | null =
+    historyRows > 0
+      ? {
+          session_id: "11111111-2222-4333-8444-555555555555",
+          events: buildHistory(hf, historyRows, seed + 7).events,
+          lines: historyRows,
+          used: historyRows,
+          ignored: 0,
+          unknown: 0,
+          unknown_elements: 0,
+          bad: 0,
+          sidechain: 0,
+          truncated: false,
+          subagent_threads: 0,
+          omitted_lines: 0,
+          omitted_bytes: 0,
+          clipped: 0,
+          dropped_events: 0,
+        }
+      : null;
+  const f = new EventFactory();
+  const T0 = Date.UTC(2026, 10, 17, 9, 0, 0);
+  const events: CoreEvent[] = [
+    f.make({ kind: "starting", pid: 4242, cwd: "C:\\projet", args: [] }, T0),
+    f.make(
+      {
+        kind: "ready",
+        version: "2.1.325",
+        capabilities: [],
+        commands: [{ name: "review", description: "Relire le diff", argument_hint: null }],
+        agents: [],
+        models: [],
+        permission_mode: "bypassPermissions",
+      } as EventBody,
+      T0,
+    ),
+    f.make(
+      {
+        kind: "init",
+        session_id: "11111111-2222-4333-8444-555555555555",
+        model: "claude-opus-5-5",
+        permission_mode: "bypassPermissions",
+        capabilities: ["ask_user_question_unanswered_v1"],
+        tools: [],
+        mcp_servers: [],
+        skills: [],
+        slash_commands: [],
+        version: "2.1.325",
+      },
+      T0,
+    ),
+  ];
+  // Messages tapés dans cette session (pas relus d'un transcript).
+  for (const e of buildHistory(f, rows, seed).events)
+    events.push(e.kind === "user_message" ? { ...e, origin: "Typed" } : e);
+  events.push(f.make({ kind: "status", state: "Idle" }, T0));
+  const g = new EventFactory();
+  const improve: CoreEvent[] = [
+    { ...g.make({ kind: "starting", pid: 5151, cwd: "C:\\mock\\work\\auto", args: [] }, T0), session: "improve-0" },
+    { ...g.make({ kind: "status", state: "Idle" }, T0), session: "improve-0" },
+  ];
+  return [
+    {
+      session: "mock-1",
+      role: "main",
+      cwd: "C:\\projet",
+      pid: 4242,
+      resumed_from: history?.session_id ?? null,
+      history,
+      events,
+      running: true,
+    },
+    {
+      session: "improve-0",
+      role: "improve",
+      cwd: "C:\\mock\\work\\auto",
+      pid: 5151,
+      resumed_from: null,
+      history: null,
+      events: improve,
+      running: true,
+    },
+  ];
+}
+
+/**
+ * Paramètres J14 du mode simulé lus dans l'URL : `improve=merged|restart|failed`,
+ * `repo=disabled|cloning`, `attach=<lignes>` (sessions vivantes au montage),
+ * `step=<ms>` (durée d'une étape).
+ */
+export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & { stepMs?: number } {
+  const p = new URLSearchParams(search);
+  const out: MockSelfUpdateOptions & { stepMs?: number } = {};
+  const imp = p.get("improve");
+  if (imp === "restart" || imp === "restart_required") out.outcome = "restart_required";
+  else if (imp === "failed" || imp === "fail") out.outcome = "failed";
+  const repo = p.get("repo");
+  if (repo === "disabled") out.repo = { state: "disabled", reason: "git introuvable dans le PATH (simulé)" };
+  else if (repo === "cloning") out.repo = { state: "cloning", path: "C:\\mock\\repo" };
+  const attach = p.get("attach");
+  if (attach !== null) out.live = mockLiveSessions(Number(attach) || 40);
+  const step = p.get("step");
+  if (step !== null && step !== "" && Number.isFinite(Number(step))) out.stepMs = Number(step);
+  return out;
+}
+
 /**
  * Commandes J14 simulées (`attach_sessions`, `ui_ready`, `get_ui_info`,
- * `improve_start`, `improve_cancel`, `ui_rollback`) : réponses minimales
- * conformes au contrat. `improveStart` déroule `MOCK_IMPROVE_STEPS`, une
- * étape toutes les `stepMs` ms, et passe chaque `ImproveStatus` à
- * `onStatus` (l'équivalent de l'événement global `improve_status`).
+ * `improve_start`, `improve_cancel`, `ui_rollback`) : réponses conformes au
+ * contrat. `improveStart` déroule les étapes de l'issue choisie, une toutes
+ * les `stepMs` ms, et passe chaque `ImproveStatus` à `onStatus` et aux
+ * abonnés de `onImproveStatus` (l'équivalent de l'événement global
+ * `improve_status`). Pendant `working`, la session dédiée émet sur le canal
+ * de `attachSessions` : elle doit rester hors de la conversation principale.
  */
 export class MockSelfUpdate {
   info: UiInfo = {
@@ -595,21 +741,33 @@ export class MockSelfUpdate {
     improve: null,
   };
   readyCalls: (string | null)[] = [];
+  /** Commandes reçues, dans l'ordre (vérifiées par les tests e2e). */
+  calls: { cmd: string; args: unknown }[] = [];
+  outcome: MockImproveOutcome;
+  live: SessionResync[];
   #timers: ReturnType<typeof setTimeout>[] = [];
   #n = 0;
   #onStatus: (s: ImproveStatus) => void;
+  #listeners = new Set<(s: ImproveStatus) => void>();
+  #attached: ((batch: CoreEvent[]) => void) | null = null;
   #stepMs: number;
 
-  constructor(onStatus: (s: ImproveStatus) => void = () => {}, stepMs = 300) {
+  constructor(onStatus: (s: ImproveStatus) => void = () => {}, stepMs = 300, opts: MockSelfUpdateOptions = {}) {
     this.#onStatus = onStatus;
     this.#stepMs = stepMs;
+    this.outcome = opts.outcome ?? "merged";
+    this.live = opts.live ?? [];
+    if (opts.repo) this.info.repo = opts.repo;
   }
 
-  attachSessions(): Promise<SessionResync[]> {
-    return Promise.resolve([]);
+  attachSessions(onEvents?: (batch: CoreEvent[]) => void): Promise<SessionResync[]> {
+    this.calls.push({ cmd: "attach_sessions", args: {} });
+    this.#attached = onEvents ?? null;
+    return Promise.resolve(structuredClone(this.live));
   }
 
   uiReady(hash: string | null): Promise<boolean> {
+    this.calls.push({ cmd: "ui_ready", args: { hash } });
     this.readyCalls.push(hash);
     return Promise.resolve(false);
   }
@@ -618,34 +776,56 @@ export class MockSelfUpdate {
     return Promise.resolve(structuredClone(this.info));
   }
 
+  onImproveStatus(cb: (s: ImproveStatus) => void): Promise<() => void> {
+    this.#listeners.add(cb);
+    return Promise.resolve(() => {
+      this.#listeners.delete(cb);
+    });
+  }
+
+  #emit(s: ImproveStatus): void {
+    this.info.improve = s;
+    this.#onStatus(s);
+    for (const l of this.#listeners) l(s);
+  }
+
   improveStart(request: string): Promise<ImproveStatus> {
-    if (this.info.repo.state !== "ready") {
-      return Promise.reject({ kind: "unsupported", message: "clone indisponible" });
+    this.calls.push({ cmd: "improve_start", args: { request } });
+    const repo = this.info.repo;
+    if (repo.state !== "ready") {
+      const why = repo.state === "disabled" ? repo.reason : "clone indisponible";
+      return Promise.reject({ kind: "unsupported", message: why });
     }
-    const id = `improve-${++this.#n}`;
+    const n = ++this.#n;
+    const id = `improve-${n}`;
+    const session = `improve-${n}`;
     const slug = request.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "demande";
+    const commit = `mock${n}`.padEnd(7, "0");
     const status = (step: ImproveStep): ImproveStatus => ({
       id,
       branch: `auto/20261117-1200-${slug}`,
       request,
       step,
-      session: null,
-      commit: step === "preparing" || step === "working" ? null : `mock${this.#n}`.padEnd(7, "0"),
-      detail: null,
+      session: step === "preparing" ? null : session,
+      commit: step === "preparing" || step === "working" ? null : commit,
+      detail: step === "failed" ? MOCK_FAIL_DETAIL : null,
       t: Date.now(),
     });
-    MOCK_IMPROVE_STEPS.forEach((step, i) => {
+    mockImproveSteps(this.outcome).forEach((step, i) => {
       if (i === 0) return;
       this.#timers.push(
         setTimeout(() => {
           const s = status(step);
-          this.info.improve = s;
           if (step === "merged") {
             this.info.previous_hash = this.info.active_hash;
             this.info.active_hash = s.commit;
             this.info.source = "disk";
+          } else if (step === "restart_required") {
+            this.info.restart_required = s.commit;
+          } else if (step === "working") {
+            this.#improveEvents(session);
           }
-          this.#onStatus(s);
+          this.#emit(s);
         }, i * this.#stepMs),
       );
     });
@@ -654,26 +834,42 @@ export class MockSelfUpdate {
     return Promise.resolve(first);
   }
 
+  /** Quelques événements de la session dédiée, sur le canal du rattachement. */
+  #improveEvents(session: string): void {
+    const f = new EventFactory();
+    const ev = (body: EventBody): CoreEvent => ({ ...f.make(body), session });
+    this.#attached?.([
+      ev({ kind: "starting", pid: 6000 + this.#n, cwd: "C:\\mock\\work\\auto", args: [] }),
+      ev({ kind: "user_message", thread: "main", uuid: null, text: "Prompt d'amélioration (simulé)", origin: "Typed" }),
+      ev({ kind: "status", state: "Streaming" }),
+    ]);
+  }
+
   improveCancel(id: string): Promise<void> {
+    this.calls.push({ cmd: "improve_cancel", args: { id } });
     const cur = this.info.improve;
     if (!cur || cur.id !== id) return Promise.reject({ kind: "invalid_argument", message: id });
     this.#timers.forEach(clearTimeout);
     this.#timers = [];
-    const s: ImproveStatus = { ...cur, step: "cancelled", t: Date.now() };
-    this.info.improve = s;
-    this.#onStatus(s);
+    this.#emit({ ...cur, step: "cancelled", t: Date.now() });
     return Promise.resolve();
   }
 
   uiRollback(): Promise<UiInfo> {
+    this.calls.push({ cmd: "ui_rollback", args: {} });
+    const from = this.info.active_hash;
     this.info.active_hash = this.info.previous_hash;
     this.info.previous_hash = null;
     this.info.source = this.info.active_hash ? "disk" : "embedded";
+    const cur = this.info.improve;
+    if (cur) this.#emit({ ...cur, step: "rolled_back", commit: from ?? cur.commit, detail: null, t: Date.now() });
     return this.getUiInfo();
   }
 
   dispose(): void {
     this.#timers.forEach(clearTimeout);
     this.#timers = [];
+    this.#listeners.clear();
   }
 }
+

@@ -14,9 +14,17 @@
   // J11 (décision 11) : lancée sans dossier en argument, l'app montre le
   // sélecteur des projets, puis celui des sessions du projet choisi
   // (nouvelle session ou reprise avec tout l'historique).
-  import { onMount } from "svelte";
+  // J14 (décisions 15 à 19) : au montage, rattachement aux sessions vivantes
+  // du cœur (`attach_sessions`, rejeu de l'historique et du journal) avant
+  // tout démarrage, puis signal « prêt » (`ui_ready`) ; saisie, historique ↑↓,
+  // agents dépliés et Ctrl+O gardés dans `sessionStorage` à travers un
+  // rechargement ; `/ameliorer <demande>` et `/revenir-version` (entrées
+  // locales de la palette) ; bandeau d'avancement (`ImproveBanner`) ; hash de
+  // l'interface dans la ligne d'état.
+  import { onMount, tick } from "svelte";
   import AgentColumn from "./lib/components/agents/AgentColumn.svelte";
   import Conversation from "./lib/components/Conversation.svelte";
+  import ImproveBanner from "./lib/components/ImproveBanner.svelte";
   import { entriesFrom, filterEntries, nameColumn } from "./lib/components/Palette.svelte";
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
   import Prompt from "./lib/components/Prompt.svelte";
@@ -34,16 +42,28 @@
     skipQuestion as skipQuestionCmd,
     startSession,
     stopSession,
+    tauriSelfUpdate,
     type Answer,
+    type ImproveStatus,
+    type SelfUpdateApi,
+    type SessionResync,
+    type UiInfo,
     type CoreEvent,
     type SessionKey,
     type SkipReason,
   } from "./lib/core/client";
   import type { ModelInfo } from "./lib/core/bindings/ModelInfo";
-  import type { MockCore } from "./lib/core/mock";
+  import type { MockCore, MockSelfUpdate } from "./lib/core/mock";
   import { Keys, keyInput, type KeyAction, type Overlay } from "./lib/state/keys.svelte";
   import { SessionStore } from "./lib/state/session.svelte";
-  import { resumeSession } from "./lib/state/sessions.svelte";
+  import {
+    SessionRouter,
+    loadUiSnapshot,
+    mainOf,
+    resumeSession,
+    saveUiSnapshot,
+    type UiSnapshot,
+  } from "./lib/state/sessions.svelte";
   import { VERSION_NOTICE_CODE, noticeVersion } from "./lib/state/versionNotice";
 
   // Mode simulé : `?mock=…`, ou d'office hors de Tauri. `mock.ts` n'est
@@ -154,12 +174,30 @@
   let initNames: string[] = $state([]);
   /** `/model` est traité par l'app (sélecteur) : toujours dans la palette. */
   const MODEL_ENTRY = { name: "model", description: "Set the AI model for Claude Code", argument_hint: null };
-  const paletteEntries = $derived(
-    entriesFrom(
+  /** Entrées locales de l'auto-amélioration (J14), traitées par l'app, jamais envoyées au CLI. */
+  const IMPROVE_NAME = "ameliorer";
+  const ROLLBACK_NAME = "revenir-version";
+  const paletteEntries = $derived.by(() => {
+    const base = entriesFrom(
       store.meta.commands.some((c) => c.name === "model") ? store.meta.commands : [...store.meta.commands, MODEL_ENTRY],
       initNames,
-    ),
-  );
+    ).filter((e) => e.name !== IMPROVE_NAME && e.name !== ROLLBACK_NAME);
+    return [
+      ...base,
+      {
+        name: IMPROVE_NAME,
+        description: "Améliorer l'app : branche, tests, bascule de l'interface",
+        argumentHint: "<demande>",
+        disabled: improveDisabled,
+      },
+      {
+        name: ROLLBACK_NAME,
+        description: "Revenir à la version précédente de l'interface",
+        argumentHint: null,
+        disabled: rollbackDisabled,
+      },
+    ];
+  });
   const paletteNameWidth = $derived(nameColumn(paletteEntries));
   /** Palette ouverte par Ctrl+K, avec le texte déjà tapé à ce moment. */
   let ctrlK = $state<{ base: string } | null>(null);
@@ -209,6 +247,13 @@
   function choosePalette(i: number, how: "enter" | "tab" | "click"): void {
     const e = paletteItems[i];
     if (!e) return;
+    // Entrée locale indisponible : sa raison, rien n'est inséré ni envoyé.
+    if (e.disabled) {
+      ctrlK = null;
+      slashDismissed = draft;
+      showNotice(`/${e.name} indisponible : ${e.disabled}`);
+      return;
+    }
     const tail = ctrlKBase;
     ctrlK = null;
     slashDismissed = null;
@@ -444,6 +489,17 @@
   async function submit(text: string) {
     keys.disarm();
     const trimmed = text.trim();
+    // J14 : entrées locales de l'auto-amélioration (jamais envoyées au CLI).
+    const improve = /^\/ameliorer(?:\s+([\s\S]*))?$/.exec(trimmed);
+    if (improve) {
+      void startImprove((improve[1] ?? "").trim());
+      return;
+    }
+    if (/^\/revenir-version\s*$/.test(trimmed)) {
+      draft = "";
+      void rollbackUi();
+      return;
+    }
     // `/model` : sélecteur de modèle (le CLI en stream-json ne l'ouvre pas).
     const model = /^\/model(?:\s+(\S+))?\s*$/.exec(trimmed);
     if (model) {
@@ -457,6 +513,7 @@
     }
     draft = "";
     sent.push(trimmed);
+    saveUi();
     // Envoyer un message ramène en bas, comme le terminal.
     conversation?.scrollToBottom();
     try {
@@ -526,8 +583,8 @@
    * `user_message Interrupted`, `turn_result aborted_streaming`, `Idle`) et
    * `t5` (`init` à chaque tour, avec le modèle choisi).
    */
-  function mockBackend(m: MockCore): { backend: Backend; filter: (b: CoreEvent[]) => void } {
-    let seq = 0;
+  function mockBackend(m: MockCore, firstSeq = 0): { backend: Backend; filter: (b: CoreEvent[]) => void } {
+    let seq = firstSeq;
     let model = "claude-opus-5-5";
     let init: Extract<CoreEvent, { kind: "init" }> | null = null;
     let aborting = false;
@@ -583,12 +640,17 @@
   /** Commandes demandées au cœur simulé (vérifiées par les tests e2e). */
   const mockCalls: { cmd: string; args: unknown }[] = [];
 
-  async function startMock() {
+  /**
+   * Mode simulé. Sans `attached`, nouvelle session `MockCore` ; avec, la
+   * session rattachée (journal déjà rejoué dans `store`) continue : rien
+   * n'est réémis et la numérotation reprend après son dernier `seq`.
+   */
+  async function startMock(attached: SessionResync | null = null) {
     const { MockCore, mockOptionsFromUrl } = await import("./lib/core/mock");
     const opts = mockOptionsFromUrl(location.search) ?? { name: "demo", rows: 60 };
-    mock = new MockCore(opts);
-    cwd = `simulé : ${opts.name}`;
-    const mb = mockBackend(mock);
+    mock = new MockCore(attached ? { ...opts, rows: 0 } : opts);
+    cwd = attached ? attached.cwd : `simulé : ${opts.name}`;
+    const mb = mockBackend(mock, attached ? store.lastSeq + 1 : 0);
     backend = {
       send: (t) => (mockCalls.push({ cmd: "send_message", args: { text: t } }), mb.backend.send(t)),
       interrupt: () => (mockCalls.push({ cmd: "interrupt", args: { cancel_queued: false } }), mb.backend.interrupt()),
@@ -601,7 +663,8 @@
         mockCalls.push({ cmd: "skip_question", args: { request_id: id, reason } }), mb.backend.skip(id, reason)
       ),
     };
-    mock.start(mb.filter);
+    if (attached) mock.attach(mb.filter);
+    else mock.start(mb.filter);
     mockReady = true;
     // Points d'accès des mesures e2e (mode simulé seulement).
     (window as unknown as Record<string, unknown>).__orch = {
@@ -611,24 +674,261 @@
       latencies,
       calls: mockCalls,
       keys,
+      selfUpdate: () => mockSelfUpdate,
+      router: () => router,
+      uiInfo: () => uiInfo,
+      saveUi,
     };
   }
 
-  onMount(() => {
-    if (mockMode) {
-      startMock().catch((err) => (startError = String(err)));
+  // --- Rattachement, signal « prêt » et auto-amélioration (J14) ----------------
+
+  /** Commandes d'auto-amélioration, réelles ou simulées (choisies au montage). */
+  let selfUpdate: SelfUpdateApi | null = $state.raw(null);
+  let mockSelfUpdate: MockSelfUpdate | null = null;
+  /** Sessions rattachées au montage, et celles apparues ensuite sur le même canal. */
+  let router: SessionRouter | null = null;
+  /** Réponse de `get_ui_info` (`null` : pas encore lue, ou commande en échec). */
+  let uiInfo: UiInfo | null = $state(null);
+  let uiInfoError: string | null = $state(null);
+  /** Bandeau d'amélioration fermé (id). */
+  let improveDismissed: string | null = $state(null);
+  /** Dernier état reçu d'une amélioration. */
+  let improveLive: ImproveStatus | null = $state(null);
+  /** Hash et empreinte du contrat de cette interface (`define` de `vite.config.ts`). */
+  const UI_HASH = typeof __UI_HASH__ === "string" ? __UI_HASH__ : "dev";
+  const CONTRACT = typeof __CONTRACT__ === "string" ? __CONTRACT__ : null;
+  const FINAL_STEPS = ["merged", "restart_required", "failed", "cancelled", "rolled_back"];
+
+  const improveRunning = $derived.by(() => {
+    const st = improveLive ?? uiInfo?.improve ?? null;
+    return st !== null && !FINAL_STEPS.includes(st.step);
+  });
+
+  /** Raison pour laquelle `/ameliorer` est grisé, ou `null`. */
+  const improveDisabled = $derived.by((): string | null => {
+    if (!selfUpdate) return "interface en cours de démarrage";
+    if (!uiInfo) return uiInfoError ? `état inconnu (${uiInfoError})` : "état du clone en cours de lecture";
+    const r = uiInfo.repo;
+    if (r.state === "disabled") return r.reason;
+    if (r.state === "cloning") return `clonage du dépôt en cours (${r.path})`;
+    if (improveRunning) return "une amélioration est déjà en cours";
+    return null;
+  });
+
+  /** Raison pour laquelle `/revenir-version` est grisé, ou `null`. */
+  const rollbackDisabled = $derived.by((): string | null => {
+    if (!selfUpdate) return "interface en cours de démarrage";
+    if (!uiInfo) return uiInfoError ? `état inconnu (${uiInfoError})` : "état de l'interface en cours de lecture";
+    if (uiInfo.source === "embedded" && !uiInfo.previous_hash) return "interface embarquée, aucune version précédente";
+    return null;
+  });
+
+  async function refreshUiInfo(): Promise<void> {
+    const su = selfUpdate;
+    if (!su) return;
+    try {
+      const info = await su.getUiInfo();
+      uiInfo = info ?? null;
+      uiInfoError = info ? null : "réponse vide";
+    } catch (err) {
+      uiInfoError = describeError(err);
+    }
+  }
+
+  async function startImprove(request: string): Promise<void> {
+    if (!request) {
+      draft = "/ameliorer ";
+      showNotice("Usage : /ameliorer <demande>");
+      prompt?.focusEnd();
       return;
     }
+    const su = selfUpdate;
+    if (improveDisabled || !su) {
+      showNotice(`/ameliorer indisponible : ${improveDisabled ?? "interface en cours de démarrage"}`);
+      return;
+    }
+    draft = "";
+    try {
+      const st = await su.improveStart(request);
+      improveLive = st;
+      improveDismissed = null;
+      if (uiInfo) uiInfo = { ...uiInfo, improve: st };
+    } catch (err) {
+      store.addBanner("Error", "improve_start", `/ameliorer : ${describeError(err)}`);
+      void refreshUiInfo();
+    }
+  }
+
+  async function rollbackUi(): Promise<void> {
+    const su = selfUpdate;
+    if (rollbackDisabled || !su) {
+      showNotice(`/revenir-version indisponible : ${rollbackDisabled ?? "interface en cours de démarrage"}`);
+      return;
+    }
+    try {
+      const info = await su.uiRollback();
+      uiInfo = info;
+      showNotice(info?.active_hash ? `Interface ${info.active_hash.slice(0, 7)} réactivée` : "Interface embarquée réactivée");
+    } catch (err) {
+      store.addBanner("Error", "ui_rollback", `Retour arrière : ${describeError(err)}`);
+    }
+  }
+
+  function onImproveStatus(st: ImproveStatus): void {
+    improveLive = st;
+    if (FINAL_STEPS.includes(st.step)) void refreshUiInfo();
+  }
+
+  /** Abonnement du bandeau à l'avancement (`IMPROVE_EVENT`, ou le cœur simulé). */
+  function subscribeImprove(cb: (st: ImproveStatus) => void): Promise<() => void> {
+    const su = selfUpdate;
+    return su ? su.onImproveStatus(cb) : Promise.resolve(() => {});
+  }
+
+  /** Clé de la session principale affichée (mode simulé : `mock-1`). */
+  function mainKey(): SessionKey | null {
+    return mockMode ? (mockReady ? "mock-1" : null) : session;
+  }
+
+  /** État de l'interface à garder à travers un rechargement. */
+  function snapshot(): UiSnapshot {
+    return {
+      session: mainKey(),
+      draft,
+      sent: sent.slice(-500),
+      agentsOpen: [...agentsOpen],
+      agentsDoneOpen,
+      verbose,
+      improveDismissed,
+    };
+  }
+
+  function saveUi(): void {
+    try {
+      saveUiSnapshot(snapshot());
+    } catch {
+      // Jamais bloquant.
+    }
+  }
+
+  /** Rétablit l'état gardé s'il appartient à la session affichée. */
+  function restoreUi(saved: UiSnapshot | null): void {
+    if (!saved) return;
+    try {
+      improveDismissed = saved.improveDismissed;
+      if (saved.session === null || saved.session !== mainKey()) return;
+      draft = saved.draft;
+      sent.length = 0;
+      sent.push(...saved.sent);
+      agentsOpen = saved.agentsOpen;
+      agentsDoneOpen = saved.agentsDoneOpen;
+      verbose = saved.verbose;
+    } catch {
+      // État illisible : on garde l'état neuf.
+    }
+  }
+
+  // Sauvegarde à chaque changement (le rechargement de la bascule ne laisse
+  // pas toujours à `pagehide` le temps d'écrire), une fois le montage fini.
+  let booted = $state(false);
+  $effect(() => {
+    void [draft, agentsOpen, agentsDoneOpen, verbose, improveDismissed, session, mockReady];
+    if (booted) saveUi();
+  });
+
+  /** Magasin d'une session rattachée : la principale a les crochets de l'app (palette, latence). */
+  function routedStore(_key: SessionKey, role: "main" | "improve"): SessionStore {
+    return role === "main" ? newStore() : new SessionStore();
+  }
+
+  /** La session principale rattachée devient la session affichée (aucune session relancée). */
+  async function adoptMain(r: SessionRouter, main: SessionResync): Promise<void> {
+    const s = r.get(main.session);
+    if (!s) return;
+    phase = "start";
+    cwd = main.cwd;
+    store = s;
+    noteInit(main.history?.events ?? []);
+    noteInit(main.events);
+    if (mockMode) await startMock(main);
+    else if (main.running) session = main.session;
+    else startFailed = { path: main.cwd, resumeId: main.resumed_from };
+  }
+
+  /** Démarrage sans session rattachée (comportement d'avant J14). */
+  async function startFresh(): Promise<void> {
+    if (mockMode) {
+      await startMock();
+      return;
+    }
+    const info = await getLaunchInfo();
+    launchError = info.launch_error;
+    if (info.cwd_from_args) await startNew(info.cwd);
+    else phase = "projects";
+  }
+
+  onMount(() => {
+    const saved = loadUiSnapshot();
+    const onHide = () => saveUi();
+    window.addEventListener("pagehide", onHide);
+    window.addEventListener("beforeunload", onHide);
     (async () => {
-      try {
-        const info = await getLaunchInfo();
-        launchError = info.launch_error;
-        if (info.cwd_from_args) await startNew(info.cwd);
-        else phase = "projects";
-      } catch (err) {
-        startError = describeError(err);
+      let su: SelfUpdateApi = tauriSelfUpdate;
+      if (mockMode) {
+        const m = await import("./lib/core/mock");
+        const o = m.mockSelfUpdateFromUrl(location.search);
+        const ms = new m.MockSelfUpdate(() => {}, o.stepMs ?? 300, o);
+        ms.info.build_commit = UI_HASH;
+        if (CONTRACT) ms.info.contract = CONTRACT;
+        mockSelfUpdate = ms;
+        su = ms;
       }
+      selfUpdate = su;
+      const r = new SessionRouter(routedStore);
+      router = r;
+      // 1. Rattachement, AVANT tout démarrage : une session vivante n'est jamais relancée.
+      let live: SessionResync[] = [];
+      try {
+        live = (await su.attachSessions(r.onBatch)) ?? [];
+      } catch (err) {
+        console.warn("attach_sessions", describeError(err));
+      }
+      r.resync(live);
+      const main = mainOf(live);
+      let fresh = !main;
+      if (main) {
+        try {
+          await adoptMain(r, main);
+          restoreUi(saved);
+        } catch (err) {
+          startError = describeError(err);
+        }
+      }
+      // 2. État de l'interface, puis signal « prêt » (watchdog de 5 s du cœur).
+      await refreshUiInfo();
+      await tick();
+      try {
+        await su.uiReady(uiInfo?.source === "embedded" ? null : UI_HASH);
+      } catch (err) {
+        console.warn("ui_ready", describeError(err));
+      }
+      // 3. Sans session à reprendre : démarrage habituel.
+      if (fresh) {
+        try {
+          await startFresh();
+          if (mockMode) restoreUi(saved);
+        } catch (err) {
+          startError = mockMode ? String(err) : describeError(err);
+        }
+      }
+      booted = true;
+      saveUi();
     })();
+    return () => {
+      window.removeEventListener("pagehide", onHide);
+      window.removeEventListener("beforeunload", onHide);
+    };
   });
 
   // --- Projets et sessions (J11) -------------------------------------------------
@@ -730,6 +1030,22 @@
   {#if launchError}
     <div class="banner" data-testid="launch-error">{launchError}</div>
   {/if}
+  {#if selfUpdate}
+    <!-- J14 : avancement de `/ameliorer` (session dédiée, tests, bascule, échec). -->
+    <ImproveBanner
+      initial={uiInfo?.improve ?? null}
+      subscribe={subscribeImprove}
+      repoPath={uiInfo && uiInfo.repo.state !== "disabled" && uiInfo.repo.state !== "unknown" ? uiInfo.repo.path : null}
+      dismissed={improveDismissed}
+      oncancel={(id) => selfUpdate!.improveCancel(id)}
+      onrollback={() => void rollbackUi()}
+      ondismiss={(id) => {
+        improveDismissed = id;
+        prompt?.focus();
+      }}
+      onstatus={onImproveStatus}
+    />
+  {/if}
   <div class="split">
     <div class="left">
       {#if phase === "projects"}
@@ -786,7 +1102,7 @@
             onpalettemove={movePalette}
             onpalettechoose={choosePalette}
           />
-          <StatusLine {store} />
+          <StatusLine {store} uiHash={UI_HASH} {uiInfo} contract={CONTRACT} />
         {/if}
       {/if}
     </div>

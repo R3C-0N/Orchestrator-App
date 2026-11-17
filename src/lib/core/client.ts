@@ -121,3 +121,38 @@ export const uiRollback = () => invoke<UiInfo>("ui_rollback");
 
 /** Nom de l'événement global Tauri qui porte un `ImproveStatus` (`IMPROVE_EVENT` côté Rust). */
 export const IMPROVE_EVENT = "improve_status";
+
+/**
+ * Commandes d'auto-amélioration vues par l'interface : réelles (`tauriSelfUpdate`)
+ * ou simulées (`MockSelfUpdate`, `mock.ts`), même forme. `onImproveStatus`
+ * abonne à l'avancement (`IMPROVE_EVENT`) et rend de quoi se désabonner.
+ */
+export type SelfUpdateApi = {
+  attachSessions(onEvents: (batch: CoreEvent[]) => void): Promise<SessionResync[]>;
+  uiReady(hash: string | null): Promise<boolean>;
+  getUiInfo(): Promise<UiInfo>;
+  improveStart(request: string): Promise<ImproveStatus>;
+  improveCancel(id: string): Promise<void>;
+  uiRollback(): Promise<UiInfo>;
+  onImproveStatus(cb: (s: ImproveStatus) => void): Promise<() => void>;
+};
+
+export const tauriSelfUpdate: SelfUpdateApi = {
+  attachSessions,
+  uiReady,
+  getUiInfo,
+  improveStart,
+  improveCancel,
+  uiRollback,
+  async onImproveStatus(cb) {
+    const { listen } = await import("@tauri-apps/api/event");
+    const un = await listen<ImproveStatus>(IMPROVE_EVENT, (e) => cb(e.payload));
+    return () => {
+      try {
+        un?.();
+      } catch {
+        // Déjà désabonné (page déchargée).
+      }
+    };
+  },
+};

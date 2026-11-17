@@ -2,7 +2,17 @@
   // Modèle pur de la palette (testé dans `e2e/unit/palette.test.ts`).
   import type { CommandInfo } from "../core/bindings/CommandInfo";
 
-  export type PaletteEntry = { name: string; description: string; argumentHint: string | null };
+  /**
+   * `disabled` : raison pour laquelle l'entrée est grisée (entrée locale de
+   * l'app indisponible, `/ameliorer` sans clone par exemple) ; elle remplace
+   * la description et l'entrée ne part pas.
+   */
+  export type PaletteEntry = {
+    name: string;
+    description: string;
+    argumentHint: string | null;
+    disabled?: string | null;
+  };
 
   /**
    * Entrées : `ready.commands` (réponse à `initialize`, `t11` : commandes et
@@ -116,8 +126,10 @@
     <div
       class="row"
       class:sel={i === sel}
+      class:off={!!e.disabled}
       role="option"
       aria-selected={i === sel}
+      aria-disabled={e.disabled ? "true" : undefined}
       tabindex="-1"
       data-name={e.name}
       onmousedown={(ev) => ev.preventDefault()}
@@ -125,7 +137,7 @@
     >
       <span class="cur">{i === sel ? "  ❯ " : "    "}</span>
       <span class="name">/{e.name}</span>
-      <span class="desc">{e.description}</span>
+      <span class="desc">{e.disabled ? `(indisponible : ${e.disabled})` : e.description}</span>
     </div>
   {/each}
 </div>
@@ -165,5 +177,9 @@
   }
   .row.sel {
     color: var(--t-lavender);
+  }
+  .row.off .name,
+  .row.off .desc {
+    opacity: 0.55;
   }
 </style>
