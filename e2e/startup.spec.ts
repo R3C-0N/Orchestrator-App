@@ -26,6 +26,27 @@ const calls = (p: Page) => p.evaluate(() => (window as unknown as { __calls: Cal
 const cmds = async (p: Page) => (await calls(p)).map((c) => c.cmd);
 const starts = async (p: Page) => (await calls(p)).filter((c) => c.cmd === "start_session").map((c) => c.args);
 
+/**
+ * Commandes du montage J14 (rattachement, état et signal « prêt » de
+ * l'interface, abonnements aux événements globaux) : vérifiées à part par
+ * `expectBoot`, retirées des listes comparées.
+ */
+const BOOT_CMDS = new Set(["attach_sessions", "get_ui_info", "ui_ready"]);
+const appCmds = async (p: Page) => (await cmds(p)).filter((c) => !BOOT_CMDS.has(c) && !c.startsWith("plugin:event|"));
+
+/** `attach_sessions` avant tout démarrage, `ui_ready` envoyé une fois. */
+async function expectBoot(p: Page) {
+  const all = await cmds(p);
+  const attach = all.indexOf("attach_sessions");
+  expect(attach).toBeGreaterThanOrEqual(0);
+  for (const c of ["get_launch_info", "start_session"]) {
+    const i = all.indexOf(c);
+    if (i >= 0) expect(attach).toBeLessThan(i);
+  }
+  expect(all.filter((c) => c === "ui_ready")).toHaveLength(1);
+  expect(all.indexOf("ui_ready")).toBeGreaterThan(attach);
+}
+
 /** Projet puis sélecteur des sessions, au clavier. */
 async function toSessions(page: Page) {
   await expect(page.getByTestId("project-picker")).toContainText("proj");
@@ -44,7 +65,8 @@ test("sans argument : projets, sessions, retour, reprise avec historique", async
   await page.keyboard.press("ArrowDown");
   await page.keyboard.press("Enter");
   await expect(page.locator('[data-row-kind="user"]')).toContainText("bonjour 1");
-  expect(await cmds(page)).toEqual([
+  await expectBoot(page);
+  expect(await appCmds(page)).toEqual([
     "get_launch_info",
     "list_projects",
     "list_sessions",
@@ -69,7 +91,8 @@ test("nouvelle session depuis le sélecteur", async ({ page }) => {
 test("avec argument : session directe, sans sélecteur", async ({ page }) => {
   await open(page, { fromArgs: true, launchError: null });
   await expect(page.locator(PROMPT)).toBeEnabled();
-  expect(await cmds(page)).toEqual(["get_launch_info", "start_session"]);
+  await expectBoot(page);
+  expect(await appCmds(page)).toEqual(["get_launch_info", "start_session"]);
   await expect(page.getByTestId("project-picker")).toHaveCount(0);
 });
 

@@ -29,6 +29,15 @@
     rolled_back: "retour à la version précédente",
   };
 
+  /** Demande sur une ligne pour l'en-tête (les retours à la ligne deviennent des espaces). */
+  export function oneLine(request: string, max = 120): string {
+    const s = request.replace(/\s+/g, " ").trim();
+    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  }
+
+  /** Délai sans état final après « annuler » avant de le signaler. */
+  export const CANCEL_TIMEOUT_MS = 15_000;
+
   export function isFinal(step: ImproveStep): boolean {
     return !RUNNING_STEPS.includes(step);
   }
@@ -97,6 +106,12 @@
   let status = $state<ImproveStatus | null>(null);
   let cancelling = $state(false);
   let error = $state<string | null>(null);
+  let cancelTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function stopCancelTimer(): void {
+    if (cancelTimer !== null) clearTimeout(cancelTimer);
+    cancelTimer = null;
+  }
 
   // État initial (avant tout événement) ; un événement plus récent l'emporte.
   $effect(() => {
@@ -109,7 +124,10 @@
     let gone = false;
     subscribe((s) => {
       status = s;
-      if (isFinal(s.step)) cancelling = false;
+      if (isFinal(s.step)) {
+        cancelling = false;
+        stopCancelTimer();
+      }
       onstatus?.(s);
     })
       .then((u) => {
@@ -119,6 +137,7 @@
       .catch((e) => (error = `avancement indisponible : ${String(e)}`));
     return () => {
       gone = true;
+      stopCancelTimer();
       un?.();
     };
   });
@@ -142,9 +161,18 @@
     if (!status || cancelling) return;
     cancelling = true;
     error = null;
+    // Sans état final dans le délai : le bouton revient, avec une explication.
+    stopCancelTimer();
+    cancelTimer = setTimeout(() => {
+      cancelTimer = null;
+      if (!cancelling) return;
+      cancelling = false;
+      error = `annulation sans réponse après ${CANCEL_TIMEOUT_MS / 1000} s : le cycle continue peut-être, réessayer`;
+    }, CANCEL_TIMEOUT_MS);
     try {
       await oncancel(status.id);
     } catch (e) {
+      stopCancelTimer();
       cancelling = false;
       error = e && typeof e === "object" && "kind" in e ? JSON.stringify(e) : String(e);
     }
@@ -161,7 +189,7 @@
   >
     <div class="head">
       <span class="glyph" class:spin={!final}>{final ? (status.step === "failed" ? "✗" : "✻") : "✻"}</span>
-      <span class="req">/ameliorer {status.request}</span>
+      <span class="req" title={status.request}>/ameliorer {oneLine(status.request)}</span>
       <span class="dim"> · {status.branch}</span>
       {#if n !== null}
         <span class="dim"> · étape {n}/{RUNNING_STEPS.length}</span>

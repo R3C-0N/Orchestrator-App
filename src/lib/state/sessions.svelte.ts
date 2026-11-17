@@ -280,6 +280,10 @@ export function resyncStore(store: SessionStore, r: Pick<SessionResync, "history
  *   entre le journal et le canal.
  * - Une session inconnue (lancée après le rattachement, une amélioration par
  *   exemple) reçoit un magasin à la volée, de rôle `improve` sauf indication.
+ * - `make` peut rendre `null` : la session n'a alors pas de magasin (jamais
+ *   affichée, une amélioration) ; seuls ses `TAIL_MAX` derniers événements
+ *   sont gardés (`tail`), la mémoire reste bornée.
+ * - `dispose` : les lots arrivés ensuite sont ignorés (rattachement abandonné).
  */
 export class SessionRouter {
   readonly stores = new Map<SessionKey, SessionStore>();
@@ -287,12 +291,27 @@ export class SessionRouter {
   readonly info = new Map<SessionKey, SessionResync>();
   /** Événements écartés parce que déjà appliqués (recouvrement journal / canal). */
   duplicates = 0;
+  static readonly TAIL_MAX = 50;
   #last = new Map<SessionKey, number>();
+  #tails = new Map<SessionKey, CoreEvent[]>();
   #buffer: CoreEvent[][] | null = [];
-  readonly #make: (key: SessionKey, role: SessionRole) => SessionStore;
+  #disposed = false;
+  readonly #make: (key: SessionKey, role: SessionRole) => SessionStore | null;
 
-  constructor(make: (key: SessionKey, role: SessionRole) => SessionStore) {
+  constructor(make: (key: SessionKey, role: SessionRole) => SessionStore | null) {
     this.#make = make;
+  }
+
+  /** Derniers événements d'une session sans magasin (au plus `TAIL_MAX`). */
+  tail(key: SessionKey): CoreEvent[] {
+    return this.#tails.get(key) ?? [];
+  }
+
+  /** Abandon du rattachement : plus rien n'est gardé ni aiguillé. */
+  dispose(): void {
+    this.#disposed = true;
+    this.#buffer = null;
+    this.#tails.clear();
   }
 
   /** Vrai une fois `resync` fait (les lots passent alors directement). */
@@ -302,6 +321,7 @@ export class SessionRouter {
 
   /** À passer comme `onEvents` de `attachSessions`. */
   onBatch = (batch: CoreEvent[]): void => {
+    if (this.#disposed) return;
     if (this.#buffer) this.#buffer.push(batch);
     else this.#route(batch);
   };
@@ -310,8 +330,12 @@ export class SessionRouter {
   resync(list: SessionResync[]): void {
     for (const r of list) {
       const s = this.#make(r.session, r.role);
-      resyncStore(s, r);
-      this.stores.set(r.session, s);
+      if (s) {
+        resyncStore(s, r);
+        this.stores.set(r.session, s);
+      } else {
+        this.#keepTail(r.session, r.events);
+      }
       this.roles.set(r.session, r.role);
       this.info.set(r.session, r);
       const last = r.events.length > 0 ? r.events[r.events.length - 1].seq : -1;
@@ -331,7 +355,11 @@ export class SessionRouter {
     let key: SessionKey | null = null;
     let run: CoreEvent[] = [];
     const flush = () => {
-      if (key !== null && run.length > 0) this.#storeOf(key).push(run);
+      if (key !== null && run.length > 0) {
+        const s = this.#storeOf(key);
+        if (s) s.push(run);
+        else this.#keepTail(key, run);
+      }
       run = [];
     };
     for (const ev of batch) {
@@ -350,21 +378,33 @@ export class SessionRouter {
     flush();
   }
 
-  #storeOf(key: SessionKey): SessionStore {
-    let s = this.stores.get(key);
-    if (!s) {
-      const role = this.roles.get(key) ?? "improve";
-      s = this.#make(key, role);
-      this.stores.set(key, s);
-      this.roles.set(key, role);
+  #storeOf(key: SessionKey): SessionStore | null {
+    const s = this.stores.get(key);
+    if (s) return s;
+    if (this.roles.has(key)) {
+      // Déjà vue : avec un magasin, il serait dans `stores`.
+      return null;
     }
-    return s;
+    const role: SessionRole = "improve";
+    this.roles.set(key, role);
+    const made = this.#make(key, role);
+    if (made) this.stores.set(key, made);
+    return made;
+  }
+
+  #keepTail(key: SessionKey, evs: CoreEvent[]): void {
+    const t = (this.#tails.get(key) ?? []).concat(evs);
+    this.#tails.set(key, t.length > SessionRouter.TAIL_MAX ? t.slice(-SessionRouter.TAIL_MAX) : t);
   }
 }
 
 /**
  * Session principale à afficher après un rattachement : la dernière de rôle
  * `main` encore en cours, sinon la dernière de rôle `main`.
+ *
+ * Les autres sessions `main` (cas anormal : le cœur n'en lance qu'une) ne sont
+ * ni affichées ni arrêtées : elles gardent leur magasin dans le routeur et
+ * continuent côté cœur jusqu'à leur fin.
  */
 export function mainOf(list: SessionResync[]): SessionResync | null {
   const mains = list.filter((r) => r.role === "main");
@@ -398,12 +438,53 @@ function sessionStore(): Storage | null {
   }
 }
 
-/** Écrit l'état ; sans effet si le stockage est inaccessible ou plein. */
-export function saveUiSnapshot(s: UiSnapshot): void {
+/** Plafonds de l'état gardé (caractères) : par entrée, et au total. */
+export type UiSnapshotLimits = { entry: number; total: number };
+export const UI_SNAPSHOT_LIMITS: Readonly<UiSnapshotLimits> = { entry: 100_000, total: 1_000_000 };
+
+/**
+ * Forme plafonnée de l'état : chaque texte (brouillon, envois) coupé à
+ * `entry` caractères, puis les envois les plus anciens retirés tant que le
+ * total dépasse `total`. Le brouillon passe toujours.
+ */
+export function capUiSnapshot(s: UiSnapshot, limits: UiSnapshotLimits = UI_SNAPSHOT_LIMITS): UiSnapshot {
+  const cut = (x: string) => (x.length > limits.entry ? x.slice(0, limits.entry) : x);
+  const out: UiSnapshot = {
+    ...s,
+    draft: cut(s.draft),
+    sent: s.sent.map(cut),
+    agentsOpen: s.agentsOpen.slice(-200).map(cut),
+  };
+  let size = JSON.stringify(out).length;
+  while (size > limits.total && out.sent.length > 0) {
+    size -= JSON.stringify(out.sent[0]).length + 1;
+    out.sent = out.sent.slice(1);
+  }
+  return out;
+}
+
+/**
+ * Écrit l'état, plafonné (`capUiSnapshot`). Stockage plein : nouvel essai avec
+ * le minimum (brouillon et réglages, sans l'historique ↑↓ ni les agents
+ * dépliés). Sans effet si le stockage est inaccessible. Rend ce qui a été
+ * écrit (`full`, `minimal`) ou `none`.
+ */
+export function saveUiSnapshot(s: UiSnapshot, limits: UiSnapshotLimits = UI_SNAPSHOT_LIMITS): "full" | "minimal" | "none" {
+  const st = sessionStore();
+  if (!st) return "none";
+  const capped = capUiSnapshot(s, limits);
   try {
-    sessionStore()?.setItem(UI_SNAPSHOT_KEY, JSON.stringify(s));
+    st.setItem(UI_SNAPSHOT_KEY, JSON.stringify(capped));
+    return "full";
   } catch {
-    // Stockage plein ou refusé : l'état sera perdu au rechargement, rien de plus.
+    // Quota dépassé (ou refus) : on garde au moins le brouillon.
+  }
+  try {
+    st.removeItem(UI_SNAPSHOT_KEY);
+    st.setItem(UI_SNAPSHOT_KEY, JSON.stringify({ ...capped, sent: [], agentsOpen: [] }));
+    return "minimal";
+  } catch {
+    return "none";
   }
 }
 

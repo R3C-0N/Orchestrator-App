@@ -12,6 +12,7 @@ import {
   SessionRouter,
   UI_SNAPSHOT_KEY,
   applyHistory,
+  capUiSnapshot,
   loadUiSnapshot,
   mainOf,
   resyncStore,
@@ -236,5 +237,77 @@ describe("UiSnapshot", () => {
     } finally {
       g.sessionStorage = prev;
     }
+  });
+});
+
+describe("UiSnapshot plafonné", () => {
+  const snap = (sent: string[], draft = "brouillon") => ({
+    session: "k1",
+    draft,
+    sent,
+    agentsOpen: [],
+    agentsDoneOpen: false,
+    verbose: false,
+    improveDismissed: null,
+  });
+
+  it("coupe chaque entrée, retire les envois les plus anciens au-delà du total", () => {
+    const limits = { entry: 10, total: 200 };
+    const out = capUiSnapshot(snap(Array.from({ length: 40 }, (_, i) => `envoi-${i}-xxxxxxxx`), "d".repeat(50)), limits);
+    expect(out.draft).toBe("d".repeat(10));
+    expect(out.sent.every((x) => x.length <= 10)).toBe(true);
+    expect(JSON.stringify(out).length).toBeLessThanOrEqual(200);
+    // Les plus récents restent.
+    expect(out.sent.at(-1)).toBe("envoi-39-x");
+  });
+
+  it("quota dépassé : le brouillon est gardé sans l'historique", () => {
+    const mem = new Map<string, string>();
+    const fake = {
+      getItem: (k: string) => mem.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        if (v.length > 300) throw new DOMException("plein", "QuotaExceededError");
+        mem.set(k, v);
+      },
+      removeItem: (k: string) => void mem.delete(k),
+    };
+    const g = globalThis as unknown as { sessionStorage?: unknown };
+    const prev = g.sessionStorage;
+    g.sessionStorage = fake;
+    try {
+      const big = snap(Array.from({ length: 50 }, (_, i) => `message numéro ${i}`), "à garder");
+      expect(saveUiSnapshot(big)).toBe("minimal");
+      expect(loadUiSnapshot()).toEqual({ ...big, sent: [] });
+      expect(saveUiSnapshot(snap(["a"]))).toBe("full");
+    } finally {
+      g.sessionStorage = prev;
+    }
+  });
+});
+
+describe("SessionRouter sans magasin", () => {
+  it("session d'amélioration : aucun magasin, seuls les derniers événements gardés", () => {
+    const live = mockLiveSessions(10);
+    const r = new SessionRouter((_k, role) => (role === "main" ? syncStore() : null));
+    r.resync(live);
+    expect(r.get("improve-0")).toBeUndefined();
+    expect(r.roles.get("improve-0")).toBe("improve");
+    const f = new EventFactory();
+    const many: CoreEvent[] = Array.from({ length: 500 }, (_, i) => ({
+      ...f.make({ kind: "status", state: "Streaming" }),
+      session: "improve-9",
+      seq: i,
+    }));
+    r.onBatch(many);
+    expect(r.get("improve-9")).toBeUndefined();
+    expect(r.tail("improve-9")).toHaveLength(SessionRouter.TAIL_MAX);
+    expect(r.tail("improve-9").at(-1)!.seq).toBe(499);
+    // Doublons toujours écartés.
+    r.onBatch(many.slice(0, 10));
+    expect(r.duplicates).toBe(10);
+    // Après `dispose`, plus rien n'est gardé.
+    r.dispose();
+    r.onBatch([{ ...many[0], seq: 1000 }]);
+    expect(r.tail("improve-9")).toEqual([]);
   });
 });

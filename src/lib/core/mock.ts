@@ -602,6 +602,8 @@ export type MockSelfUpdateOptions = {
   repo?: RepoStatus;
   /** Sessions vivantes rendues par `attachSessions` (rattachement après un rechargement). */
   live?: SessionResync[];
+  /** Nombre d'appels à `attachSessions` rejetés d'abord (`attachFail=<n>`). */
+  attachFail?: number;
 };
 
 /** Détail d'un échec simulé (étape `testing`). */
@@ -702,7 +704,8 @@ export function mockLiveSessions(rows: number, historyRows = 0, seed = 15): Sess
 /**
  * Paramètres J14 du mode simulé lus dans l'URL : `improve=merged|restart|failed`,
  * `repo=disabled|cloning`, `attach=<lignes>` (sessions vivantes au montage),
- * `step=<ms>` (durée d'une étape).
+ * `attachFail=<n>` (les n premiers rattachements échouent), `step=<ms>`
+ * (durée d'une étape).
  */
 export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & { stepMs?: number } {
   const p = new URLSearchParams(search);
@@ -715,6 +718,8 @@ export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & {
   else if (repo === "cloning") out.repo = { state: "cloning", path: "C:\\mock\\repo" };
   const attach = p.get("attach");
   if (attach !== null) out.live = mockLiveSessions(Number(attach) || 40);
+  const attachFail = Number(p.get("attachFail"));
+  if (Number.isInteger(attachFail) && attachFail > 0) out.attachFail = attachFail;
   const step = p.get("step");
   if (step !== null && step !== "" && Number.isFinite(Number(step))) out.stepMs = Number(step);
   return out;
@@ -745,6 +750,7 @@ export class MockSelfUpdate {
   calls: { cmd: string; args: unknown }[] = [];
   outcome: MockImproveOutcome;
   live: SessionResync[];
+  attachFail: number;
   #timers: ReturnType<typeof setTimeout>[] = [];
   #n = 0;
   #onStatus: (s: ImproveStatus) => void;
@@ -757,11 +763,16 @@ export class MockSelfUpdate {
     this.#stepMs = stepMs;
     this.outcome = opts.outcome ?? "merged";
     this.live = opts.live ?? [];
+    this.attachFail = opts.attachFail ?? 0;
     if (opts.repo) this.info.repo = opts.repo;
   }
 
   attachSessions(onEvents?: (batch: CoreEvent[]) => void): Promise<SessionResync[]> {
     this.calls.push({ cmd: "attach_sessions", args: {} });
+    if (this.attachFail > 0) {
+      this.attachFail--;
+      return Promise.reject({ kind: "internal", message: "canal de rattachement refusé (simulé)" });
+    }
     this.#attached = onEvents ?? null;
     return Promise.resolve(structuredClone(this.live));
   }

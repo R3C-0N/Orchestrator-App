@@ -90,3 +90,18 @@ describe("MockSelfUpdate", () => {
     expect(mockSelfUpdateFromUrl("?mock=demo")).toEqual({});
   });
 });
+
+describe("bandeau d'amélioration", () => {
+  it("demande sur plusieurs lignes : une seule ligne, tronquée", async () => {
+    const { oneLine } = await import("../../src/lib/components/ImproveBanner.svelte");
+    expect(oneLine("Bandeau\n  plus\r\ndiscret\t")).toBe("Bandeau plus discret");
+    expect(oneLine("x".repeat(300), 10)).toBe(`${"x".repeat(9)}…`);
+  });
+
+  it("attachFail : les n premiers rattachements échouent", async () => {
+    const m = new MockSelfUpdate(() => {}, 300, mockSelfUpdateFromUrl("?attachFail=2"));
+    await expect(m.attachSessions()).rejects.toMatchObject({ kind: "internal" });
+    await expect(m.attachSessions()).rejects.toMatchObject({ kind: "internal" });
+    expect(await m.attachSessions()).toEqual([]);
+  });
+});

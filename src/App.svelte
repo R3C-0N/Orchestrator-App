@@ -720,6 +720,8 @@
   const rollbackDisabled = $derived.by((): string | null => {
     if (!selfUpdate) return "interface en cours de démarrage";
     if (!uiInfo) return uiInfoError ? `état inconnu (${uiInfoError})` : "état de l'interface en cours de lecture";
+    // Pendant un cycle (bascule comprise), le retour arrière croiserait la bascule.
+    if (improveRunning) return "une amélioration est en cours";
     if (uiInfo.source === "embedded" && !uiInfo.previous_hash) return "interface embarquée, aucune version précédente";
     return null;
   });
@@ -829,17 +831,33 @@
     }
   }
 
-  // Sauvegarde à chaque changement (le rechargement de la bascule ne laisse
-  // pas toujours à `pagehide` le temps d'écrire), une fois le montage fini.
+  // Sauvegarde après chaque changement, temporisée (une frappe n'écrit pas tout
+  // de suite : 300 ms sans changement), une fois le montage fini ; `pagehide`
+  // écrit tout de suite ce qui reste (le rechargement de la bascule ne lui
+  // laisse pas toujours le temps, d'où l'écriture au fil de l'eau).
+  const SAVE_DELAY_MS = 300;
   let booted = $state(false);
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleSave(): void {
+    if (saveTimer !== null) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      saveUi();
+    }, SAVE_DELAY_MS);
+  }
   $effect(() => {
     void [draft, agentsOpen, agentsDoneOpen, verbose, improveDismissed, session, mockReady];
-    if (booted) saveUi();
+    if (booted) scheduleSave();
   });
 
-  /** Magasin d'une session rattachée : la principale a les crochets de l'app (palette, latence). */
-  function routedStore(_key: SessionKey, role: "main" | "improve"): SessionStore {
-    return role === "main" ? newStore() : new SessionStore();
+  /**
+   * Magasin d'une session rattachée : la principale a les crochets de l'app
+   * (palette, latence). La session d'amélioration n'est jamais affichée (le
+   * bandeau suit `ImproveStatus`) : pas de magasin, le routeur n'en garde que
+   * les derniers événements.
+   */
+  function routedStore(_key: SessionKey, role: "main" | "improve"): SessionStore | null {
+    return role === "main" ? newStore() : null;
   }
 
   /** La session principale rattachée devient la session affichée (aucune session relancée). */
@@ -868,9 +886,122 @@
     else phase = "projects";
   }
 
+  /** Échec du montage (rattachement ou rejeu) : aucune session lancée, bouton « Réessayer ». */
+  let mountError: string | null = $state(null);
+  let mountRetrying = $state(false);
+  const ATTACH_TRIES = 3;
+  const ATTACH_RETRY_MS = 300;
+
+  /**
+   * `attach_sessions`, essayé 3 fois à 300 ms d'intervalle. Le même routeur
+   * sert à chaque essai : un canal resté enregistré après un échec livre au
+   * même endroit, et les doublons sont écartés par `seq`.
+   */
+  async function attachWithRetry(su: SelfUpdateApi, r: SessionRouter): Promise<SessionResync[]> {
+    let last: unknown = null;
+    for (let i = 0; i < ATTACH_TRIES; i++) {
+      if (i > 0) await new Promise((res) => setTimeout(res, ATTACH_RETRY_MS));
+      try {
+        return (await su.attachSessions(r.onBatch)) ?? [];
+      } catch (err) {
+        last = err;
+        console.warn(`attach_sessions (essai ${i + 1}/${ATTACH_TRIES})`, describeError(err));
+      }
+    }
+    throw last;
+  }
+
+  /** Une image peinte après le rendu (`ui_ready` ne part qu'ensuite) ; repli à 1 s si rAF est suspendu (fenêtre cachée). */
+  function painted(): Promise<void> {
+    return new Promise((res) => {
+      const t = setTimeout(res, 1000);
+      requestAnimationFrame(() => {
+        clearTimeout(t);
+        res();
+      });
+    });
+  }
+
+  /**
+   * Montage : rattachement, rejeu, puis `ui_ready`, puis démarrage habituel
+   * s'il n'y avait rien à reprendre. Relancé tel quel par « Réessayer ».
+   */
+  async function boot(su: SelfUpdateApi, saved: UiSnapshot | null): Promise<void> {
+    mountError = null;
+    router?.dispose();
+    const r = new SessionRouter(routedStore);
+    router = r;
+    // 1. Rattachement, AVANT tout démarrage : une session vivante n'est jamais
+    //    relancée. En échec, AUCUNE session n'est lancée (le cœur n'a pas de
+    //    garde : `start_session` en lancerait une deuxième à côté d'une vivante).
+    let live: SessionResync[];
+    try {
+      live = await attachWithRetry(su, r);
+    } catch (err) {
+      r.dispose();
+      mountError = `Rattachement aux sessions impossible : ${describeError(err)}. Aucune session n'a été lancée.`;
+      return;
+    }
+    let main: SessionResync | null;
+    try {
+      r.resync(live);
+      main = mainOf(live);
+      if (main) {
+        await adoptMain(r, main);
+        restoreUi(saved);
+      }
+    } catch (err) {
+      r.dispose();
+      mountError = `Reprise des sessions impossible : ${describeError(err)}. Aucune session n'a été lancée.`;
+      return;
+    }
+    // 2. État de l'interface, puis signal « prêt » au watchdog du cœur, une
+    //    fois le rattachement répondu, le rejeu fait et une image peinte.
+    //    Un échec de `get_ui_info` seul n'empêche pas `ui_ready` : l'interface
+    //    reste utilisable (ligne d'état et palette indiquent l'état inconnu) ;
+    //    le hash envoyé est alors celui de cette page.
+    await refreshUiInfo();
+    await tick();
+    await painted();
+    try {
+      await su.uiReady(uiInfo?.source === "embedded" ? null : UI_HASH);
+    } catch (err) {
+      console.warn("ui_ready", describeError(err));
+    }
+    // 3. Sans session à reprendre : démarrage habituel.
+    if (!main) {
+      try {
+        await startFresh();
+        if (mockMode) restoreUi(saved);
+      } catch (err) {
+        startError = mockMode ? String(err) : describeError(err);
+      }
+    }
+    booted = true;
+    saveUi();
+  }
+
+  async function retryMount(): Promise<void> {
+    const su = selfUpdate;
+    if (!su || mountRetrying) return;
+    mountRetrying = true;
+    try {
+      await boot(su, loadUiSnapshot());
+    } finally {
+      mountRetrying = false;
+    }
+  }
+
   onMount(() => {
     const saved = loadUiSnapshot();
-    const onHide = () => saveUi();
+    // Rien n'est écrit avant la fin du montage : un état à moitié rétabli
+    // écraserait celui gardé par la page d'avant.
+    const onHide = () => {
+      if (!booted) return;
+      if (saveTimer !== null) clearTimeout(saveTimer);
+      saveTimer = null;
+      saveUi();
+    };
     window.addEventListener("pagehide", onHide);
     window.addEventListener("beforeunload", onHide);
     (async () => {
@@ -883,51 +1014,16 @@
         if (CONTRACT) ms.info.contract = CONTRACT;
         mockSelfUpdate = ms;
         su = ms;
+        // Accès e2e avant tout démarrage (échec du rattachement).
+        (window as unknown as Record<string, unknown>).__orchSelfUpdate = ms;
       }
       selfUpdate = su;
-      const r = new SessionRouter(routedStore);
-      router = r;
-      // 1. Rattachement, AVANT tout démarrage : une session vivante n'est jamais relancée.
-      let live: SessionResync[] = [];
-      try {
-        live = (await su.attachSessions(r.onBatch)) ?? [];
-      } catch (err) {
-        console.warn("attach_sessions", describeError(err));
-      }
-      r.resync(live);
-      const main = mainOf(live);
-      let fresh = !main;
-      if (main) {
-        try {
-          await adoptMain(r, main);
-          restoreUi(saved);
-        } catch (err) {
-          startError = describeError(err);
-        }
-      }
-      // 2. État de l'interface, puis signal « prêt » (watchdog de 5 s du cœur).
-      await refreshUiInfo();
-      await tick();
-      try {
-        await su.uiReady(uiInfo?.source === "embedded" ? null : UI_HASH);
-      } catch (err) {
-        console.warn("ui_ready", describeError(err));
-      }
-      // 3. Sans session à reprendre : démarrage habituel.
-      if (fresh) {
-        try {
-          await startFresh();
-          if (mockMode) restoreUi(saved);
-        } catch (err) {
-          startError = mockMode ? String(err) : describeError(err);
-        }
-      }
-      booted = true;
-      saveUi();
+      await boot(su, saved);
     })();
     return () => {
       window.removeEventListener("pagehide", onHide);
       window.removeEventListener("beforeunload", onHide);
+      if (saveTimer !== null) clearTimeout(saveTimer);
     };
   });
 
@@ -1026,6 +1122,12 @@
   {/each}
   {#if startError}
     <div class="banner error">{startError}</div>
+  {/if}
+  {#if mountError}
+    <div class="banner error" data-testid="mount-error">
+      {mountError}
+      <button data-testid="mount-retry" disabled={mountRetrying} onclick={() => void retryMount()}>Réessayer</button>
+    </div>
   {/if}
   {#if launchError}
     <div class="banner" data-testid="launch-error">{launchError}</div>

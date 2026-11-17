@@ -18,7 +18,11 @@ type Orch = {
   store: Store;
   calls: Call[];
   selfUpdate: () => { calls: Call[]; readyCalls: (string | null)[] } | null;
-  router: () => { roles: Map<string, string>; get(k: string): Store | undefined } | null;
+  router: () => {
+    roles: Map<string, string>;
+    get(k: string): Store | undefined;
+    tail(k: string): { kind: string; text?: string }[];
+  } | null;
 };
 
 async function open(page: Page, query = "", stepMs = 120) {
@@ -84,11 +88,14 @@ test("/ameliorer : bandeau à chaque étape jusqu'à la fusion, session dédiée
     const o = (window as unknown as { __orch: Orch }).__orch;
     return {
       rows: o.store.rows.length,
-      improve: o.router()!.get("improve-1")?.rows.map((r) => r.text),
+      // Session dédiée : aucun magasin (jamais affichée), derniers événements seulement.
+      store: o.router()!.get("improve-1") ?? null,
+      improve: o.router()!.tail("improve-1").filter((e) => e.kind === "user_message").map((e) => e.text),
       role: o.router()!.roles.get("improve-1"),
     };
   });
   expect(sep.rows).toBe(rowsBefore);
+  expect(sep.store).toBeNull();
   expect(sep.improve).toEqual(["Prompt d'amélioration (simulé)"]);
   expect(sep.role).toBe("improve");
   // Interface sur disque : le hash actif diffère de celui de cette page (rechargement attendu).
@@ -229,4 +236,40 @@ test("stockage de session illisible : démarrage normal", async ({ page }) => {
   await page.reload();
   await page.waitForFunction(() => (window as unknown as { __orch?: Orch }).__orch?.store.status === "Idle");
   await expect(page.locator(PROMPT)).toHaveValue("");
+});
+
+test("rattachement refusé : 3 essais, aucune session lancée, pas de ui_ready, puis « Réessayer »", async ({ page }) => {
+  await page.goto("/?mock=demo&rows=0&rate=400&attachFail=3");
+  await expect(page.getByTestId("mount-error")).toContainText("Rattachement aux sessions impossible");
+  await expect(page.getByTestId("mount-error")).toContainText("Aucune session n'a été lancée");
+  type Su = { calls: Call[] };
+  const suCmds = () =>
+    page.evaluate(() => (window as unknown as { __orchSelfUpdate: Su }).__orchSelfUpdate.calls.map((c) => c.cmd));
+  expect(await suCmds()).toEqual(["attach_sessions", "attach_sessions", "attach_sessions"]);
+  // Aucune session simulée démarrée (`__orch` n'existe qu'une fois la session lancée).
+  await page.waitForTimeout(500);
+  expect(await page.evaluate(() => "__orch" in window)).toBe(false);
+  await page.getByTestId("mount-retry").click();
+  await page.waitForFunction(() => (window as unknown as { __orch?: Orch }).__orch?.store.status === "Idle");
+  await expect(page.getByTestId("mount-error")).toHaveCount(0);
+  expect(await suCmds()).toEqual(["attach_sessions", "attach_sessions", "attach_sessions", "attach_sessions", "ui_ready"]);
+});
+
+test("demande sur plusieurs lignes : en-tête sur une ligne ; /revenir-version grisé pendant le cycle", async ({ page }) => {
+  await open(page, "", 600);
+  await page.keyboard.type("/amel");
+  await page.keyboard.press("Tab");
+  await page.keyboard.type("Première ligne");
+  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.type("seconde ligne");
+  await expect(page.locator(PROMPT)).toHaveValue("/ameliorer Première ligne\nseconde ligne");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(BANNER)).toContainText("/ameliorer Première ligne seconde ligne");
+  await expect(page.locator(BANNER)).toHaveAttribute("data-step", "working");
+  const head = page.locator(`${BANNER} .head`);
+  const lineHeight = await page.locator(`${BANNER} .msg`).first().evaluate((e) => e.getBoundingClientRect().height);
+  expect((await head.boundingBox())!.height).toBeLessThan(lineHeight * 1.5);
+  await page.locator(PROMPT).focus();
+  await page.keyboard.type("/revenir");
+  await expect(page.locator(`${PALETTE} [data-name="revenir-version"]`)).toContainText("une amélioration est en cours");
 });
