@@ -70,6 +70,9 @@ pub struct Reducer {
     blocks: BlockCounters,
     /// Questions en attente : request_id -> input brut de l'outil.
     pub questions: HashMap<String, Value>,
+    /// Questions en attente : request_id -> `tool_use_id` de l'appel
+    /// `AskUserQuestion` (purge de la table des agents à la fermeture).
+    question_tools: HashMap<String, String>,
     /// request_id de nos requêtes `initialize`.
     initialize_ids: Vec<String>,
     pub capabilities: Vec<String>,
@@ -104,6 +107,12 @@ impl Reducer {
     /// Sous-agents connus, dans l'ordre d'apparition.
     pub fn agents(&self) -> &[AgentEvent] {
         self.agents.all()
+    }
+
+    /// Appels `AskUserQuestion` de sous-agents encore notés (tests : la table
+    /// est purgée à la fermeture de la question et à la fin de l'agent).
+    pub fn ask_entries(&self) -> usize {
+        self.agents.ask_entries()
     }
 
     /// Déclare un `request_id` d'`initialize` envoyé par nous : sa réponse
@@ -173,6 +182,9 @@ impl Reducer {
     /// `Skipped`) : la retire de la table et émet `question_closed`. Rien si
     /// la question n'est pas (ou plus) en attente.
     pub fn close_question(&mut self, request_id: &str, reason: QuestionCloseReason) -> Vec<Action> {
+        if let Some(tool) = self.question_tools.remove(request_id) {
+            self.agents.forget_ask(&tool);
+        }
         if self.questions.remove(request_id).is_none() {
             return vec![];
         }
@@ -546,6 +558,9 @@ impl Reducer {
                 if tool == "AskUserQuestion" {
                     let questions = parse_questions(&input);
                     self.questions.insert(request_id.clone(), input);
+                    if let Some(tool) = &c.tool_use_id {
+                        self.question_tools.insert(request_id.clone(), tool.clone());
+                    }
                     let thread = self
                         .agents
                         .asking_agent(c.agent_id.as_deref(), c.tool_use_id.as_deref())

@@ -337,3 +337,76 @@ test("t4 : la question de la fixture, Bleu choisi, donne les answers envoyés au
   const [c] = await calls(page, "answer_question");
   expect(c.args.answers).toEqual(expected);
 });
+
+test("deux questions en parallèle (main puis un agent) : en file, la plus ancienne d'abord, l'agent reste en attente", async ({
+  page,
+}) => {
+  await open(page);
+  const AGENT = "toolu_q_vert";
+  await page.evaluate((id) => {
+    const s = (window as unknown as W).__orch.store;
+    const now = Date.now();
+    s.apply([
+      {
+        seq: s.lastSeq + 1,
+        t: now,
+        session: "mock-1",
+        kind: "agent",
+        tool_use_id: id,
+        task_id: "task_q_vert",
+        agent_type: "agent-vert",
+        color: "green",
+        description: "Agent qui pose une question",
+        status: "Running",
+        background: true,
+        started_at: now,
+        ended_at: null,
+        last_tool: "Read",
+        tokens: null,
+        tool_uses: null,
+        summary: null,
+      },
+    ]);
+  }, AGENT);
+  const agent = page.locator(`[data-agent="${AGENT}"]`);
+  await expect(agent).toBeVisible();
+  const ask2 = (qs: QItem[], thread?: string) =>
+    page.evaluate(
+      ({ qs, thread }) =>
+        (window as unknown as { __orch: { mock: { ask(q: QItem[], o?: { thread?: string }): string } } }).__orch.mock.ask(
+          qs,
+          thread ? { thread } : {},
+        ),
+      { qs, thread },
+    );
+  const COLOR: QItem = {
+    question: "Quelle couleur ?",
+    header: "Couleur",
+    multi_select: false,
+    options: [
+      { label: "Bleu", description: "" },
+      { label: "Vert", description: "" },
+    ],
+  };
+  const idMain = await ask2([LANG]);
+  const idAgent = await ask2([COLOR], AGENT);
+  const card = page.locator(CARD);
+  // La plus ancienne (main) est affichée ; l'agent attend quand même.
+  await expect(card).toHaveAttribute("data-request", idMain);
+  await expect(page.getByTestId("question-text")).toHaveText(LANG.question);
+  await expect(agent).toHaveAttribute("data-waiting", "true");
+  // Réponse à main : la carte de l'agent paraît, l'agent attend toujours.
+  await page.keyboard.press("1");
+  await expect(card).toHaveAttribute("data-request", idAgent);
+  await expect(page.getByTestId("question-text")).toHaveText(COLOR.question);
+  await expect(page.locator(`${CARD} .opt.sel`)).toContainText("1. Bleu");
+  await expect(agent).toHaveAttribute("data-waiting", "true");
+  // Réponse à l'agent : plus de carte, l'agent repasse en cours.
+  await page.keyboard.press("2");
+  await closed(page);
+  await expect(agent).not.toHaveAttribute("data-waiting");
+  expect((await calls(page, "answer_question")).map((c) => c.args)).toEqual([
+    { request_id: idMain, answers: { [LANG.question]: "Rust" }, response: null },
+    { request_id: idAgent, answers: { [COLOR.question]: "Vert" }, response: null },
+  ]);
+});

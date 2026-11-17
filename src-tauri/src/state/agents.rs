@@ -58,7 +58,8 @@ pub struct AgentRegistry {
     task_to_tool: HashMap<String, String>,
     /// `tool_use_id` d'un `AskUserQuestion` appelé dans le fil d'un agent ->
     /// `tool_use_id` de cet agent ([`AgentRegistry::asking_agent`]). Seul cet
-    /// outil est noté : la table reste minuscule.
+    /// outil est noté ; l'entrée est retirée quand la question se ferme
+    /// ([`AgentRegistry::forget_ask`]) ou quand l'agent se termine.
     ask_thread: HashMap<String, String>,
 }
 
@@ -146,6 +147,9 @@ impl AgentRegistry {
         };
         let before = self.agents[i].clone();
         f(&mut self.agents[i]);
+        if !is_terminal(before.status) && is_terminal(self.agents[i].status) {
+            self.ask_thread.retain(|_, agent| agent != tool_use_id);
+        }
         let a = &mut self.agents[i];
         if a.color.is_none() {
             a.color = agent_color(&a.agent_type).map(str::to_string);
@@ -227,6 +231,16 @@ impl AgentRegistry {
                 .map(String::as_str)
                 .filter(|id| self.is_agent(id))
         })
+    }
+
+    /// Question fermée : l'appel `AskUserQuestion` `tool_use_id` n'attend plus.
+    pub fn forget_ask(&mut self, tool_use_id: &str) {
+        self.ask_thread.remove(tool_use_id);
+    }
+
+    /// Nombre d'appels `AskUserQuestion` encore notés (tests : table purgée).
+    pub fn ask_entries(&self) -> usize {
+        self.ask_thread.len()
     }
 
     fn set_last_tool(&mut self, tool_use_id: &str, tool: &str) -> Option<AgentEvent> {
@@ -445,6 +459,7 @@ impl AgentRegistry {
                 out.push(a.clone());
             }
         }
+        self.ask_thread.clear();
         out
     }
 }

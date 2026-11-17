@@ -46,7 +46,7 @@ export type AgentGroups<T> = {
  * Tri de la colonne : en attente de réponse, puis en cours, puis terminés.
  * Ordre stable dans chaque groupe (ordre de lancement : celui de `agents`).
  * `waiting` : `tool_use_id` des agents dont une question attend une réponse
- * (`SessionStore.question.thread`) ; un agent fini n'attend plus rien.
+ * (`SessionStore.questions[].thread`) ; un agent fini n'attend plus rien.
  */
 export function groupAgents<T extends Pick<AgentEvent, "tool_use_id" | "status">>(
   agents: readonly T[],
@@ -61,9 +61,12 @@ export function groupAgents<T extends Pick<AgentEvent, "tool_use_id" | "status">
   return g;
 }
 
-/** Agents en attente d'après la question ouverte : jamais le fil principal. */
-export function waitingIds(question: { thread: string } | null): ReadonlySet<string> {
-  return new Set(question && question.thread !== "main" ? [question.thread] : []);
+/**
+ * Agents en attente d'après les questions en attente (toutes, pas seulement
+ * celle affichée) : jamais le fil principal.
+ */
+export function waitingIds(questions: readonly { thread: string }[]): ReadonlySet<string> {
+  return new Set(questions.filter((q) => q.thread !== "main").map((q) => q.thread));
 }
 
 /** En-tête du panneau des agents terminés : « ▸ 3 done » (replié), « ▾ 3 done » (ouvert). */

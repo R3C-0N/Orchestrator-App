@@ -257,9 +257,12 @@ test("tri : un agent qui finit passe dans le panneau ; fil déroulé, il reste v
   await page.waitForFunction(() => window.__agentsDemo.done());
   const toggle = page.getByTestId("agents-done-toggle");
   const done = page.getByTestId("agents-done");
-  // Bleu, fil fermé, finit : il quitte les agents en cours pour le panneau replié.
+  // Bleu, fil fermé, focalisé au clavier, finit : il quitte les agents en
+  // cours pour le panneau replié, le focus passe à l'en-tête du panneau.
+  await card(page, "toolu_sort_bleu").locator("button.head").focus();
   await applyAgent(page, "toolu_sort_bleu", "agent-bleu", "blue", { status: "Completed", ended_at: Date.now(), tool_uses: 1 });
   await expect(toggle).toHaveText("▸ 3 done");
+  await expect(toggle).toBeFocused();
   expect(await order(page)).toEqual(["toolu_sort_vert"]);
   // Un agent en cours, fil déroulé, qui finit : il reste sous l'en-tête replié, fil ouvert.
   await applyAgent(page, "toolu_sort_cyan", "agent-cyan", "cyan", {});
@@ -267,8 +270,11 @@ test("tri : un agent qui finit passe dans le panneau ; fil déroulé, il reste v
   const cyan = card(page, "toolu_sort_cyan");
   await cyan.locator("button.head").click();
   await expect(cyan.getByTestId("agent-thread")).toBeVisible();
+  await cyan.locator("button.head").focus();
   await applyAgent(page, "toolu_sort_cyan", "agent-cyan", "cyan", { status: "Completed", ended_at: Date.now(), tool_uses: 1 });
   await expect(toggle).toHaveText("▸ 4 done");
+  // Sa carte reste affichée : le focus la suit.
+  await expect(cyan.locator("button.head")).toBeFocused();
   await expect(cyan).toHaveAttribute("data-status", "Completed");
   await expect(done.locator(".card")).toHaveCount(1);
   await expect(cyan.getByTestId("agent-thread")).toBeVisible();

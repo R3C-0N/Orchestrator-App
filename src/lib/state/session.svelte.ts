@@ -134,7 +134,31 @@ export class SessionStore {
   /** Bloc de texte en cours de streaming, réactif en profondeur. */
   live: AssistantTextRow | null = $state(null);
   agents: AgentEvent[] = $state([]);
-  question: Question | null = $state(null);
+  /**
+   * Questions en attente, dans l'ordre d'arrivée (une par `request_id`) :
+   * le fil principal et des sous-agents peuvent attendre en même temps. La
+   * carte affiche la plus ancienne ; la suivante paraît quand elle est fermée.
+   */
+  questions: Question[] = $state.raw([]);
+
+  /** Question affichée : la plus ancienne en attente. */
+  get question(): Question | null {
+    return this.questions[0] ?? null;
+  }
+
+  /**
+   * Remplace la question de même `request_id` (carte remise à zéro après une
+   * erreur d'envoi) ou l'ajoute en fin de file ; `null` retire la question
+   * affichée.
+   */
+  set question(q: Question | null) {
+    if (q === null) {
+      this.questions = this.questions.slice(1);
+      return;
+    }
+    const i = this.questions.findIndex((x) => x.requestId === q.requestId);
+    this.questions = i < 0 ? [...this.questions, q] : this.questions.map((x, k) => (k === i ? q : x));
+  }
   meta: SessionMeta = $state({
     cwd: null,
     version: null,
@@ -478,6 +502,7 @@ export class SessionStore {
         break;
       }
       case "question":
+        // Même `request_id` : remplacée ; sinon en fin de file.
         this.question = {
           requestId: ev.request_id,
           toolUseId: ev.tool_use_id,
@@ -487,7 +512,8 @@ export class SessionStore {
         };
         break;
       case "question_closed":
-        if (this.question?.requestId === ev.request_id) this.question = null;
+        if (this.questions.some((q) => q.requestId === ev.request_id))
+          this.questions = this.questions.filter((q) => q.requestId !== ev.request_id);
         break;
       case "turn_result":
         // Un bloc resté ouvert (tour interrompu) est figé tel quel.

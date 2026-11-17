@@ -551,16 +551,46 @@ fn question_thread_names_the_waiting_agent() {
         4,
     );
     assert_eq!(thread_of(&r.handle_at(&ask("q1", "tq1", None), 5)), "tA");
+    assert_eq!(r.ask_entries(), 1);
+    // La question fermée, l'appel est oublié.
+    assert_eq!(
+        r.close_question("q1", QuestionCloseReason::Answered).len(),
+        1
+    );
+    assert_eq!(r.ask_entries(), 0);
     // Par `agent_id` = `task_id` (agent rouge), même sans appel vu.
     assert_eq!(
         thread_of(&r.handle_at(&ask("q2", "tq2", Some("a0b1")), 6)),
         "tB"
+    );
+    // Par `agent_id` = `tool_use_id` de l'agent (bleu).
+    assert_eq!(
+        thread_of(&r.handle_at(&ask("q5", "tq5", Some("tA")), 6)),
+        "tA"
     );
     // `agent_id` inconnu, appel jamais vu : fil principal, pas d'agent inventé.
     assert_eq!(
         thread_of(&r.handle_at(&ask("q3", "tq3", Some("inconnu")), 7)),
         "main"
     );
+    // `agent_id` inconnu, appel vu dans le fil du rouge : le rouge.
+    r.handle_at(
+        &json!({"type":"assistant","parent_tool_use_id":"tB","message":{"id":"m3","content":[
+            {"type":"tool_use","id":"tq4","name":"AskUserQuestion","input":{"questions":[]}}
+        ]}}),
+        8,
+    );
+    assert_eq!(
+        thread_of(&r.handle_at(&ask("q4", "tq4", Some("inconnu")), 9)),
+        "tB"
+    );
+    assert_eq!(r.ask_entries(), 1);
+    // L'agent rouge se termine (question toujours ouverte) : l'appel est oublié.
+    r.handle_at(
+        &json!({"type":"system","subtype":"task_notification","task_id":"a0b1","tool_use_id":"tB","status":"completed"}),
+        10,
+    );
+    assert_eq!(r.ask_entries(), 0);
 }
 
 #[test]

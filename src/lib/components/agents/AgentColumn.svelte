@@ -15,7 +15,7 @@
   // dont le fil est déroulé reste affiché sous l'en-tête replié jusqu'à ce
   // que son fil soit refermé ou que le panneau soit replié.
   //
-  // Lit seulement le magasin (`agents`, `question`, `threads`, `threadsRev`,
+  // Lit seulement le magasin (`agents`, `questions`, `threads`, `threadsRev`,
   // `status`, `meta.cwd`) : aucune commande Tauri, aucune capability.
   //
   // Props :
@@ -52,7 +52,7 @@
   const anyLive = $derived(agents.some(isLive));
   // `seconds.now` abonne à l'horloge ; `Date.now()` seul ne relance rien.
   const now = $derived(anyLive ? seconds.now : Date.now());
-  const waiting = $derived(waitingIds(store.question));
+  const waiting = $derived(waitingIds(store.questions));
   const groups = $derived(groupAgents(agents, waiting));
   const live = $derived(groups.waiting.length ? [...groups.waiting, ...groups.running] : groups.running);
   const running = $derived(live.length);
@@ -63,6 +63,33 @@
   function toggle(id: string) {
     open = open.includes(id) ? open.filter((x) => x !== id) : [...open, id];
   }
+
+  // Focus clavier : un agent qui change de groupe change de `{#each}`, son
+  // bouton est recréé et le focus perdu. Noté avant la mise à jour du DOM,
+  // il est rendu après : à la carte si elle reste affichée, sinon à
+  // l'en-tête du panneau. Rien si le focus est parti ailleurs.
+  let column: HTMLElement | undefined = $state();
+  let refocus: string | null = null;
+  $effect.pre(() => {
+    void groups;
+    const el = document.activeElement;
+    refocus =
+      column && el instanceof HTMLElement && column.contains(el)
+        ? (el.closest<HTMLElement>("[data-agent]")?.dataset.agent ?? null)
+        : null;
+  });
+  $effect(() => {
+    void groups;
+    const id = refocus;
+    refocus = null;
+    if (!id || !column) return;
+    const el = document.activeElement;
+    if (el && el !== document.body) return;
+    const target =
+      column.querySelector<HTMLElement>(`[data-agent="${CSS.escape(id)}"] button.head`) ??
+      column.querySelector<HTMLElement>('[data-testid="agents-done-toggle"]');
+    target?.focus();
+  });
 
   function toggleDone() {
     doneOpen = !doneOpen;
@@ -81,7 +108,7 @@
   }
 </script>
 
-<aside class="agents term" style:width aria-label="Agents" data-testid="agent-column">
+<aside class="agents term" style:width aria-label="Agents" data-testid="agent-column" bind:this={column}>
   <div class="main">
     <span class="g">{BULLET}</span>
     <span class="b">main</span>

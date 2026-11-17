@@ -209,9 +209,9 @@ describe("tri de la colonne : en attente, en cours, terminés", () => {
   });
 
   it("la question du fil principal ne désigne aucun agent", () => {
-    expect([...waitingIds(null)]).toEqual([]);
-    expect([...waitingIds({ thread: "main" })]).toEqual([]);
-    expect([...waitingIds({ thread: "toolu_x" })]).toEqual(["toolu_x"]);
+    expect([...waitingIds([])]).toEqual([]);
+    expect([...waitingIds([{ thread: "main" }])]).toEqual([]);
+    expect([...waitingIds([{ thread: "main" }, { thread: "toolu_x" }, { thread: "toolu_y" }])]).toEqual(["toolu_x", "toolu_y"]);
   });
 
   it("ligne ⎿ « ☐ Waiting for your answer » tant qu'il attend et qu'il tourne", () => {
@@ -230,12 +230,37 @@ describe("tri de la colonne : en attente, en cours, terminés", () => {
     expect(s.gaps).toBe(0);
     expect(s.failed).toBe(0);
     expect(s.question?.thread).toBe("toolu_sort_vert");
-    const g = groupAgents(s.agents, waitingIds(s.question));
+    const g = groupAgents(s.agents, waitingIds(s.questions));
     expect(ids(g.waiting)).toEqual(["toolu_sort_vert"]);
     expect(ids(g.running)).toEqual(["toolu_sort_bleu"]);
     expect(ids(g.over)).toEqual(["toolu_sort_rouge", "toolu_sort_orange"]);
     // La question une fois fermée, vert reprend sa place dans les agents en cours.
     s.apply([{ seq: 5000, t: 1_000_000, session: "demo", kind: "question_closed", request_id: "req_sort_q", reason: "Answered" } as CoreEvent]);
-    expect(ids(groupAgents(s.agents, waitingIds(s.question)).running)).toEqual(["toolu_sort_bleu", "toolu_sort_vert"]);
+    expect(ids(groupAgents(s.agents, waitingIds(s.questions)).running)).toEqual(["toolu_sort_bleu", "toolu_sort_vert"]);
+  });
+});
+
+describe("questions en file (main et sous-agents en parallèle)", () => {
+  const q = (seq: number, id: string, thread: string) =>
+    ({ seq, t: 0, session: "s", kind: "question", request_id: id, tool_use_id: `tu_${id}`, thread, questions: [], can_skip: true }) as CoreEvent;
+  const closed = (seq: number, id: string) =>
+    ({ seq, t: 0, session: "s", kind: "question_closed", request_id: id, reason: "Answered" }) as CoreEvent;
+
+  it("affiche la plus ancienne, compte toutes les questions en attente, ferme par request_id", () => {
+    const s = store();
+    s.apply([q(0, "r_main", "main"), q(1, "r_a", "toolu_a"), q(2, "r_b", "toolu_b")]);
+    expect(s.question?.requestId).toBe("r_main");
+    expect([...waitingIds(s.questions)]).toEqual(["toolu_a", "toolu_b"]);
+    // Fermer une question qui n'est pas affichée la retire quand même.
+    s.apply([closed(3, "r_b")]);
+    expect(s.questions.map((x) => x.requestId)).toEqual(["r_main", "r_a"]);
+    s.apply([closed(4, "r_main")]);
+    expect(s.question?.requestId).toBe("r_a");
+    expect([...waitingIds(s.questions)]).toEqual(["toolu_a"]);
+    // Même request_id : remplacée sur place, pas dupliquée.
+    s.question = { ...s.question! };
+    expect(s.questions).toHaveLength(1);
+    s.apply([closed(5, "r_a")]);
+    expect(s.question).toBeNull();
   });
 });
