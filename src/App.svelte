@@ -1222,7 +1222,10 @@
   </div>
   <footer>
     <span>{cwd}</span>
-    <span>{store.status} · {store.rows.length} lignes</span>
+    <!-- data-* : mesures de la recette sur l'exe (J14 : lignes, trous de seq). -->
+    <span data-testid="footer-status" data-rows={store.rows.length} data-gaps={store.gaps} data-last-seq={store.lastSeq}
+      >{store.status} · {store.rows.length} lignes</span
+    >
     <span>latence token p50 {p50} ms · p95 {p95} ms</span>
   </footer>
 </main>
