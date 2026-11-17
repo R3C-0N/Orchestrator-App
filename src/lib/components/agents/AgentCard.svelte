@@ -20,6 +20,7 @@
     now,
     last = false,
     open = false,
+    waiting = false,
     thread = null,
     cwd = null,
     ontoggle,
@@ -32,6 +33,8 @@
     last?: boolean;
     /** Fil déroulé. */
     open?: boolean;
+    /** Une question de son fil attend la réponse de l'utilisateur. */
+    waiting?: boolean;
     /** Lignes du fil de l'agent (`SessionStore.threads`), `null` si absent. */
     thread?: readonly Row[] | null;
     /** Dossier de travail (chemins relatifs du fil). */
@@ -41,18 +44,18 @@
   } = $props();
 
   const st = $derived(agentGlyph(agent.status));
-  const detail = $derived(agentDetail(agent));
+  const detail = $derived(agentDetail(agent, waiting));
   const stats = $derived(agentStats(agent, now));
   const pipe = $derived(last ? " " : "│");
 </script>
 
-<div class="card" data-agent={agent.tool_use_id} data-status={agent.status}>
+<div class="card" data-agent={agent.tool_use_id} data-status={agent.status} data-waiting={waiting || undefined}>
   <button
     type="button"
     class="head"
     disabled={!ontoggle}
     aria-expanded={ontoggle ? open : undefined}
-    aria-label={agentLabel(agent, now)}
+    aria-label={agentLabel(agent, now, waiting)}
     title={`${agentName(agent.agent_type)} — ${agent.description}`}
     onclick={() => ontoggle?.(agent.tool_use_id)}
   >
@@ -139,5 +142,8 @@
   }
   .err {
     color: var(--t-error);
+  }
+  .ask {
+    color: var(--t-lavender);
   }
 </style>

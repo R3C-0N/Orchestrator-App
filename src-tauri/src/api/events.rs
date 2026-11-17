@@ -105,6 +105,11 @@ pub enum EventBody {
     Question {
         request_id: String,
         tool_use_id: Option<String>,
+        /// Fil qui pose la question : `"main"`, ou le `tool_use_id` de l'appel
+        /// Agent quand un sous-agent attend la réponse (colonne des agents,
+        /// groupe « en attente »). Retrouvé par `agent_id` du `can_use_tool`
+        /// (= `task_id` de l'agent) ou par le fil de l'appel `AskUserQuestion`.
+        thread: ThreadId,
         questions: Vec<QuestionItem>,
         can_skip: bool,
     },

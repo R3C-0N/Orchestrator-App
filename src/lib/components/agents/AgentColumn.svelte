@@ -8,14 +8,23 @@
   //   └ ● agent-rouge  Dire bonjour
   //       ⎿  Done · 0 tool uses    0s · ↓ 24.0k tokens
   //
-  // Lit seulement le magasin (`agents`, `threads`, `threadsRev`, `status`,
-  // `meta.cwd`) : aucune commande Tauri, aucune capability.
+  // Ordre : agents en attente d'une réponse (question en suspens dans leur
+  // fil, ligne `⎿  ☐ Waiting for your answer`), puis en cours, puis les
+  // terminés dans un panneau repliable (« ▸ 3 done », replié par défaut).
+  // Ordre de lancement dans chaque groupe (`groupAgents`). Un agent terminé
+  // dont le fil est déroulé reste affiché sous l'en-tête replié jusqu'à ce
+  // que son fil soit refermé ou que le panneau soit replié.
+  //
+  // Lit seulement le magasin (`agents`, `question`, `threads`, `threadsRev`,
+  // `status`, `meta.cwd`) : aucune commande Tauri, aucune capability.
   //
   // Props :
   // - `store` (obligatoire) : le `SessionStore` de la session affichée.
   // - `width` : largeur de la colonne (CSS), `"48ch"` par défaut.
   // - `expandable` : clic sur un agent → son fil déroulé (bonus), vrai par défaut.
   // - `open` (bindable) : `tool_use_id` des agents dépliés.
+  // - `doneOpen` (bindable) : panneau des agents terminés ouvert, faux par
+  //   défaut ; l'app le garde d'une session à l'autre tant qu'elle tourne.
   //
   // Coût : l'horloge d'une seconde (`render/clock`) n'est lue que tant qu'un
   // agent tourne ; une colonne d'agents finis ne se redessine plus.
@@ -23,28 +32,45 @@
   import { BULLET } from "../../render/glyphs";
   import type { SessionStore } from "../../state/session.svelte";
   import AgentCard from "./AgentCard.svelte";
-  import { isLive } from "./agentView";
+  import { doneHeader, groupAgents, isLive, waitingIds } from "./agentView";
 
   let {
     store,
     width = "48ch",
     expandable = true,
     open = $bindable([]),
+    doneOpen = $bindable(false),
   }: {
     store: SessionStore;
     width?: string;
     expandable?: boolean;
     open?: string[];
+    doneOpen?: boolean;
   } = $props();
 
   const agents = $derived(store.agents);
   const anyLive = $derived(agents.some(isLive));
   // `seconds.now` abonne à l'horloge ; `Date.now()` seul ne relance rien.
   const now = $derived(anyLive ? seconds.now : Date.now());
-  const running = $derived(agents.filter(isLive).length);
+  const waiting = $derived(waitingIds(store.question));
+  const groups = $derived(groupAgents(agents, waiting));
+  const live = $derived(groups.waiting.length ? [...groups.waiting, ...groups.running] : groups.running);
+  const running = $derived(live.length);
+  // Panneau replié : seuls les agents terminés dont le fil est déroulé.
+  const shownOver = $derived(doneOpen ? groups.over : groups.over.filter((a) => open.includes(a.tool_use_id)));
+  const header = $derived(doneHeader(groups.over.length, doneOpen));
 
   function toggle(id: string) {
     open = open.includes(id) ? open.filter((x) => x !== id) : [...open, id];
+  }
+
+  function toggleDone() {
+    doneOpen = !doneOpen;
+    // Replier le panneau referme aussi les fils des agents terminés.
+    if (!doneOpen) {
+      const over = new Set(groups.over.map((a) => a.tool_use_id));
+      if (open.some((id) => over.has(id))) open = open.filter((id) => !over.has(id));
+    }
   }
 
   function threadOf(id: string) {
@@ -64,17 +90,43 @@
   {#if agents.length === 0}
     <div class="empty dim">  no agents</div>
   {:else}
-    {#each agents as a, i (a.tool_use_id)}
+    {#each live as a, i (a.tool_use_id)}
       <AgentCard
         agent={a}
         {now}
-        last={i === agents.length - 1}
+        last={i === live.length - 1}
+        waiting={waiting.has(a.tool_use_id)}
         open={expandable && open.includes(a.tool_use_id)}
         thread={expandable && open.includes(a.tool_use_id) ? threadOf(a.tool_use_id) : null}
         cwd={store.meta.cwd}
         ontoggle={expandable ? toggle : undefined}
       />
     {/each}
+    {#if groups.over.length > 0}
+      <button
+        type="button"
+        class="fold"
+        aria-expanded={doneOpen}
+        aria-controls="agents-done"
+        data-testid="agents-done-toggle"
+        onclick={toggleDone}
+      >
+        <span class="g dim">{`${header.glyph} `}</span><span class="fold-text dim">{header.text}</span>
+      </button>
+      <div id="agents-done" data-testid="agents-done" data-open={doneOpen}>
+        {#each shownOver as a, i (a.tool_use_id)}
+          <AgentCard
+            agent={a}
+            {now}
+            last={i === shownOver.length - 1}
+            open={expandable && open.includes(a.tool_use_id)}
+            thread={expandable && open.includes(a.tool_use_id) ? threadOf(a.tool_use_id) : null}
+            cwd={store.meta.cwd}
+            ontoggle={expandable ? toggle : undefined}
+          />
+        {/each}
+      </div>
+    {/if}
     <div class="foot dim" data-testid="agent-count">
       {running > 0 ? `${running} running · ` : ""}{agents.length} {agents.length === 1 ? "agent" : "agents"}
     </div>
@@ -109,6 +161,27 @@
   }
   .empty {
     white-space: pre;
+  }
+  .fold {
+    display: flex;
+    width: 100%;
+    padding: 0;
+    margin: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    white-space: pre;
+    cursor: pointer;
+  }
+  .fold:hover .fold-text,
+  .fold:focus-visible .fold-text {
+    color: var(--t-fg);
+  }
+  .fold:focus-visible {
+    outline: 1px dotted var(--t-dim);
+    outline-offset: -1px;
   }
   .foot {
     margin-top: var(--t-lh);

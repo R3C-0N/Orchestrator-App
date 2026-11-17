@@ -294,7 +294,7 @@ export class MockCore {
   /** Capacités annoncées par `init` (`can_skip` des questions). */
   #caps: string[] = [];
   /** Questions en attente de réponse (comme `pending_in` du cœur). */
-  #questions = new Map<string, { toolUseId: string; questions: QuestionItem[]; canSkip: boolean }>();
+  #questions = new Map<string, { toolUseId: string; thread: string; questions: QuestionItem[]; canSkip: boolean }>();
   #asked = 0;
 
   constructor(opts: MockOptions = {}) {
@@ -430,8 +430,12 @@ export class MockCore {
   // courte réponse de Claude. Erreurs du cœur : `UnknownRequest` pour une
   // requête inconnue, `Unsupported` pour « ignorer » sans la capacité.
 
-  /** Claude pose une question ; renvoie le `request_id`. */
-  ask(questions: QuestionItem[], opts: { canSkip?: boolean } = {}): string {
+  /**
+   * Claude pose une question ; renvoie le `request_id`. `thread` : le
+   * `tool_use_id` d'un sous-agent qui pose la question (il passe alors dans
+   * le groupe « en attente » de la colonne des agents), `"main"` par défaut.
+   */
+  ask(questions: QuestionItem[], opts: { canSkip?: boolean; thread?: string } = {}): string {
     const n = this.#asked++;
     const requestId = `req_mock_q${n}`;
     const toolUseId = `toolu_mock_ask_${n}`;
@@ -445,16 +449,17 @@ export class MockCore {
         multiSelect: q.multi_select,
       })),
     };
-    this.#questions.set(requestId, { toolUseId, questions, canSkip });
+    const thread = opts.thread ?? "main";
+    this.#questions.set(requestId, { toolUseId, thread, questions, canSkip });
     this.#emit({ kind: "status", state: "Requesting" });
     this.#emit({
       kind: "block_done",
-      thread: "main",
+      thread,
       msg,
       index: 0,
       block: { type: "ToolUse", tool_use_id: toolUseId, name: "AskUserQuestion", input },
     });
-    this.#emit({ kind: "question", request_id: requestId, tool_use_id: toolUseId, questions, can_skip: canSkip });
+    this.#emit({ kind: "question", request_id: requestId, tool_use_id: toolUseId, thread, questions, can_skip: canSkip });
     return requestId;
   }
 
@@ -468,7 +473,7 @@ export class MockCore {
     this.#emit({ kind: "question_closed", request_id: requestId, reason: "Answered" });
     const parts = Object.entries(answers).map(([k, v]) => `"${k}"="${String(v)}"`);
     this.#questionResult(
-      q.toolUseId,
+      q,
       `Your questions have been answered: ${parts.join(", ")}. You can now continue with these answers in mind.`,
     );
   }
@@ -479,21 +484,21 @@ export class MockCore {
     if (q && !q.canSkip) throw { kind: "unsupported", message: "ask_user_question_unanswered_v1" };
     this.#takeQuestion(requestId);
     this.#emit({ kind: "question_closed", request_id: requestId, reason: "Skipped" });
-    this.#questionResult(q!.toolUseId, "The user did not answer the questions.");
+    this.#questionResult(q!, "The user did not answer the questions.");
   }
 
-  #takeQuestion(requestId: string): { toolUseId: string; questions: QuestionItem[]; canSkip: boolean } {
+  #takeQuestion(requestId: string): { toolUseId: string; thread: string; questions: QuestionItem[]; canSkip: boolean } {
     const q = this.#questions.get(requestId);
     if (!q) throw { kind: "unknown_request", message: requestId };
     this.#questions.delete(requestId);
     return q;
   }
 
-  #questionResult(toolUseId: string, text: string): void {
+  #questionResult(q: { toolUseId: string; thread: string }, text: string): void {
     this.#emit({
       kind: "tool_result",
-      thread: "main",
-      tool_use_id: toolUseId,
+      thread: q.thread,
+      tool_use_id: q.toolUseId,
       content: [{ type: "Text", text }],
       is_error: false,
       meta: null,

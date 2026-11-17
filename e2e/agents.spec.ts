@@ -25,6 +25,7 @@ type Demo = {
   store: { agents: { status: string }[]; status: string; rows: unknown[] };
   apply(events: unknown[]): void;
   done(): boolean;
+  open(): string[];
 };
 declare global {
   interface Window {
@@ -73,6 +74,9 @@ test("t3 : deux agents bleu et rouge, état, durée qui avance puis se fige, las
 
   // Fin : ● vert, durée figée à ended_at − started_at = (520 − 160) × 20 ms ≈ 7 s.
   await page.waitForFunction(() => window.__agentsDemo.done(), null, { timeout: 20_000 });
+  // Les agents terminés sont dans le panneau replié : on l'ouvre.
+  await expect(col.locator(".card")).toHaveCount(0);
+  await page.getByTestId("agents-done-toggle").click();
   await expect(card(page, BLEU)).toHaveAttribute("data-status", "Completed");
   await expect(card(page, BLEU).getByTestId("agent-glyph")).toHaveText("●");
   expect(await card(page, BLEU).getByTestId("agent-glyph").evaluate((el) => getComputedStyle(el).color)).toBe(
@@ -95,6 +99,7 @@ test("bonus : clic sur un agent → son fil, au clavier aussi", async ({ page })
   await page.setViewportSize({ width: 1136, height: 813 });
   await open(page, "mock=t3&stretch=1");
   await page.waitForFunction(() => window.__agentsDemo.done());
+  await page.getByTestId("agents-done-toggle").click();
   const head = card(page, BLEU).locator("button.head");
   await expect(head).toHaveAttribute("aria-expanded", "false");
   await head.click();
@@ -145,9 +150,139 @@ test("4 agents + 1 gris : lisible, sans débordement, 2 lignes par agent", async
     await card(page, "toolu_four_inconnu").locator(".name").evaluate((el) => getComputedStyle(el).backgroundColor),
   ).toBe("rgb(118, 118, 118)");
   await page.waitForFunction(() => window.__agentsDemo.done(), null, { timeout: 30_000 });
+  await page.getByTestId("agents-done-toggle").click();
   await expect(card(page, "toolu_four_orange")).toHaveAttribute("data-status", "Failed");
   await expect(card(page, "toolu_four_orange").getByTestId("agent-detail")).toHaveText("Failed · 2 tool uses");
   await page.screenshot({ path: `${OUT_DIR}/four-termine.png` });
+});
+
+// --- Tri de la colonne : en attente, en cours, terminés (repliés) ------------
+
+/** Ordre affiché des cartes : `tool_use_id` dans l'ordre du DOM. */
+const order = (page: Page) =>
+  page
+    .getByTestId("agent-column")
+    .locator(".card")
+    .evaluateAll((els) => els.map((e) => e.getAttribute("data-agent")));
+
+/** État complet d'un agent du scénario `sort`, appliqué tout de suite. */
+async function applyAgent(page: Page, id: string, type: string, color: string, patch: Record<string, unknown>) {
+  await page.evaluate(
+    ({ id, type, color, patch }) => {
+      const now = Date.now();
+      window.__agentsDemo.apply([
+        {
+          seq: 0,
+          t: now,
+          session: "demo",
+          kind: "agent",
+          tool_use_id: id,
+          task_id: `task_${id}`,
+          agent_type: type,
+          color,
+          description: "Agent ajouté par le test",
+          status: "Running",
+          background: true,
+          started_at: now - 5000,
+          ended_at: null,
+          last_tool: "Read",
+          tokens: null,
+          tool_uses: null,
+          summary: null,
+          ...patch,
+        },
+      ]);
+    },
+    { id, type, color, patch },
+  );
+}
+
+test("tri : en attente, puis en cours, puis terminés dans un panneau replié", async ({ page }) => {
+  await page.setViewportSize({ width: 1136, height: 813 });
+  await open(page, "mock=sort&scale=1");
+  await page.waitForFunction(() => window.__agentsDemo.done());
+  const col = page.getByTestId("agent-column");
+  const done = page.getByTestId("agents-done");
+  // Vert (lancé 2e) attend une réponse : en tête ; bleu tourne ; rouge et
+  // orange (terminé, échec) sont repliés.
+  expect(await order(page)).toEqual(["toolu_sort_vert", "toolu_sort_bleu"]);
+  await expect(card(page, "toolu_sort_vert")).toHaveAttribute("data-waiting", "true");
+  await expect(card(page, "toolu_sort_vert").getByTestId("agent-detail")).toHaveText("☐ Waiting for your answer");
+  expect(
+    await card(page, "toolu_sort_vert").getByTestId("agent-detail").evaluate((el) => getComputedStyle(el).color),
+  ).toBe("rgb(177, 185, 249)");
+  expect(await card(page, "toolu_sort_bleu").getAttribute("data-waiting")).toBeNull();
+  const toggle = page.getByTestId("agents-done-toggle");
+  await expect(toggle).toHaveText("▸ 2 done");
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(done.locator(".card")).toHaveCount(0);
+  await expect(col.getByTestId("agent-count")).toHaveText("2 running · 4 agents");
+  // Le dernier agent vivant ferme l'arbre (`└`), le panneau suit.
+  await expect(card(page, "toolu_sort_bleu").locator(".line").first()).toContainText("└");
+  mkdirSync(OUT_DIR, { recursive: true });
+  await col.screenshot({ path: `${OUT_DIR}/tri-replie.png` });
+
+  // Clic : ouvert, terminés dans l'ordre de lancement.
+  await toggle.click();
+  await expect(toggle).toHaveText("▾ 2 done");
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  expect(await order(page)).toEqual(["toolu_sort_vert", "toolu_sort_bleu", "toolu_sort_rouge", "toolu_sort_orange"]);
+  await expect(card(page, "toolu_sort_orange")).toHaveAttribute("data-status", "Failed");
+  await col.screenshot({ path: `${OUT_DIR}/tri-ouvert.png` });
+
+  // Clavier : Entrée replie, Espace rouvre.
+  await toggle.focus();
+  await page.keyboard.press("Enter");
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(done.locator(".card")).toHaveCount(0);
+  await page.keyboard.press("Space");
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(done.locator(".card")).toHaveCount(2);
+  await page.keyboard.press("Space");
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+  // Question fermée : vert reprend sa place (ordre de lancement) parmi les agents en cours.
+  await page.evaluate(() =>
+    window.__agentsDemo.apply([
+      { seq: 0, t: Date.now(), session: "demo", kind: "question_closed", request_id: "req_sort_q", reason: "Answered" },
+    ]),
+  );
+  await expect.poll(() => order(page)).toEqual(["toolu_sort_bleu", "toolu_sort_vert"]);
+  await expect(card(page, "toolu_sort_vert").getByTestId("agent-detail")).toHaveText("Read…");
+});
+
+test("tri : un agent qui finit passe dans le panneau ; fil déroulé, il reste visible", async ({ page }) => {
+  await page.setViewportSize({ width: 1136, height: 813 });
+  await open(page, "mock=sort&scale=1");
+  await page.waitForFunction(() => window.__agentsDemo.done());
+  const toggle = page.getByTestId("agents-done-toggle");
+  const done = page.getByTestId("agents-done");
+  // Bleu, fil fermé, finit : il quitte les agents en cours pour le panneau replié.
+  await applyAgent(page, "toolu_sort_bleu", "agent-bleu", "blue", { status: "Completed", ended_at: Date.now(), tool_uses: 1 });
+  await expect(toggle).toHaveText("▸ 3 done");
+  expect(await order(page)).toEqual(["toolu_sort_vert"]);
+  // Un agent en cours, fil déroulé, qui finit : il reste sous l'en-tête replié, fil ouvert.
+  await applyAgent(page, "toolu_sort_cyan", "agent-cyan", "cyan", {});
+  await expect.poll(() => order(page)).toEqual(["toolu_sort_vert", "toolu_sort_cyan"]);
+  const cyan = card(page, "toolu_sort_cyan");
+  await cyan.locator("button.head").click();
+  await expect(cyan.getByTestId("agent-thread")).toBeVisible();
+  await applyAgent(page, "toolu_sort_cyan", "agent-cyan", "cyan", { status: "Completed", ended_at: Date.now(), tool_uses: 1 });
+  await expect(toggle).toHaveText("▸ 4 done");
+  await expect(cyan).toHaveAttribute("data-status", "Completed");
+  await expect(done.locator(".card")).toHaveCount(1);
+  await expect(cyan.getByTestId("agent-thread")).toBeVisible();
+  await expect(cyan.locator("button.head")).toHaveAttribute("aria-expanded", "true");
+  // Refermer son fil le range dans le panneau replié.
+  await cyan.locator("button.head").click();
+  await expect(done.locator(".card")).toHaveCount(0);
+  // Ouvrir le panneau, dérouler un fil, replier le panneau : le fil est refermé.
+  await toggle.click();
+  await cyan.locator("button.head").click();
+  await expect(cyan.getByTestId("agent-thread")).toBeVisible();
+  await toggle.click();
+  await expect(done.locator(".card")).toHaveCount(0);
+  expect(await page.evaluate(() => window.__agentsDemo.open())).toEqual([]);
 });
 
 function dataUrl(path: string): string {

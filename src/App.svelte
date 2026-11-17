@@ -96,6 +96,8 @@
   let verbose = $state(false);
   /** Agents dépliés dans la colonne (fil de l'agent, bonus de J9). */
   let agentsOpen: string[] = $state([]);
+  // Panneau des agents terminés : replié au départ, gardé tant que l'app tourne.
+  let agentsDoneOpen = $state(false);
 
   let session: SessionKey | null = $state(null);
   let cwd = $state("");
@@ -778,7 +780,7 @@
         {/if}
       {/if}
     </div>
-    <AgentColumn {store} width="48ch" bind:open={agentsOpen} />
+    <AgentColumn {store} width="48ch" bind:open={agentsOpen} bind:doneOpen={agentsDoneOpen} />
   </div>
   <footer>
     <span>{cwd}</span>

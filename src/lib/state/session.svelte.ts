@@ -86,6 +86,11 @@ export type Notice = { id: number; level: NoticeLevel; code: string; message: st
 export type Question = {
   requestId: string;
   toolUseId: string | null;
+  /**
+   * Fil qui attend la réponse : `"main"`, ou le `tool_use_id` de l'agent dont
+   * le fil pose la question (groupe « en attente » de la colonne des agents).
+   */
+  thread: string;
   questions: QuestionItem[];
   canSkip: boolean;
 };
@@ -476,6 +481,7 @@ export class SessionStore {
         this.question = {
           requestId: ev.request_id,
           toolUseId: ev.tool_use_id,
+          thread: ev.thread,
           questions: ev.questions,
           canSkip: ev.can_skip,
         };

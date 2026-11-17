@@ -17,13 +17,58 @@ import type { Row, ToolCallRow } from "../../state/session.svelte";
 /** Agent en cours dans le panneau du TUI (`05`). */
 export const RUNNING_GLYPH = "◯";
 
-export type AgentTone = "dim" | "ok" | "err";
+export type AgentTone = "dim" | "ok" | "err" | "ask";
+
+/**
+ * Question en attente (pastille de la carte de question, capture `07` :
+ * « ☐ <header> »), reprise sur la ligne `⎿` d'un agent qui attend la réponse.
+ */
+export const WAITING_GLYPH = "☐";
 
 const OVER = new Set<AgentStatus>(["Completed", "Failed", "Stopped"]);
 
 /** Vrai tant que l'agent tourne (sa durée avance). */
 export function isLive(a: Pick<AgentEvent, "status">): boolean {
   return !OVER.has(a.status);
+}
+
+/** Groupes de la colonne, dans l'ordre d'affichage. */
+export type AgentGroups<T> = {
+  /** En attente d'une réponse de l'utilisateur (question en suspens dans son fil). */
+  waiting: T[];
+  /** En cours. */
+  running: T[];
+  /** Terminés, en échec ou arrêtés (panneau repliable). */
+  over: T[];
+};
+
+/**
+ * Tri de la colonne : en attente de réponse, puis en cours, puis terminés.
+ * Ordre stable dans chaque groupe (ordre de lancement : celui de `agents`).
+ * `waiting` : `tool_use_id` des agents dont une question attend une réponse
+ * (`SessionStore.question.thread`) ; un agent fini n'attend plus rien.
+ */
+export function groupAgents<T extends Pick<AgentEvent, "tool_use_id" | "status">>(
+  agents: readonly T[],
+  waiting: ReadonlySet<string>,
+): AgentGroups<T> {
+  const g: AgentGroups<T> = { waiting: [], running: [], over: [] };
+  for (const a of agents) {
+    if (!isLive(a)) g.over.push(a);
+    else if (waiting.has(a.tool_use_id)) g.waiting.push(a);
+    else g.running.push(a);
+  }
+  return g;
+}
+
+/** Agents en attente d'après la question ouverte : jamais le fil principal. */
+export function waitingIds(question: { thread: string } | null): ReadonlySet<string> {
+  return new Set(question && question.thread !== "main" ? [question.thread] : []);
+}
+
+/** En-tête du panneau des agents terminés : « ▸ 3 done » (replié), « ▾ 3 done » (ouvert). */
+export function doneHeader(count: number, open: boolean): { glyph: string; text: string } {
+  return { glyph: open ? "▾" : "▸", text: `${count} done` };
 }
 
 /**
@@ -70,7 +115,8 @@ function plural(n: number, one: string, many: string): string {
  * (`last_tool`, nom affiché comme dans le fil : Edit → Update, Grep → Search),
  * l'état final ensuite.
  */
-export function agentDetail(a: AgentEvent): { text: string; tone: AgentTone } {
+export function agentDetail(a: AgentEvent, waiting = false): { text: string; tone: AgentTone } {
+  if (waiting && isLive(a)) return { text: `${WAITING_GLYPH} Waiting for your answer`, tone: "ask" };
   const uses = a.tool_uses !== null ? ` ${DOT} ${plural(a.tool_uses, "tool use", "tool uses")}` : "";
   switch (a.status) {
     case "Starting":
@@ -87,9 +133,10 @@ export function agentDetail(a: AgentEvent): { text: string; tone: AgentTone } {
 }
 
 /** Libellé d'accessibilité complet (le texte affiché est tronqué). */
-export function agentLabel(a: AgentEvent, now: number): string {
+export function agentLabel(a: AgentEvent, now: number, waiting = false): string {
   const stats = agentStats(a, now);
-  return [a.agent_type.trim(), a.description, a.status, a.last_tool ?? "", stats].filter(Boolean).join(", ");
+  const status = waiting && isLive(a) ? "waiting for your answer" : a.status;
+  return [a.agent_type.trim(), a.description, status, a.last_tool ?? "", stats].filter(Boolean).join(", ");
 }
 
 /** Une ligne du fil déroulé d'un agent (bonus J9). */

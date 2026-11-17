@@ -11,10 +11,13 @@ import {
   agentElapsed,
   agentGlyph,
   agentStats,
+  doneHeader,
+  groupAgents,
   isLive,
   threadLines,
+  waitingIds,
 } from "../../src/lib/components/agents/agentView";
-import { fourAgents, retime } from "../../src/lib/components/agents/demo/replay";
+import { fourAgents, retime, sortAgents } from "../../src/lib/components/agents/demo/replay";
 import { AGENT_NEUTRAL, agentColor } from "../../src/lib/render/colors";
 import { SessionStore } from "../../src/lib/state/session.svelte";
 
@@ -165,5 +168,74 @@ describe("scénario de démo à 4 agents + 1 gris", () => {
     expect(agentColor(s.agents[4].color, s.agents[4].agent_type)).toBe(AGENT_NEUTRAL);
     const orange = threadLines(s.threads.get("toolu_four_orange")!, "C:\\projet");
     expect(orange.find((l) => l.kind === "tool" && l.isError)).toMatchObject({ title: "Update", arg: "src\\lib\\render\\tools.ts" });
+  });
+});
+
+describe("tri de la colonne : en attente, en cours, terminés", () => {
+  const ids = (xs: AgentEvent[]) => xs.map((a) => a.tool_use_id);
+  const a1 = agent({ tool_use_id: "a1" });
+  const a2 = agent({ tool_use_id: "a2", status: "Completed" });
+  const a3 = agent({ tool_use_id: "a3" });
+  const a4 = agent({ tool_use_id: "a4", status: "Failed" });
+  const a5 = agent({ tool_use_id: "a5", status: "Starting" });
+  const a6 = agent({ tool_use_id: "a6", status: "Stopped" });
+  const all = [a1, a2, a3, a4, a5, a6];
+
+  it("sans question : en cours puis terminés (échec et arrêt compris), dans l'ordre de lancement", () => {
+    const g = groupAgents(all, new Set());
+    expect(ids(g.waiting)).toEqual([]);
+    expect(ids(g.running)).toEqual(["a1", "a3", "a5"]);
+    expect(ids(g.over)).toEqual(["a2", "a4", "a6"]);
+  });
+
+  it("un agent qui attend une réponse passe en tête, les autres gardent leur ordre", () => {
+    const g = groupAgents(all, new Set(["a5"]));
+    expect(ids(g.waiting)).toEqual(["a5"]);
+    expect(ids(g.running)).toEqual(["a1", "a3"]);
+    expect(ids(g.over)).toEqual(["a2", "a4", "a6"]);
+  });
+
+  it("un agent terminé n'attend plus rien, même si une question porte son id", () => {
+    const g = groupAgents(all, new Set(["a2"]));
+    expect(ids(g.waiting)).toEqual([]);
+    expect(ids(g.over)).toEqual(["a2", "a4", "a6"]);
+  });
+
+  it("change de groupe quand son état change, sans déranger l'ordre des autres", () => {
+    const after = all.map((a) => (a.tool_use_id === "a1" ? { ...a, status: "Completed" as const } : a));
+    const g = groupAgents(after, new Set());
+    expect(ids(g.running)).toEqual(["a3", "a5"]);
+    expect(ids(g.over)).toEqual(["a1", "a2", "a4", "a6"]);
+  });
+
+  it("la question du fil principal ne désigne aucun agent", () => {
+    expect([...waitingIds(null)]).toEqual([]);
+    expect([...waitingIds({ thread: "main" })]).toEqual([]);
+    expect([...waitingIds({ thread: "toolu_x" })]).toEqual(["toolu_x"]);
+  });
+
+  it("ligne ⎿ « ☐ Waiting for your answer » tant qu'il attend et qu'il tourne", () => {
+    expect(agentDetail(agent({ last_tool: "Read" }), true)).toEqual({ text: "☐ Waiting for your answer", tone: "ask" });
+    expect(agentDetail(agent({ status: "Completed", tool_uses: 1 }), true).text).toBe("Done · 1 tool use");
+  });
+
+  it("en-tête du panneau : ▸ replié, ▾ ouvert", () => {
+    expect(doneHeader(3, false)).toEqual({ glyph: "▸", text: "3 done" });
+    expect(doneHeader(1, true)).toEqual({ glyph: "▾", text: "1 done" });
+  });
+
+  it("scénario sort : vert en attente, bleu en cours, rouge puis orange terminés", () => {
+    const s = store();
+    s.apply(sortAgents(1_000_000).map((x) => x.ev));
+    expect(s.gaps).toBe(0);
+    expect(s.failed).toBe(0);
+    expect(s.question?.thread).toBe("toolu_sort_vert");
+    const g = groupAgents(s.agents, waitingIds(s.question));
+    expect(ids(g.waiting)).toEqual(["toolu_sort_vert"]);
+    expect(ids(g.running)).toEqual(["toolu_sort_bleu"]);
+    expect(ids(g.over)).toEqual(["toolu_sort_rouge", "toolu_sort_orange"]);
+    // La question une fois fermée, vert reprend sa place dans les agents en cours.
+    s.apply([{ seq: 5000, t: 1_000_000, session: "demo", kind: "question_closed", request_id: "req_sort_q", reason: "Answered" } as CoreEvent]);
+    expect(ids(groupAgents(s.agents, waitingIds(s.question)).running)).toEqual(["toolu_sort_bleu", "toolu_sort_vert"]);
   });
 });

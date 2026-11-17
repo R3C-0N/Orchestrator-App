@@ -9,7 +9,7 @@
   import { SessionStore } from "../../../state/session.svelte";
   import Conversation from "../../Conversation.svelte";
   import AgentColumn from "../AgentColumn.svelte";
-  import { fourAgents, play, retime } from "./replay";
+  import { fourAgents, play, retime, sortAgents } from "./replay";
 
   const params = new URLSearchParams(location.search);
   const scenario = params.get("mock") ?? "t3";
@@ -22,6 +22,7 @@
 
   const store = new SessionStore();
   let open: string[] = $state([]);
+  let doneOpen = $state(false);
   let done = $state(false);
 
   // `seq` renuméroté à l'envoi : historique et scénario forment une seule suite.
@@ -39,7 +40,9 @@
         ? retime(t3 as unknown as CoreEvent[], base, stretch)
         : scenario === "four"
           ? fourAgents(base, scale)
-          : [];
+          : scenario === "sort"
+            ? sortAgents(base, scale)
+            : [];
     const stop = play(timed, push, () => (done = true));
     (window as unknown as Record<string, unknown>).__agentsDemo = {
       store,
@@ -48,6 +51,7 @@
       apply: (events: CoreEvent[]) => store.apply(events.map((e) => ({ ...e, seq: seq++ }) as CoreEvent)),
       done: () => done,
       open: () => open,
+      doneOpen: () => doneOpen,
     };
     return stop;
   });
@@ -55,7 +59,7 @@
 
 <main data-scenario={scenario} data-done={done}>
   <div class="left"><Conversation {store} /></div>
-  <AgentColumn {store} {width} bind:open />
+  <AgentColumn {store} {width} bind:open bind:doneOpen />
 </main>
 
 <style>

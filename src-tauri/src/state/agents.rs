@@ -41,6 +41,9 @@ use crate::protocol::inbound::{
 /// Noms de l'outil qui lance un sous-agent (spec 4.4).
 pub const AGENT_TOOL_NAMES: &[&str] = &["Agent", "Task"];
 
+/// Outil des questions de Claude (`can_use_tool` en attente de l'interface).
+const ASK_TOOL: &str = "AskUserQuestion";
+
 pub fn is_agent_tool(name: &str) -> bool {
     AGENT_TOOL_NAMES.contains(&name)
 }
@@ -53,6 +56,10 @@ pub struct AgentRegistry {
     by_tool: HashMap<String, usize>,
     /// `task_id` -> `tool_use_id` (`task_started`, `background_tasks_changed`).
     task_to_tool: HashMap<String, String>,
+    /// `tool_use_id` d'un `AskUserQuestion` appelé dans le fil d'un agent ->
+    /// `tool_use_id` de cet agent ([`AgentRegistry::asking_agent`]). Seul cet
+    /// outil est noté : la table reste minuscule.
+    ask_thread: HashMap<String, String>,
 }
 
 fn is_terminal(s: AgentStatus) -> bool {
@@ -196,9 +203,30 @@ impl AgentRegistry {
             }));
         }
         if let Some(parent) = thread {
+            if name == ASK_TOOL && !tool_use_id.is_empty() {
+                self.ask_thread
+                    .insert(tool_use_id.to_string(), parent.to_string());
+            }
             out.extend(self.set_last_tool(parent, name));
         }
         out
+    }
+
+    /// Agent (son `tool_use_id`) qui attend la réponse à un `can_use_tool` :
+    /// d'abord par `agent_id` de la requête (le `task_id` de l'agent, ou son
+    /// `tool_use_id`), sinon par le fil où l'appel `tool_use_id` a été vu.
+    /// `None` : la question vient du fil principal (ou d'un agent inconnu).
+    pub fn asking_agent(&self, agent_id: Option<&str>, tool_use_id: Option<&str>) -> Option<&str> {
+        let by_agent = agent_id.filter(|id| !id.is_empty()).and_then(|id| {
+            self.tool_of_task(id)
+                .or_else(|| self.by_tool.get_key_value(id).map(|(k, _)| k.as_str()))
+        });
+        by_agent.or_else(|| {
+            tool_use_id
+                .and_then(|t| self.ask_thread.get(t))
+                .map(String::as_str)
+                .filter(|id| self.is_agent(id))
+        })
     }
 
     fn set_last_tool(&mut self, tool_use_id: &str, tool: &str) -> Option<AgentEvent> {

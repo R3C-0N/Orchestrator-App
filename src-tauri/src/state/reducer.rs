@@ -546,9 +546,14 @@ impl Reducer {
                 if tool == "AskUserQuestion" {
                     let questions = parse_questions(&input);
                     self.questions.insert(request_id.clone(), input);
+                    let thread = self
+                        .agents
+                        .asking_agent(c.agent_id.as_deref(), c.tool_use_id.as_deref())
+                        .map_or_else(ThreadId::main, |id| ThreadId(id.to_string()));
                     out.push(Action::Emit(EventBody::Question {
                         request_id,
                         tool_use_id: c.tool_use_id.clone(),
+                        thread,
                         questions,
                         can_skip: self.capabilities.iter().any(|c| c == CAP_UNANSWERED),
                     }));

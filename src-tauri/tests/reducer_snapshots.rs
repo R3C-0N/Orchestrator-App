@@ -508,6 +508,61 @@ fn tool_progress_and_subagent_tools_set_last_tool() {
         .any(|b| matches!(b, EventBody::Agent(a) if a.tool_use_id == "tC" && a.color.is_none())));
 }
 
+/// Fil d'une question (colonne des agents, groupe « en attente ») : `main`
+/// pour le fil principal, l'agent par `agent_id` (= `task_id`) ou par le fil
+/// où l'appel `AskUserQuestion` a été vu.
+#[test]
+fn question_thread_names_the_waiting_agent() {
+    let thread_of = |a: &[Action]| {
+        emitted(a)
+            .into_iter()
+            .find_map(|b| match b {
+                EventBody::Question { thread, .. } => Some(thread.0),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let ask = |rid: &str, tool: &str, agent: Option<&str>| {
+        let mut req = json!({"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":tool,"input":{"questions":[]}});
+        if let Some(a) = agent {
+            req["agent_id"] = json!(a);
+        }
+        json!({"type":"control_request","request_id":rid,"request":req})
+    };
+    let mut r = Reducer::new();
+    r.handle_at(
+        &json!({"type":"assistant","message":{"id":"m","content":[
+            {"type":"tool_use","id":"tA","name":"Agent","input":{"subagent_type":"agent-bleu","description":"a"}},
+            {"type":"tool_use","id":"tB","name":"Agent","input":{"subagent_type":"agent-rouge","description":"b"}}
+        ]}}),
+        1,
+    );
+    r.handle_at(
+        &json!({"type":"system","subtype":"task_started","task_id":"a0b1","tool_use_id":"tB","subagent_type":"agent-rouge","description":"b","task_type":"local_agent"}),
+        2,
+    );
+    // Fil principal.
+    assert_eq!(thread_of(&r.handle_at(&ask("q0", "tq0", None), 3)), "main");
+    // Par le fil de l'appel AskUserQuestion (agent bleu).
+    r.handle_at(
+        &json!({"type":"assistant","parent_tool_use_id":"tA","message":{"id":"m2","content":[
+            {"type":"tool_use","id":"tq1","name":"AskUserQuestion","input":{"questions":[]}}
+        ]}}),
+        4,
+    );
+    assert_eq!(thread_of(&r.handle_at(&ask("q1", "tq1", None), 5)), "tA");
+    // Par `agent_id` = `task_id` (agent rouge), même sans appel vu.
+    assert_eq!(
+        thread_of(&r.handle_at(&ask("q2", "tq2", Some("a0b1")), 6)),
+        "tB"
+    );
+    // `agent_id` inconnu, appel jamais vu : fil principal, pas d'agent inventé.
+    assert_eq!(
+        thread_of(&r.handle_at(&ask("q3", "tq3", Some("inconnu")), 7)),
+        "main"
+    );
+}
+
 #[test]
 fn cancel_closes_and_history_mode_marks_user_messages() {
     let mut r = Reducer::new();

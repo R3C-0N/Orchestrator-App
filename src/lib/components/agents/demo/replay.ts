@@ -8,6 +8,9 @@
 // - `four` : un orchestrateur avec 4 agents en parallèle (bleu, vert,
 //   orange, violet) plus un agent de couleur inconnue (gris), avec des
 //   outils, un échec et des descriptions longues : lisibilité de la colonne.
+// - `sort` : tri de la colonne ; 4 agents lancés dans l'ordre bleu, vert,
+//   rouge, orange ; vert pose une question (groupe « en attente »), rouge
+//   finit puis orange échoue (panneau des terminés, replié).
 
 import type { AgentEvent } from "../../../core/bindings/AgentEvent";
 import type { CoreEvent } from "../../../core/bindings/CoreEvent";
@@ -186,6 +189,81 @@ export function fourAgents(base: number, scale = 1): Timed[] {
   });
   const lastEnd = Math.max(...AGENTS.map((a, k) => 300 + k * 250 + a.ms));
   add(lastEnd + 300, { kind: "status", state: "Idle" });
+  out.sort((x, y) => x.at - y.at);
+  return out.map((x, seq) => ({
+    at: x.at,
+    ev: { seq: seq + 1000, t: base + x.at, session: "demo", ...x.body } as CoreEvent,
+  }));
+}
+
+/**
+ * Événements du scénario `sort` (tri de la colonne), horodatés depuis
+ * `base` ; `scale` étire le temps.
+ */
+export function sortAgents(base: number, scale = 1): Timed[] {
+  const out: { at: number; body: EventBody }[] = [];
+  const add = (at: number, body: EventBody) => out.push({ at: Math.round(at * scale), body });
+  const specs = [
+    { id: "toolu_sort_bleu", type: "agent-bleu", color: "blue", description: "Lecture du réducteur" },
+    { id: "toolu_sort_vert", type: "agent-vert", color: "green", description: "Choix du format du rapport" },
+    { id: "toolu_sort_rouge", type: "agent-rouge", color: "red", description: "Tests Vitest" },
+    { id: "toolu_sort_orange", type: "agent-orange", color: "orange", description: "Correction d'un libellé" },
+  ];
+  const agent = (k: number, at: number, patch: Partial<AgentEvent>) => {
+    const a = specs[k];
+    add(at, {
+      kind: "agent",
+      tool_use_id: a.id,
+      task_id: `task_${a.id}`,
+      agent_type: a.type,
+      color: a.color,
+      description: a.description,
+      status: "Running",
+      background: true,
+      started_at: base + Math.round((100 + k * 50) * scale),
+      ended_at: null,
+      last_tool: null,
+      tokens: null,
+      tool_uses: null,
+      summary: null,
+      ...patch,
+    } as EventBody);
+  };
+  add(0, { kind: "status", state: "Streaming" });
+  specs.forEach((_, k) => agent(k, 100 + k * 50, { last_tool: "Read" }));
+  // Vert pose une question dans son fil : la carte de question s'ouvre.
+  add(800, {
+    kind: "block_done",
+    thread: specs[1].id,
+    msg: "msg_sort_ask",
+    index: 0,
+    block: {
+      type: "ToolUse",
+      tool_use_id: "toolu_sort_ask",
+      name: "AskUserQuestion",
+      input: { questions: [{ question: "Quel format ?", header: "Format", options: [], multiSelect: false }] },
+    },
+  });
+  add(800, {
+    kind: "question",
+    request_id: "req_sort_q",
+    tool_use_id: "toolu_sort_ask",
+    thread: specs[1].id,
+    questions: [
+      {
+        question: "Quel format ?",
+        header: "Format",
+        options: [
+          { label: "Court", description: "Une ligne" },
+          { label: "Long", description: "Un paragraphe" },
+        ],
+        multi_select: false,
+      },
+    ],
+    can_skip: true,
+  });
+  agent(2, 1500, { status: "Completed", ended_at: base + Math.round(1500 * scale), tool_uses: 1, summary: "ok" });
+  agent(3, 2500, { status: "Failed", ended_at: base + Math.round(2500 * scale), tool_uses: 2, summary: "échec" });
   out.sort((x, y) => x.at - y.at);
   return out.map((x, seq) => ({
     at: x.at,
