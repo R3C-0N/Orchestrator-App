@@ -273,9 +273,15 @@ test("Ctrl+O puis molette pendant le recalage : la molette n'est pas écrasée",
   // ci-dessous plutôt qu'une borne sur `scrollTop`.
   for (const top of m.scrollTops) expect(top).toBeLessThanOrEqual(m.afterWheel + 1);
   for (let i = 1; i < m.scrollTops.length; i++) expect(m.scrollTops[i]).toBeLessThanOrEqual(m.scrollTops[i - 1] + 1);
-  // Ce qui est vu : j reste plus bas qu'avant la molette (la vue a monté),
-  // même après la mesure des lignes découvertes, plus petites qu'estimé.
-  expect(m.tops[m.tops.length - 1]).toBeGreaterThan(m.jTop0);
+  // Ce qui est vu : la boucle s'arrête quand j est aligné en haut à 0,5 px
+  // près (`Math.abs(d) > 0.5`), ou le perd de vue (j non rendu, `Infinity`)
+  // en le visant par son décalage estimé. Après la molette, j reste rendu
+  // à chaque image et n'est jamais aligné : il finit 7 px au-dessus du haut
+  // (mesure : -68,5 avant la molette, 231,5 juste après, puis -7 une fois
+  // mesurées les lignes découvertes, plus petites qu'estimé).
+  for (const top of m.tops) expect(Number.isFinite(top)).toBe(true);
+  for (const top of m.tops.slice(1)) expect(Math.abs(top)).toBeGreaterThan(0.5);
+  expect(m.tops[m.tops.length - 1]).toBeLessThan(-0.5);
   expect(await sticky(page)).toBe(false);
 });
 
