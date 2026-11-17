@@ -548,9 +548,17 @@ fn transcripts_output_budget_drops_oldest_events_at_a_user_message() {
 #[test]
 fn transcripts_200mb_history_serializes_under_30mb() {
     use std::io::Write;
+    /// Supprime le dossier (200 Mo) à la fin du test, même en cas d'échec.
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     let dir = std::env::temp_dir().join(format!("orch-j11-200mb-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = Cleanup(dir.clone());
     let id = "0b8f3c2e-1111-4a6b-9c1d-0000000000aa";
     let path = dir.join(format!("{id}.jsonl"));
     // ~290 ko de sortie (texte JSON déjà échappé), et une ligne géante
