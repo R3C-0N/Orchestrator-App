@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { contractFingerprint } from "./tools/contract-fingerprint.mjs";
 
@@ -29,16 +29,39 @@ function uiHash(): string {
   return "dev";
 }
 
+/**
+ * `contract.json` à la racine du build : `{ contract, commit }` (J14,
+ * relecture R2). Le cœur le lit avant d'activer une interface (empreinte
+ * du contrat de l'exe), avec en repli la recherche de `__CONTRACT__` dans
+ * les scripts.
+ */
+function contractFile(contract: string, commit: string): Plugin {
+  return {
+    name: "orchestrator-contract",
+    apply: "build",
+    generateBundle() {
+      this.emitFile({
+        type: "asset",
+        fileName: "contract.json",
+        source: JSON.stringify({ contract, commit }) + "\n",
+      });
+    },
+  };
+}
+
+const CONTRACT = contractFingerprint(ROOT);
+const UI_HASH = uiHash();
+
 // Configuration recommandée par Tauri : port fixe, pas d'écran effacé,
 // on ne surveille pas src-tauri (cargo s'en charge).
 export default defineConfig({
-  plugins: [svelte()],
+  plugins: [svelte(), contractFile(CONTRACT, UI_HASH)],
   // Constantes de build (déclarées dans `src/vite-env.d.ts`). `__CONTRACT__` :
   // empreinte du contrat calculée maintenant, par le même code que `build.rs`
   // (`tools/contract-fingerprint.mjs`), jamais figée à la main.
   define: {
-    __UI_HASH__: JSON.stringify(uiHash()),
-    __CONTRACT__: JSON.stringify(contractFingerprint(ROOT)),
+    __UI_HASH__: JSON.stringify(UI_HASH),
+    __CONTRACT__: JSON.stringify(CONTRACT),
   },
   clearScreen: false,
   server: {

@@ -39,48 +39,113 @@ use crate::ui::{UiHost, READY_TIMEOUT};
 pub const IMPROVE_SESSION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Outils refusés à la session d'amélioration (relecture de sécurité de
-/// l'étape 3) : rien qui pousse, change les dépôts distants, la
-/// configuration git, les sous-modules, les worktrees ou les références à
-/// la main ; et pas de question (personne ne la verrait). Refus tenus même
-/// en `bypassPermissions` (vérifié, test `improve_live`).
+/// l'étape 3, puis relecture finale B1) : rien qui pousse ou parle au
+/// réseau (git push sous toutes ses formes écrites, `gh`, `ssh`, `curl`),
+/// change les dépôts distants, la configuration git (`git config`,
+/// `git -c`), les sous-modules, les worktrees ou les références à la main ;
+/// et pas de question (personne ne la verrait). Refus tenus même en
+/// `bypassPermissions`, jokers `*` acceptés par le CLI 2.1.326 (vérifié, test
+/// `improve_live`). Ce filtre porte sur le texte des commandes : il ne voit
+/// pas un `git push` lancé par un autre programme (`cmd /c`, `node -e`) ;
+/// ceux-là échouent sur l'environnement de [`improve_env`].
 pub const DISALLOWED_TOOLS: &[&str] = &[
     "Bash(git push:*)",
+    "Bash(git * push*)",
+    "Bash(*git -c*)",
+    "Bash(*git.exe*)",
     "Bash(git remote:*)",
     "Bash(git config:*)",
     "Bash(git submodule:*)",
     "Bash(git worktree:*)",
     "Bash(git update-ref:*)",
     "Bash(git branch -f:*)",
+    "Bash(gh:*)",
+    "Bash(ssh:*)",
+    "Bash(curl:*)",
     "AskUserQuestion",
 ];
 
-/// Environnement de la session d'amélioration : git sans SSH ni invite,
-/// sans hooks, sans transport `ext::`.
-pub fn improve_env() -> Vec<(String, String)> {
-    [
+/// Préfixes d'URL réécrits en `no-push://` pour tout push
+/// (`url.no-push://.pushInsteadOf`) : un push vers une URL explicite échoue
+/// aussi.
+pub const PUSH_PREFIXES: &[&str] = &["https://", "http://", "ssh://", "git@", "git://", "file://"];
+
+/// Variables héritées de l'app retirées de l'environnement de la session
+/// d'amélioration (jetons, agents et commandes SSH).
+pub const IMPROVE_ENV_REMOVE: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "SSH_AUTH_SOCK",
+];
+
+/// Environnement de la session d'amélioration : git sans SSH ni invite ni
+/// aide à la saisie d'identifiants, sans configuration système ni globale
+/// (`global_config` : fichier vide hors dépôt ; le clone porte son identité
+/// de commit en local, `repo::configure`), donc sans gestionnaire
+/// d'identifiants ; sans hooks ; aucun transport permis
+/// (`protocol.allow=never`, `ext::` compris) et tout push réécrit vers
+/// `no-push://`.
+pub fn improve_env(global_config: &Path) -> Vec<(String, String)> {
+    let mut config: Vec<(&str, &str)> = vec![
+        ("core.hooksPath", "NUL"),
+        ("protocol.ext.allow", "never"),
+        ("protocol.allow", "never"),
+    ];
+    config.extend(
+        PUSH_PREFIXES
+            .iter()
+            .map(|p| ("url.no-push://.pushInsteadOf", *p)),
+    );
+    let mut env: Vec<(String, String)> = [
         ("GIT_SSH_COMMAND", "false"),
         ("GIT_TERMINAL_PROMPT", "0"),
-        ("GIT_CONFIG_COUNT", "2"),
-        ("GIT_CONFIG_KEY_0", "core.hooksPath"),
-        ("GIT_CONFIG_VALUE_0", "NUL"),
-        ("GIT_CONFIG_KEY_1", "protocol.ext.allow"),
-        ("GIT_CONFIG_VALUE_1", "never"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GCM_INTERACTIVE", "never"),
+        ("GIT_ASKPASS", ""),
+        ("SSH_ASKPASS", ""),
     ]
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect()
+    .collect();
+    env.push((
+        "GIT_CONFIG_GLOBAL".into(),
+        global_config.to_string_lossy().into_owned(),
+    ));
+    env.push(("GIT_CONFIG_COUNT".into(), config.len().to_string()));
+    for (i, (k, v)) in config.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), k.to_string()));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), v.to_string()));
+    }
+    env
+}
+
+/// Fichier de configuration git globale (vide) de la session
+/// d'amélioration : `%LOCALAPPDATA%\orchestrator\improve.gitconfig`, remis à
+/// vide avant chaque session.
+pub fn empty_global_config() -> std::io::Result<PathBuf> {
+    let dir = crate::selfupdate::data_dir().unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir)?;
+    let p = dir.join("improve.gitconfig");
+    std::fs::write(&p, b"")?;
+    Ok(p)
 }
 
 /// Options de lancement de la session d'amélioration (`model` : clé
-/// `improve_model` de `config.json`, sinon le modèle par défaut du CLI).
-pub fn improve_launch_options(model: Option<String>) -> LaunchOptions {
+/// `improve_model` de `config.json`, sinon le modèle par défaut du CLI ;
+/// `global_config` : voir [`improve_env`]).
+pub fn improve_launch_options(model: Option<String>, global_config: &Path) -> LaunchOptions {
     let mut extra_args = vec!["--disallowedTools".to_string()];
     extra_args.extend(DISALLOWED_TOOLS.iter().map(|t| t.to_string()));
     LaunchOptions {
         resume: None,
         model,
         extra_args,
-        env: improve_env(),
+        env: improve_env(global_config),
+        env_remove: IMPROVE_ENV_REMOVE.iter().map(|k| k.to_string()).collect(),
     }
 }
 
@@ -113,10 +178,23 @@ fn has_string_literal(bytes: &[u8], contract: &str) -> bool {
     })
 }
 
+/// Fichier de contrat du build de l'interface (racine du build).
+pub const UI_CONTRACT_FILE: &str = "contract.json";
+
 /// La sortie de Vite dans `dir` porte l'empreinte `contract` (constante
 /// `__CONTRACT__` inlinée dans les scripts) : l'interface a été construite
 /// pour le contrat de cet exe.
 pub fn ui_contract_matches(dir: &Path, contract: &str) -> bool {
+    // `contract.json` (`{ contract, commit }`, écrit par le plugin de
+    // `vite.config.ts`) d'abord ; sans lui (build plus ancien, illisible),
+    // recherche du littéral dans les scripts.
+    if let Some(found) = std::fs::read(dir.join(UI_CONTRACT_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("contract")?.as_str().map(str::to_string))
+    {
+        return found == contract;
+    }
     fn walk(d: &Path, contract: &str, depth: u32) -> bool {
         if depth > 8 {
             return false;
@@ -353,16 +431,25 @@ impl<R: Runtime> PipelineHost for AppHost<R> {
     ) -> BoxFut<'a, Result<(), CoreError>> {
         Box::pin(async move {
             let state = self.app.state::<AppState>();
+            let global = empty_global_config()
+                .map_err(|e| CoreError::Io(format!("configuration git de la session : {e}")))?;
             let s = state
-                .start_improve(cwd, prompt, improve_launch_options(self.model.clone()))
+                .start_improve(
+                    cwd,
+                    prompt,
+                    improve_launch_options(self.model.clone(), &global),
+                )
                 .await?;
-            // Dans cet ordre à la destruction : arrêt, puis levée de la
-            // protection (la session n'est plus dans la table).
+            // Les gardes tombent dans l'ordre inverse de leur déclaration :
+            // `_stop` d'abord (arrêt demandé dans une tâche), puis `_protect`
+            // (protection levée). L'arrêt est asynchrone : la session peut
+            // rester quelques instants sans protection, sans risque (la
+            // fermeture différée n'agit qu'après `DETACH_GRACE`).
+            let _protect = state.protect(&s.key);
             let _stop = StopOnDrop {
                 app: self.app.clone(),
                 key: s.key.clone(),
             };
-            let _protect = state.protect(&s.key);
             *self.session.lock().unwrap() = Some(s.key.clone());
             // Le bandeau voit la session dès maintenant.
             let cur = self
@@ -650,29 +737,61 @@ mod tests {
 
     #[test]
     fn improve_options_refuse_git_tools_and_isolate_git() {
-        let o = improve_launch_options(Some("haiku".into()));
+        let g = std::path::Path::new("vide.gitconfig");
+        let o = improve_launch_options(Some("haiku".into()), g);
         assert_eq!(o.extra_args[0], "--disallowedTools");
         for t in [
             "Bash(git push:*)",
+            "Bash(git * push*)",
+            "Bash(*git -c*)",
+            "Bash(*git.exe*)",
             "Bash(git remote:*)",
             "Bash(git config:*)",
             "Bash(git submodule:*)",
             "Bash(git worktree:*)",
             "Bash(git update-ref:*)",
             "Bash(git branch -f:*)",
+            "Bash(gh:*)",
+            "Bash(ssh:*)",
+            "Bash(curl:*)",
         ] {
             assert!(o.extra_args.iter().any(|a| a == t), "{t}");
         }
-        let env: std::collections::HashMap<_, _> = o.env.into_iter().collect();
+        for k in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GIT_SSH",
+            "SSH_AUTH_SOCK",
+            "GIT_SSH_COMMAND",
+        ] {
+            assert!(o.env_remove.iter().any(|r| r == k), "{k}");
+        }
+        let env: std::collections::HashMap<_, _> = o.env.iter().cloned().collect();
         assert_eq!(env["GIT_SSH_COMMAND"], "false");
         assert_eq!(env["GIT_TERMINAL_PROMPT"], "0");
-        assert_eq!(env["GIT_CONFIG_COUNT"], "2");
-        assert_eq!(env["GIT_CONFIG_KEY_0"], "core.hooksPath");
-        assert_eq!(env["GIT_CONFIG_VALUE_0"], "NUL");
-        assert_eq!(env["GIT_CONFIG_KEY_1"], "protocol.ext.allow");
-        assert_eq!(env["GIT_CONFIG_VALUE_1"], "never");
+        assert_eq!(env["GIT_CONFIG_NOSYSTEM"], "1");
+        assert_eq!(env["GIT_CONFIG_GLOBAL"], "vide.gitconfig");
+        assert_eq!(env["GCM_INTERACTIVE"], "never");
+        assert_eq!(env["GIT_ASKPASS"], "");
+        assert_eq!(env["SSH_ASKPASS"], "");
+        let n: usize = env["GIT_CONFIG_COUNT"].parse().unwrap();
+        let pairs: Vec<(String, String)> = (0..n)
+            .map(|i| {
+                (
+                    env[&format!("GIT_CONFIG_KEY_{i}")].clone(),
+                    env[&format!("GIT_CONFIG_VALUE_{i}")].clone(),
+                )
+            })
+            .collect();
+        let has = |k: &str, v: &str| pairs.iter().any(|(a, b)| a == k && b == v);
+        assert!(has("core.hooksPath", "NUL"));
+        assert!(has("protocol.ext.allow", "never"));
+        assert!(has("protocol.allow", "never"));
+        for p in ["https://", "http://", "ssh://", "git@", "git://", "file://"] {
+            assert!(has("url.no-push://.pushInsteadOf", p), "{p}");
+        }
         // Les options passent la validation du lancement.
-        let o = improve_launch_options(Some("haiku".into()));
+        let o = improve_launch_options(Some("haiku".into()), g);
         crate::process::spawn::validate_launch_options(&o).unwrap();
     }
 
@@ -737,6 +856,26 @@ mod tests {
         );
         assert_eq!(fresh.store().read_pointer().active, None);
         assert!(leave_incompatible_ui(&fresh, "3333333333333333").is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn contract_file_is_read_first() {
+        let d = std::env::temp_dir().join(format!("orch-contract-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("assets")).unwrap();
+        // Scripts avec l'empreinte A, contract.json avec B : le fichier gagne.
+        std::fs::write(d.join("assets/i.js"), "Ze=`aaaaaaaaaaaaaaaa`").unwrap();
+        std::fs::write(
+            d.join("contract.json"),
+            r#"{"contract":"bbbbbbbbbbbbbbbb","commit":"1234567"}"#,
+        )
+        .unwrap();
+        assert!(ui_contract_matches(&d, "bbbbbbbbbbbbbbbb"));
+        assert!(!ui_contract_matches(&d, "aaaaaaaaaaaaaaaa"));
+        // Fichier illisible : repli sur les scripts.
+        std::fs::write(d.join("contract.json"), "pas du json").unwrap();
+        assert!(ui_contract_matches(&d, "aaaaaaaaaaaaaaaa"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

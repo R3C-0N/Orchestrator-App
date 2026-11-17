@@ -323,11 +323,23 @@ async fn configure(dir: &Path) -> Result<(), String> {
         next.push_str("/node_modules\n");
         std::fs::write(&exclude, next).map_err(|e| format!("{} : {e}", exclude.display()))?;
     }
-    if !git_ok(dir, &["config", "user.email"]).await? {
-        git(dir, &["config", "user.email", "orchestrator@localhost"]).await?;
-    }
-    if !git_ok(dir, &["config", "user.name"]).await? {
-        git(dir, &["config", "user.name", "Orchestrator"]).await?;
+    // Identité de commit **locale** : la session d'amélioration tourne sans
+    // configuration globale ni système (`GIT_CONFIG_GLOBAL` vide,
+    // `GIT_CONFIG_NOSYSTEM`), pour ne voir aucun identifiant. On recopie
+    // l'identité effective de l'utilisateur, sinon une identité par défaut.
+    for (key, default) in [
+        ("user.email", "orchestrator@localhost"),
+        ("user.name", "Orchestrator"),
+    ] {
+        if git_ok(dir, &["config", "--local", key]).await? {
+            continue;
+        }
+        let effective = git(dir, &["config", key]).await.unwrap_or_default();
+        let value = match effective.trim() {
+            "" => default,
+            v => v,
+        };
+        git(dir, &["config", "--local", key, value]).await?;
     }
     Ok(())
 }

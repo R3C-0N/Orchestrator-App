@@ -307,6 +307,9 @@ impl Drop for ActiveGuard<'_> {
 struct Snapshot {
     /// Contenu de `.git/config` (commun aux worktrees).
     config: Vec<u8>,
+    /// Taille et date de modification de `.git/config` : une modification
+    /// faite puis annulée pendant la session change au moins la date.
+    config_meta: Option<(u64, SystemTime)>,
     /// Hooks présents (hors `.sample`).
     hooks: Vec<String>,
     /// SHA-256 de `node_modules/.package-lock.json` du clone.
@@ -498,6 +501,49 @@ fn is_link(p: &Path) -> bool {
     std::fs::symlink_metadata(p)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+/// Taille et date de modification d'un fichier.
+fn file_meta(p: &Path) -> Option<(u64, SystemTime)> {
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+/// Fichier mis en lecture seule, attribut rétabli à la destruction.
+pub struct ReadOnly {
+    path: PathBuf,
+    was_readonly: bool,
+}
+
+impl ReadOnly {
+    pub fn set(path: &Path) -> std::io::Result<ReadOnly> {
+        let mut perm = std::fs::metadata(path)?.permissions();
+        let was_readonly = perm.readonly();
+        if !was_readonly {
+            perm.set_readonly(true);
+            std::fs::set_permissions(path, perm)?;
+        }
+        Ok(ReadOnly {
+            path: path.to_path_buf(),
+            was_readonly,
+        })
+    }
+}
+
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        if self.was_readonly {
+            return;
+        }
+        if let Ok(m) = std::fs::metadata(&self.path) {
+            let mut perm = m.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(false);
+            if let Err(e) = std::fs::set_permissions(&self.path, perm) {
+                tracing::error!("{} : lecture seule non retirée : {e}", self.path.display());
+            }
+        }
+    }
 }
 
 fn sha256_file(p: &Path) -> Option<Vec<u8>> {
@@ -719,6 +765,7 @@ impl Pipeline {
         let common = common_dir(&clone).await.map_err(fail(S::Preparing))?;
         let snapshot = Snapshot {
             config: std::fs::read(common.join("config")).unwrap_or_default(),
+            config_meta: file_meta(&common.join("config")),
             hooks: hooks_in(&common),
             deps: sha256_file(&clone.join("node_modules").join(".package-lock.json")),
         };
@@ -727,9 +774,14 @@ impl Pipeline {
         if let Mode::Improve = mode {
             rep.emit(S::Working, None);
             let prompt = build_prompt(&wt, req);
-            guarded(cancel, self.host.run_session(req, &wt, &prompt))
-                .await?
-                .map_err(|e| Stop::Failed(S::Working, e.to_string()))?;
+            // `.git/config` en lecture seule pendant la session (rétabli à la
+            // destruction de la garde, erreur ou annulation comprises).
+            let ro = ReadOnly::set(&common.join("config")).map_err(|e| {
+                Stop::Failed(S::Working, format!(".git/config en lecture seule : {e}"))
+            })?;
+            let done = guarded(cancel, self.host.run_session(req, &wt, &prompt)).await;
+            drop(ro);
+            done?.map_err(|e| Stop::Failed(S::Working, e.to_string()))?;
         }
 
         // --- Contrôles déterministes.
@@ -1159,7 +1211,9 @@ async fn check(
     }
 
     // Configuration git : rien d'ajouté (push, hooks, ssh…).
-    if std::fs::read(common.join("config")).unwrap_or_default() != snapshot.config {
+    if std::fs::read(common.join("config")).unwrap_or_default() != snapshot.config
+        || file_meta(&common.join("config")) != snapshot.config_meta
+    {
         return Err("la configuration git du clone (.git/config) a été modifiée".into());
     }
     if hooks_in(common) != snapshot.hooks {

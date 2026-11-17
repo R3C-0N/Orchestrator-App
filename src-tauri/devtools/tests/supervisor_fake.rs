@@ -964,6 +964,10 @@ async fn only_one_main_session_is_kept() {
         .await
         .unwrap();
     let _keep_imp = state.protect(&imp.key);
+    // Relecture C1 : la plus ancienne ne ferme jamais une plus récente
+    // (démarrages entrelacés).
+    assert_eq!(state.close_other_mains(&mains[0].key).await, 0);
+    assert!(alive(mains[1].pid));
     let closed = state.close_other_mains(&mains[1].key).await;
     assert_eq!(closed, 1);
     assert!(!alive(mains[0].pid), "ancienne session principale fermée");

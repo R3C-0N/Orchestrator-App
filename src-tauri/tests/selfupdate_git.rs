@@ -1370,3 +1370,47 @@ async fn no_orphan_after_timeout_or_exit() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!alive(pid), "petit-enfant {pid} survivant après la sortie");
 }
+
+/// Relecture finale B1 : `.git/config` est en lecture seule pendant la
+/// session, et une modification annulée avant la fin (même contenu à la
+/// fin) est vue par sa date de modification : cycle refusé. L'attribut est
+/// rétabli après la session.
+#[tokio::test]
+async fn git_config_changed_then_restored_is_refused() {
+    let root = TempRoot::new("gitconf-restored");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    let config = cfg.dir.join(".git").join("config");
+    let seen_readonly = Arc::new(Mutex::new(None));
+    let seen = seen_readonly.clone();
+    let path = config.clone();
+    let host = Arc::new(FakeHost {
+        commits: vec![commit_src(vec![("src/a.txt", "a\n")], "a")],
+        extra: Some(Box::new(move |_wt| {
+            let mut perm = std::fs::metadata(&path).unwrap().permissions();
+            *seen.lock().unwrap() = Some(perm.readonly());
+            // Contourner la lecture seule, modifier, puis remettre le contenu.
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(false);
+            std::fs::set_permissions(&path, perm).unwrap();
+            let orig = std::fs::read(&path).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            std::fs::write(&path, b"[url \"x\"]\n").unwrap();
+            std::fs::write(&path, &orig).unwrap();
+        })),
+        switch_ok: true,
+        ..Default::default()
+    });
+    let p = pipeline(&root, cfg.clone(), host, Arc::new(FakeToolchain::new()));
+    let (out, _) = run(&p, "config restaurée").await;
+    assert_eq!(
+        *seen_readonly.lock().unwrap(),
+        Some(true),
+        "lecture seule pendant la session"
+    );
+    assert_refused(&out, ".git/config");
+    assert_eq!(main_of(&cfg), c1);
+    assert!(
+        !std::fs::metadata(&config).unwrap().permissions().readonly(),
+        "attribut rétabli après la session"
+    );
+}

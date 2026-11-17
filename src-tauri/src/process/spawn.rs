@@ -37,6 +37,9 @@ pub struct LaunchOptions {
     /// Variables d'environnement ajoutées à celles de l'app (session
     /// d'amélioration : git sans réseau, sans hooks, sans invite).
     pub env: Vec<(String, String)>,
+    /// Variables d'environnement de l'app **retirées** de celles du
+    /// processus (session d'amélioration : jetons et agents SSH hérités).
+    pub env_remove: Vec<String>,
 }
 
 /// Valide les valeurs venues de l'interface avant de les passer en arguments :
@@ -84,18 +87,23 @@ pub struct Spawned {
 }
 
 pub fn spawn_claude(exe: &Path, cwd: &Path, args: &[String]) -> std::io::Result<Spawned> {
-    spawn_claude_env(exe, cwd, args, &[])
+    spawn_claude_env(exe, cwd, args, &[], &[])
 }
 
-/// [`spawn_claude`] avec des variables d'environnement en plus.
+/// [`spawn_claude`] avec des variables d'environnement en plus (`env`) et en
+/// moins (`env_remove`, appliqué avant `env`).
 pub fn spawn_claude_env(
     exe: &Path,
     cwd: &Path,
     args: &[String],
     env: &[(String, String)],
+    env_remove: &[String],
 ) -> std::io::Result<Spawned> {
     let job = Job::new()?;
     let mut cmd = Command::new(exe);
+    for k in env_remove {
+        cmd.env_remove(k);
+    }
     cmd.args(args)
         .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd)

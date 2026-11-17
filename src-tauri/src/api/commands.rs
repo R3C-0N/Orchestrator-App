@@ -51,7 +51,14 @@ pub struct AppState {
     ui: Mutex<Option<Attachment>>,
     /// Sessions protégées de la fermeture différée ([`AppState::protect`]).
     protected: Protected,
+    /// Sérialise `start_session` (lancement puis fermeture des autres
+    /// sessions principales) : deux démarrages entrelacés ne se ferment pas
+    /// l'un l'autre.
+    pub main_start: tokio::sync::Mutex<()>,
 }
+
+/// Attente du repos d'une session principale remplacée avant de la fermer.
+pub const MAIN_REPLACE_WAIT: Duration = Duration::from_secs(3);
 
 /// Protection d'une session contre la fermeture différée, levée à la
 /// destruction (voir [`AppState::protect`]).
@@ -92,6 +99,7 @@ impl AppState {
             page_gen: Arc::new(AtomicU64::new(0)),
             ui: Mutex::new(None),
             protected: Arc::default(),
+            main_start: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -129,19 +137,22 @@ impl AppState {
         Some(info)
     }
 
-    /// La webview (re)charge sa page (`on_page_load`). Nom gardé de J6, sens
-    /// changé par J14 (décision 15) : les sessions ne sont plus fermées mais
-    /// **détachées** ; leurs événements ne vont plus qu'à leur journal, et la
-    /// nouvelle page s'y rattache par `attach_sessions`. Une session pas
-    /// rattachée après [`AppState::detach_grace`] est fermée. Renvoie le
-    /// nombre de sessions détachées.
+    /// Version `async` de [`AppState::detach_all`] (nom gardé de J6), pour
+    /// les tests et les outils : `on_page_load` appelle `detach_all`
+    /// directement depuis l'étape 5 de J14. Sens changé par J14
+    /// (décision 15) : les sessions ne sont plus fermées mais **détachées** ;
+    /// leurs événements ne vont plus qu'à leur journal, et la nouvelle page
+    /// s'y rattache par `attach_sessions`. Une session pas rattachée après
+    /// [`AppState::detach_grace`] est fermée. Renvoie le nombre de sessions
+    /// détachées.
     pub async fn close_orphans(&self) -> usize {
         self.detach_all()
     }
 
-    /// Version synchrone de [`AppState::close_orphans`], à appeler
-    /// directement dans `on_page_load` (étape 5) : la génération avance avant
-    /// que la nouvelle page puisse appeler `attach_sessions`.
+    /// La webview (re)charge sa page : appelé directement par `on_page_load`
+    /// (pas de tâche), pour que la génération avance avant que la nouvelle
+    /// page puisse appeler `attach_sessions`. Contexte du runtime tokio
+    /// requis (fermeture différée).
     pub fn detach_all(&self) -> usize {
         let gen = self.page_gen.fetch_add(1, Ordering::SeqCst) + 1;
         {
@@ -306,25 +317,48 @@ impl AppState {
         }
     }
 
-    /// Ferme les sessions principales vivantes autres que `keep` (J14,
-    /// étape 5) : le cœur garde au plus une session `Main`. L'interface
-    /// n'en affiche qu'une (`mainOf` au rattachement) ; une deuxième
-    /// (nouvelle session lancée à côté de la courante) continuerait sinon
-    /// invisible jusqu'à la fermeture de l'app. Renvoie le nombre de
-    /// sessions fermées.
+    /// Ferme les sessions principales démarrées avant `keep` (J14, étape 5) :
+    /// le cœur garde au plus une session `Main`. L'interface n'en affiche
+    /// qu'une (`mainOf` au rattachement) ; une deuxième (nouvelle session
+    /// lancée à côté de la courante) continuerait sinon invisible jusqu'à la
+    /// fermeture de l'app. Une session plus récente que `keep` n'est jamais
+    /// fermée (démarrages entrelacés). Une session en plein tour est attendue
+    /// [`MAIN_REPLACE_WAIT`] au plus ; au-delà, le tour abandonné est noté
+    /// dans son journal (notice `turn_abandoned`) et au journal de l'app,
+    /// puis elle est fermée. Renvoie le nombre de sessions fermées.
     pub async fn close_other_mains(&self, keep: &SessionKey) -> usize {
-        let others: Vec<SessionKey> = self
-            .sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(k, s)| *k != keep && s.role == SessionRole::Main)
-            .map(|(k, _)| k.clone())
-            .collect();
+        let older: Vec<Arc<Session>> = {
+            let map = self.sessions.lock().unwrap();
+            let Some(newest) = map.get(keep).map(|s| s.started_at) else {
+                return 0;
+            };
+            map.iter()
+                .filter(|(k, s)| {
+                    *k != keep && s.role == SessionRole::Main && s.started_at <= newest
+                })
+                .map(|(_, s)| s.clone())
+                .collect()
+        };
         let mut n = 0;
-        for k in others {
-            if self.close_session(&k).await.is_some() {
-                tracing::info!(session = %k.0, "session principale remplacée : fermée");
+        for s in older {
+            if s.is_running() && !s.is_idle() && !s.wait_idle(MAIN_REPLACE_WAIT).await {
+                tracing::warn!(
+                    session = %s.key.0,
+                    "session principale remplacée en plein tour : tour abandonné"
+                );
+                s.outlet().emit(
+                    crate::api::events::EventBody::Notice {
+                        level: crate::api::events::NoticeLevel::Warn,
+                        code: "turn_abandoned".into(),
+                        message: "session remplacée par une nouvelle session principale : tour en cours abandonné"
+                            .into(),
+                        detail: None,
+                    },
+                    crate::process::supervisor::now_ms(),
+                );
+            }
+            if self.close_session(&s.key).await.is_some() {
+                tracing::info!(session = %s.key.0, "session principale remplacée : fermée");
                 n += 1;
             }
         }
@@ -514,6 +548,8 @@ pub async fn start_session(
     let exe = locate_claude().map_err(|tried| CoreError::ClaudeNotFound(tried.join(" ; ")))?;
     let cwd = PathBuf::from(cwd);
     let page = channel_sink(events, state.page_gen.clone(), state.reaper());
+    // Un démarrage à la fois (lancement puis fermeture des anciennes).
+    let _one = state.main_start.lock().await;
     let session = state
         .spawn_session(
             SessionRole::Main,
