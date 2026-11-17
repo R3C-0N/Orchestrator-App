@@ -128,10 +128,28 @@ async fn live_resume_shows_history_and_keeps_context() {
     // Reprise : le contexte est gardé.
     let events2: Events = Arc::default();
     let s2 = start(Some(session_id.clone()), &events2).await;
+    // J14 : le premier historique chargé est gardé par la session et rendu
+    // tel quel au rattachement, même si le transcript grossit ensuite.
+    assert_eq!(s2.resumed_from.as_deref(), Some(session_id.as_str()));
+    assert!(s2.cached_history(&session_id).is_none());
+    assert_eq!(s2.keep_history(h.clone()), h);
     let from = events2.lock().unwrap().len();
     s2.send_message("Quel est le mot de code ? Réponds seulement le mot.")
         .unwrap();
     let answer = turn(&events2, from).await;
+    let reread = load_history(&dir, &session_id, &SessionKey("live-j11".into())).expect("relu");
+    assert!(
+        reread.events.len() > h.events.len(),
+        "le transcript a grossi"
+    );
+    assert_eq!(
+        s2.cached_history(&session_id),
+        Some(h.clone()),
+        "cache inchangé"
+    );
+    let r = s2.resync(Arc::new(|_| true), 1);
+    assert_eq!(r.history, Some(h));
+    assert_eq!(r.pid, s2.pid);
     s2.stop().await;
     println!("réponse après reprise : {answer:?}");
     assert!(answer.contains("MANDARINE-42"));

@@ -9,6 +9,13 @@
 //! par la fin de stdout, qu'un petit-enfant peut garder ouverte. Après la
 //! sortie, stdout est encore lu pendant [`SessionConfig::exit_flush`], puis le
 //! Job Object est terminé : tout l'arbre meurt et les tuyaux se ferment.
+//!
+//! Sessions rattachables (J14, décision 15) : chaque événement est numéroté et
+//! gardé dans le journal de la session ([`Outlet`]) avant de partir vers la
+//! destination courante. La destination est remplaçable : un rechargement de
+//! l'interface la détache (les événements ne vont plus qu'au journal), et la
+//! nouvelle page s'y rattache en recevant le journal complet
+//! ([`Outlet::attach`]), sans trou ni doublon de `seq`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -22,7 +29,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::events::{CoreEvent, EventBody, QuestionCloseReason, SessionState};
-use crate::api::types::{Answers, CoreError, ExitInfo, InterruptAck, SessionKey, SkipReason};
+use crate::api::types::{
+    Answers, CoreError, ExitInfo, HistoryLoaded, InterruptAck, SessionKey, SessionResync,
+    SessionRole, SkipReason,
+};
 use crate::errors::{self, NoticeLimiter};
 use crate::logging::{self, RawLog};
 use crate::process::locate::display_path;
@@ -85,23 +95,225 @@ impl Default for SessionConfig {
     }
 }
 
-/// Numérote et horodate les événements, puis les passe au regroupeur.
+/// Destination d'une session attachée à une page de l'interface : le `Sink`
+/// et la génération de page (`AppState::page_gen`) qui l'a fournie.
 #[derive(Clone)]
-struct Emitter {
-    session: SessionKey,
-    seq: Arc<AtomicU64>,
-    tx: mpsc::UnboundedSender<CoreEvent>,
+pub struct Attachment {
+    pub sink: Sink,
+    pub page_gen: u64,
 }
 
-impl Emitter {
-    fn emit(&self, body: EventBody, t: u64) {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        let _ = self.tx.send(CoreEvent {
+/// Destination courante des événements d'une session.
+struct Route {
+    sink: Option<Sink>,
+    /// Premier `seq` que `sink` doit recevoir : les précédents sont dans
+    /// l'instantané rendu par [`Outlet::attach`] (pas de doublon).
+    from_seq: u64,
+    /// Génération de page de `sink`.
+    page_gen: u64,
+    /// Numéro de rattachement : un échec d'envoi ne détache que le `sink`
+    /// qui a échoué, pas un `sink` posé depuis.
+    epoch: u64,
+    /// Depuis quand la session n'a plus de destination (après en avoir eu
+    /// une) ; `None` si attachée, ou jamais attachée.
+    detached_since: Option<Instant>,
+}
+
+struct Journal {
+    events: Vec<CoreEvent>,
+    tx: mpsc::UnboundedSender<CoreEvent>,
+    turns: u64,
+}
+
+/// Journal des `CoreEvent` d'une session et destination remplaçable (J14).
+///
+/// Ordre garanti : un événement reçoit son `seq` (= sa place dans le
+/// journal), entre au journal et part vers le regroupeur sous le même verrou ;
+/// [`Outlet::attach`] prend l'instantané du journal et change de destination
+/// sous ce même verrou. Tout événement absent de l'instantané passe donc
+/// ensuite par le regroupeur vers la nouvelle destination, et tout événement
+/// de l'instantané encore en route est écarté (`from_seq`). Le verrou unique
+/// garantit aussi que les `seq` entrent dans le regroupeur dans l'ordre, même
+/// émis par des tâches différentes (stderr, supervision, commandes).
+pub struct Outlet {
+    session: SessionKey,
+    journal: Mutex<Journal>,
+    route: Mutex<Route>,
+    /// Nombre d'événements émis ; réveille les attentes (`Session::wait_*`).
+    activity: watch::Sender<u64>,
+}
+
+impl Outlet {
+    /// Crée le journal et lance son regroupeur (runtime tokio requis).
+    /// `attachment` : destination initiale ; `None` : journal seul.
+    pub fn spawn(session: SessionKey, attachment: Option<Attachment>) -> Arc<Outlet> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (page_gen, sink) = match attachment {
+            Some(a) => (a.page_gen, Some(a.sink)),
+            None => (0, None),
+        };
+        let outlet = Arc::new(Outlet {
+            session,
+            journal: Mutex::new(Journal {
+                events: Vec::new(),
+                tx,
+                turns: 0,
+            }),
+            route: Mutex::new(Route {
+                sink,
+                from_seq: 0,
+                page_gen,
+                epoch: 0,
+                detached_since: None,
+            }),
+            activity: watch::channel(0).0,
+        });
+        // Référence faible : le regroupeur s'arrête quand le journal (donc
+        // l'émetteur) disparaît.
+        let weak = Arc::downgrade(&outlet);
+        let deliver: Sink = Arc::new(move |batch| {
+            if let Some(o) = weak.upgrade() {
+                o.deliver(batch);
+            }
+            // Toujours vrai : une destination fermée n'arrête pas le
+            // regroupeur, la session peut être rattachée plus tard.
+            true
+        });
+        tokio::spawn(run_batcher(rx, deliver));
+        outlet
+    }
+
+    /// Numérote, horodate, journalise et envoie un événement ; renvoie son `seq`.
+    pub fn emit(&self, body: EventBody, t: u64) -> u64 {
+        let mut j = self.journal.lock().unwrap();
+        let seq = j.events.len() as u64;
+        if matches!(body, EventBody::TurnResult { .. }) {
+            j.turns += 1;
+        }
+        let ev = CoreEvent {
             seq,
             t,
             session: self.session.clone(),
             body,
-        });
+        };
+        j.events.push(ev.clone());
+        let _ = j.tx.send(ev);
+        self.activity.send_replace(seq + 1);
+        seq
+    }
+
+    /// Lot sorti du regroupeur : vers la destination courante, sans les
+    /// événements déjà rendus par l'instantané du dernier rattachement. Le
+    /// `sink` est appelé hors verrou : un lot lu avec l'ancienne destination
+    /// ne contient que des événements émis avant le rattachement, donc
+    /// présents dans son instantané.
+    fn deliver(&self, batch: Vec<CoreEvent>) {
+        let (sink, from, epoch) = {
+            let r = self.route.lock().unwrap();
+            match &r.sink {
+                Some(s) => (s.clone(), r.from_seq, r.epoch),
+                None => return,
+            }
+        };
+        let batch: Vec<CoreEvent> = if batch.first().is_some_and(|e| e.seq < from) {
+            batch.into_iter().filter(|e| e.seq >= from).collect()
+        } else {
+            batch
+        };
+        if batch.is_empty() || sink(batch) {
+            return;
+        }
+        let mut r = self.route.lock().unwrap();
+        if r.epoch == epoch && r.sink.is_some() {
+            tracing::warn!(session = %self.session.0, "destination fermée : session détachée");
+            r.sink = None;
+            r.detached_since = Some(Instant::now());
+        }
+    }
+
+    /// Rattache la session à `sink` et renvoie le journal complet. Les
+    /// événements suivants partent vers `sink`, à partir du `seq` qui suit
+    /// l'instantané.
+    pub fn attach(&self, sink: Sink, page_gen: u64) -> Vec<CoreEvent> {
+        let j = self.journal.lock().unwrap();
+        let snapshot = j.events.clone();
+        let mut r = self.route.lock().unwrap();
+        r.sink = Some(sink);
+        r.from_seq = snapshot.len() as u64;
+        r.page_gen = page_gen;
+        r.epoch += 1;
+        r.detached_since = None;
+        snapshot
+    }
+
+    /// Détache la session si sa destination vient d'une génération de page
+    /// antérieure à `page_gen`. Vrai si elle vient d'être détachée.
+    pub fn detach_before(&self, page_gen: u64) -> bool {
+        let mut r = self.route.lock().unwrap();
+        if r.sink.is_none() || r.page_gen >= page_gen {
+            return false;
+        }
+        r.sink = None;
+        r.epoch += 1;
+        r.detached_since = Some(Instant::now());
+        true
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.route.lock().unwrap().sink.is_some()
+    }
+
+    /// Durée depuis le détachement ; `None` si attachée ou jamais attachée.
+    pub fn detached_for(&self) -> Option<Duration> {
+        self.route
+            .lock()
+            .unwrap()
+            .detached_since
+            .map(|t| t.elapsed())
+    }
+
+    /// Nombre d'événements émis (= `seq` du prochain).
+    pub fn len(&self) -> u64 {
+        self.journal.lock().unwrap().events.len() as u64
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copie du journal.
+    pub fn events(&self) -> Vec<CoreEvent> {
+        self.journal.lock().unwrap().events.clone()
+    }
+
+    /// Tours terminés (`turn_result` émis).
+    pub fn turns(&self) -> u64 {
+        self.journal.lock().unwrap().turns
+    }
+
+    /// Réveillé à chaque événement émis.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.activity.subscribe()
+    }
+}
+
+/// Émetteur des événements d'une session : son journal.
+#[derive(Clone)]
+struct Emitter(Arc<Outlet>);
+
+/// Issue de [`Session::wait_turn_end`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnWait {
+    /// Tour terminé : nombre de tours terminés depuis le démarrage.
+    Done(u64),
+    /// Le processus s'est arrêté avant la fin du tour.
+    Exited,
+    Timeout,
+}
+
+impl Emitter {
+    fn emit(&self, body: EventBody, t: u64) {
+        self.0.emit(body, t);
     }
 
     fn emit_actions(&self, out: Vec<Action>, t: u64) {
@@ -118,6 +330,15 @@ pub struct Session {
     pub pid: u32,
     pub claude_path: PathBuf,
     pub cwd: PathBuf,
+    pub role: SessionRole,
+    /// `session_id` passé à `--resume`.
+    pub resumed_from: Option<String>,
+    /// Heure de démarrage (ms) : ordre des sessions dans `attach_sessions`.
+    pub started_at: u64,
+    /// Historique repris, gardé au premier `load_history` (J14) : rendu tel
+    /// quel au rattachement et aux appels suivants, même si le transcript a
+    /// grossi depuis (sinon les tours de la session apparaîtraient deux fois).
+    history: Mutex<Option<HistoryLoaded>>,
     config: SessionConfig,
     stdin_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
     reducer: Arc<Mutex<Reducer>>,
@@ -422,6 +643,31 @@ impl Session {
         sink: Sink,
         config: SessionConfig,
     ) -> Result<Arc<Session>, CoreError> {
+        let attachment = Attachment { sink, page_gen: 0 };
+        Self::start_role(
+            key,
+            exe,
+            cwd,
+            opts,
+            SessionRole::Main,
+            Some(attachment),
+            config,
+        )
+        .await
+    }
+
+    /// Lancement complet (J14) : rôle de la session et destination initiale
+    /// de ses événements (`None` : journal seul, jusqu'au premier
+    /// rattachement).
+    pub async fn start_role(
+        key: SessionKey,
+        exe: &Path,
+        cwd: &Path,
+        opts: LaunchOptions,
+        role: SessionRole,
+        attachment: Option<Attachment>,
+        config: SessionConfig,
+    ) -> Result<Arc<Session>, CoreError> {
         if !cwd.is_dir() {
             return Err(CoreError::BadCwd(display_path(cwd)));
         }
@@ -447,13 +693,8 @@ impl Session {
                 .map(Arc::new)
         });
 
-        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_batcher(ev_rx, sink));
-        let emitter = Emitter {
-            session: key.clone(),
-            seq: Arc::new(AtomicU64::new(0)),
-            tx: ev_tx,
-        };
+        let resumed_from = opts.resume.clone();
+        let emitter = Emitter(Outlet::spawn(key.clone(), attachment));
         emitter.emit(
             EventBody::Starting {
                 pid: spawned.pid,
@@ -516,6 +757,10 @@ impl Session {
             pid: spawned.pid,
             claude_path: exe.to_path_buf(),
             cwd: cwd.to_path_buf(),
+            role,
+            resumed_from,
+            started_at: now_ms(),
+            history: Mutex::new(None),
             config,
             stdin_tx: Mutex::new(Some(stdin_tx)),
             reducer,
@@ -627,6 +872,105 @@ impl Session {
     /// Fichier de copie du flux brut, si le journal est actif.
     pub fn raw_log_path(&self) -> Option<&Path> {
         self.raw.as_deref().map(RawLog::path)
+    }
+
+    /// Journal et destination des événements (J14).
+    pub fn outlet(&self) -> &Arc<Outlet> {
+        &self.emitter.0
+    }
+
+    /// Rattache la session à `sink` (page `page_gen`) et rend de quoi
+    /// reconstruire son état : historique repris et journal complet.
+    pub fn resync(&self, sink: Sink, page_gen: u64) -> SessionResync {
+        let events = self.outlet().attach(sink, page_gen);
+        SessionResync {
+            session: self.key.clone(),
+            role: self.role,
+            cwd: display_path(&self.cwd),
+            pid: self.pid,
+            resumed_from: self.resumed_from.clone(),
+            history: self.history.lock().unwrap().clone(),
+            events,
+            running: self.is_running(),
+        }
+    }
+
+    /// Historique repris déjà chargé pour `session_id`, s'il y en a un.
+    pub fn cached_history(&self, session_id: &str) -> Option<HistoryLoaded> {
+        self.history
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|h| h.session_id == session_id)
+            .cloned()
+    }
+
+    /// Garde le premier historique chargé ; renvoie celui qui est gardé (un
+    /// chargement concurrent arrivé avant l'emporte).
+    pub fn keep_history(&self, h: HistoryLoaded) -> HistoryLoaded {
+        let mut slot = self.history.lock().unwrap();
+        match slot.as_ref() {
+            Some(kept) if kept.session_id == h.session_id => kept.clone(),
+            Some(_) => h,
+            None => {
+                *slot = Some(h.clone());
+                h
+            }
+        }
+    }
+
+    /// Au repos (décision 15) : pas de tour en cours et pas de question
+    /// ouverte. Une session arrêtée est au repos.
+    pub fn is_idle(&self) -> bool {
+        let r = self.reducer.lock().unwrap();
+        !r.in_turn() && r.questions.is_empty()
+    }
+
+    /// Attend le repos (ou la fin du processus) ; faux au-delà du délai.
+    pub async fn wait_idle(&self, within: Duration) -> bool {
+        let mut rx = self.outlet().subscribe();
+        tokio::time::timeout(within, async {
+            loop {
+                if self.is_idle() || !self.is_running() {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// Attend qu'au moins `after + 1` tours soient terminés (`turns()` lu
+    /// avant d'envoyer le message, par exemple).
+    pub async fn wait_turn_end(&self, after: u64, within: Duration) -> TurnWait {
+        let mut rx = self.outlet().subscribe();
+        let mut exit = self.exit_rx.clone();
+        let wait = async {
+            loop {
+                let n = self.outlet().turns();
+                if n > after {
+                    return TurnWait::Done(n);
+                }
+                if !self.is_running() {
+                    return TurnWait::Exited;
+                }
+                tokio::select! {
+                    r = rx.changed() => if r.is_err() { return TurnWait::Exited },
+                    _ = exit.changed() => {},
+                }
+            }
+        };
+        tokio::time::timeout(within, wait)
+            .await
+            .unwrap_or(TurnWait::Timeout)
+    }
+
+    /// Tours terminés depuis le démarrage.
+    pub fn turns(&self) -> u64 {
+        self.outlet().turns()
     }
 
     async fn control_with_id(
