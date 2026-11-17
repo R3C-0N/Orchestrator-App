@@ -110,6 +110,30 @@ pub fn is_clone(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
+/// URL de dépôt acceptée : `git@…`, `ssh://`, `https://`, `file://` ou
+/// chemin local absolu ; jamais d'option (`-…`) ni de transport `ext::`.
+pub fn check_url(url: &str) -> Result<(), String> {
+    let bad = |why: &str| Err(format!("URL du dépôt refusée ({why}) : {url}"));
+    if url.is_empty() {
+        return bad("vide");
+    }
+    if url.starts_with('-') {
+        return bad("commence par « - »");
+    }
+    if url.chars().any(|c| c.is_control()) {
+        return bad("caractère de contrôle");
+    }
+    let lower = url.to_ascii_lowercase();
+    let remote = ["git@", "ssh://", "https://", "file://"]
+        .iter()
+        .any(|p| lower.starts_with(p));
+    if remote || Path::new(url).is_absolute() {
+        Ok(())
+    } else {
+        bad("formes permises : git@, ssh://, https://, file:// ou chemin local absolu")
+    }
+}
+
 fn disabled(reason: impl Into<String>) -> RepoStatus {
     RepoStatus::Disabled {
         reason: reason.into(),
@@ -165,6 +189,9 @@ pub async fn ensure_clone_with(config: &RepoConfig, opts: &CloneOptions) -> Repo
             ));
         }
     }
+    if let Err(reason) = check_url(&config.url) {
+        return disabled(reason);
+    }
     let commit = config.commit.trim();
     if commit.is_empty() || commit == "unknown" {
         return disabled("commit de compilation inconnu (exe compilé hors d'un dépôt git)");
@@ -215,6 +242,7 @@ async fn clone_fresh(config: &RepoConfig, opts: &CloneOptions) -> RepoStatus {
             "--no-checkout",
             "--origin",
             "origin",
+            "--",
             &config.url,
             &tmp_s,
         ],
@@ -229,6 +257,14 @@ async fn clone_fresh(config: &RepoConfig, opts: &CloneOptions) -> RepoStatus {
     if let Err(reason) = status {
         let _ = std::fs::remove_dir_all(&tmp);
         return disabled(reason);
+    }
+    // Dossier de destination déjà là mais vide (contrôlé plus haut) : retiré
+    // pour que le renommage aboutisse.
+    if dir.is_dir() {
+        if let Err(e) = std::fs::remove_dir(dir) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return disabled(format!("{} non supprimable : {e}", dir.display()));
+        }
     }
     if let Err(e) = std::fs::rename(&tmp, dir) {
         let _ = std::fs::remove_dir_all(&tmp);

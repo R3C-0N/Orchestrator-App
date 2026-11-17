@@ -128,6 +128,11 @@ pub trait PipelineHost: Send + Sync {
     fn switch_ui<'a>(&'a self, hash: &'a str, dir: &'a Path)
         -> BoxFut<'a, Result<bool, CoreError>>;
 
+    /// Revient à l'interface active avant le dernier `switch_ui` réussi
+    /// (fusion impossible après la bascule : la version activée n'est pas
+    /// dans `main`). Étape 5 : `UiHost::rollback`.
+    fn rollback_ui(&self) -> BoxFut<'_, Result<(), CoreError>>;
+
     /// Attend que la session principale soit au repos (étape `WaitingIdle`,
     /// annulable), avant [`PipelineHost::switch_ui`]. Par défaut : immédiat
     /// (`switch_ui` attend de toute façon le repos).
