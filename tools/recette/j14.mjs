@@ -402,31 +402,38 @@ async function phaseCycle() {
     status_line: after.status,
     ui_dirs: uiDirs(),
   });
-  // Fournisseur disque : chemins malveillants (réponse = index.html, jamais
-  // le fichier visé).
-  const probes = await app.page.evaluate(async () => {
-    const paths = [
-      "/../active.json",
-      "/%2e%2e/active.json",
-      "/%2e%2e%2factive.json",
-      "/..%5cactive.json",
-      "/C:/Windows/win.ini",
-      "/%43:%5cWindows%5cwin.ini",
-      "/manifest.json",
-      "/assets/../../state.json",
-    ];
-    const r = [];
-    for (const p of paths) {
-      try {
-        const res = await fetch(p);
-        const t = await res.text();
-        r.push({ p, status: res.status, index: t.includes("<!doctype html") || t.includes("<!DOCTYPE html"), head: t.slice(0, 40) });
-      } catch (e) {
-        r.push({ p, error: String(e) });
-      }
+  // Fournisseur disque : chemins malveillants. `fetch` est interdit par la
+  // CSP (connect-src) : on navigue la page vers chaque chemin (la
+  // navigation n'est pas soumise à connect-src) et on lit ce qui est servi.
+  // Chromium normalise `..` et `%2e%2e` avant la requête ; restent les
+  // formes encodées (`%5c`) et les noms hors du manifeste.
+  const probes = [];
+  const csp0 = consoleMsgs.length;
+  for (const p of [
+    "/..%5cactive.json",
+    "/%2e%2e%5cstate.json",
+    "/assets/..%5c..%5cstate.json",
+    "/C:%5cWindows%5cwin.ini",
+    "/%5c%5c.%5cC:%5cWindows%5cwin.ini",
+    "/manifest.json",
+    "/..%2factive.json",
+  ]) {
+    try {
+      const res = await app.page.goto("http://tauri.localhost" + p, { timeout: 15_000 });
+      const body = await app.page.evaluate(() => document.documentElement.outerHTML.slice(0, 2000));
+      probes.push({
+        p,
+        status: res?.status(),
+        servedIndex: body.includes('<div id="app"') || body.includes("/assets/index-"),
+        leaked: /\[fonts\]|"activations"|"active"|"files"|"bad"/.test(body),
+      });
+    } catch (e) {
+      probes.push({ p, error: e.message.split("\n")[0] });
     }
-    return r;
-  });
+  }
+  await app.page.goto("http://tauri.localhost/", { timeout: 15_000 });
+  await ready(app.page);
+  note("probe_console", consoleMsgs.slice(csp0));
   note("probes", probes);
   note("console", consoleMsgs);
   await stop(app);

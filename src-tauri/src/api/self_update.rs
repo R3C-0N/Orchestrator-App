@@ -100,11 +100,24 @@ fn configured_model() -> Option<String> {
     }
 }
 
+/// La chaîne `contract` apparaît dans `bytes` comme littéral de chaîne
+/// (entre `"`, `'` ou `` ` `` : le minifieur de Vite écrit des gabarits).
+fn has_string_literal(bytes: &[u8], contract: &str) -> bool {
+    let c = contract.as_bytes();
+    if c.is_empty() || bytes.len() < c.len() + 2 {
+        return false;
+    }
+    bytes.windows(c.len() + 2).any(|w| {
+        let q = w[0];
+        matches!(q, b'"' | b'\'' | b'`') && w[w.len() - 1] == q && &w[1..w.len() - 1] == c
+    })
+}
+
 /// La sortie de Vite dans `dir` porte l'empreinte `contract` (constante
 /// `__CONTRACT__` inlinée dans les scripts) : l'interface a été construite
 /// pour le contrat de cet exe.
 pub fn ui_contract_matches(dir: &Path, contract: &str) -> bool {
-    fn walk(d: &Path, needle: &[u8], depth: u32) -> bool {
+    fn walk(d: &Path, contract: &str, depth: u32) -> bool {
         if depth > 8 {
             return false;
         }
@@ -115,20 +128,19 @@ pub fn ui_contract_matches(dir: &Path, contract: &str) -> bool {
             let Ok(ft) = e.file_type() else { continue };
             let p = e.path();
             if ft.is_dir() {
-                if walk(&p, needle, depth + 1) {
+                if walk(&p, contract, depth + 1) {
                     return true;
                 }
             } else if ft.is_file()
                 && p.extension().is_some_and(|x| x == "js")
-                && std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle))
+                && std::fs::read(&p).is_ok_and(|b| has_string_literal(&b, contract))
             {
                 return true;
             }
         }
         false
     }
-    let needle = format!("\"{contract}\"");
-    walk(dir, needle.as_bytes(), 0)
+    walk(dir, contract, 0)
 }
 
 /// Supprime les verrous de build `<hash>.lock` laissés par un arrêt brutal
@@ -644,8 +656,20 @@ mod tests {
         std::fs::create_dir_all(d.join("assets")).unwrap();
         std::fs::write(d.join("index.html"), "\"0123456789abcdef\"").unwrap();
         assert!(!ui_contract_matches(&d, "0123456789abcdef"));
+        // Sortie réelle de Vite 7 (gabarit) : Ze=`<empreinte>`.
+        std::fs::write(
+            d.join("assets/index-x.js"),
+            "Xe=`4e111e3`,Ze=`0123456789abcdef`,",
+        )
+        .unwrap();
+        assert!(ui_contract_matches(&d, "0123456789abcdef"));
         std::fs::write(d.join("assets/index-x.js"), "const c=\"0123456789abcdef\";").unwrap();
         assert!(ui_contract_matches(&d, "0123456789abcdef"));
+        // Préfixe d'une autre chaîne : pas un littéral entier.
+        std::fs::write(d.join("assets/index-x.js"), "c=`0123456789abcdef0`").unwrap();
+        assert!(!ui_contract_matches(&d, "0123456789abcdef"));
+        std::fs::write(d.join("assets/index-x.js"), "c=\"0123456789abcdef`").unwrap();
+        assert!(!ui_contract_matches(&d, "0123456789abcdef"));
         assert!(!ui_contract_matches(&d, "fedcba9876543210"));
         let _ = std::fs::remove_dir_all(&d);
     }
