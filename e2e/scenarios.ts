@@ -409,6 +409,33 @@ function sK1(): Scenario {
   return { id: "k1", ref: "k1-tour-en-cours-saisie-vide", verbose: false, steps: b.steps, relative: true, settleMs: 1200 };
 }
 
+// --- w1 / w1b : Write d'un nouveau fichier (capture J13) ------------------------
+
+const LISTE = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\nlambda\nmu\n";
+
+function sW1(verbose: boolean): Scenario {
+  const cwd = `${SANDBOX}\\write`;
+  const path = `${cwd}\\liste.txt`;
+  const b = new Builder(at(8, 8, 0) - 15000)
+    .boot(cwd)
+    .user(
+      "Avec un seul appel de l outil Write, cree le nouveau fichier liste.txt contenant exactement ces 12 lignes : alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda, mu (un mot par ligne). Ne lis aucun fichier avant. Puis reponds juste ok.",
+    )
+    .tool(
+      "Write",
+      { file_path: path, content: LISTE },
+      {
+        text: `File created successfully at: ${path}`,
+        // Forme de `tool_use_result` relevée dans la fixture t13 (`type: "create"`).
+        meta: { type: "create", filePath: path, content: LISTE, structuredPatch: [], originalFile: null, userModified: false },
+      },
+    )
+    .setTime(at(8, 8, 0))
+    .text("ok")
+    .turn(15000, at(8, 8, 1));
+  return { id: verbose ? "w1b" : "w1", ref: verbose ? "w1b-write-detail-ctrl-o" : "w1-write-normal", verbose, steps: b.steps };
+}
+
 export function scenarios(): Scenario[] {
-  return [s02(), s03(false), s03(true), s04(), s05(), s06(), s08(), s09(false), s09(true), sK1()];
+  return [s02(), s03(false), s03(true), s04(), s05(), s06(), s08(), s09(false), s09(true), sK1(), sW1(false), sW1(true)];
 }

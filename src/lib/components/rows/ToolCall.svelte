@@ -70,7 +70,7 @@
   {#if isEdit || writeIsUpdate}
     <EditDiff {row} />
   {:else if writeInfo}
-    <ToolResult lines={[writeInfo.head, ...writeInfo.lines]} more={writeInfo.more} html />
+    <ToolResult lines={[writeInfo.head, ...writeInfo.lines]} more={writeInfo.more} hint={false} html />
   {:else if row.name === "Read" || row.name === "Glob" || row.name === "Grep"}
     <ToolResult lines={[shortResult(row)]} />
   {:else}

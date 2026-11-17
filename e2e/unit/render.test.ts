@@ -355,11 +355,25 @@ describe("diff : CRLF, MultiEdit, sans originalFile", () => {
 
   it("Write d'un nouveau fichier : « Wrote N lines to <chemin> », lignes numérotées, HTML échappé", () => {
     const w = writeSummary({ file_path: "C:\\p\\notes2.txt", content: "alpha\r\n<b>beta</b>\r\n" }, "C:\\p", false);
-    expect(w.head).toBe("Wrote <b>2</b> lines to <b>notes2.txt</b>");
-    expect(w.lines).toEqual([" 1 alpha", " 2 &lt;b&gt;beta&lt;/b&gt;"]);
+    expect(w.head).toBe('Wrote <span class="b">2</span> lines to <span class="b link">notes2.txt</span>');
+    expect(w.lines).toEqual(['<span class="ln"> 1</span> alpha', '<span class="ln"> 2</span> &lt;b&gt;beta&lt;/b&gt;']);
     expect(w.more).toBe(0);
     const long = writeSummary({ file_path: "x", content: Array.from({ length: 25 }, (_, i) => `l${i}`).join("\n") }, null, false);
     expect([long.lines.length, long.more]).toEqual([10, 15]);
+    // Capture w1/w1b : 12 lignes, numéros sur 3 colonnes (« ⎿  » puis «   1 alpha », «  10 kappa »),
+    // 10 lignes et 2 masquées en vue normale, chemin absolu et 12 lignes en vue détaillée.
+    const twelve = { file_path: "C:\\p\\liste.txt", content: "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\nlambda\nmu\n" };
+    const n = writeSummary(twelve, "C:\\p", false);
+    expect(n.head).toBe('Wrote <span class="b">12</span> lines to <span class="b link">liste.txt</span>');
+    expect([n.lines[0], n.lines[9], n.lines.length, n.more]).toEqual([
+      '<span class="ln">  1</span> alpha',
+      '<span class="ln"> 10</span> kappa',
+      10,
+      2,
+    ]);
+    const v = writeSummary(twelve, "C:\\p", true);
+    expect(v.head).toContain("C:\\p\\liste.txt");
+    expect([v.lines.length, v.more, v.lines[11]]).toEqual([12, 0, '<span class="ln"> 12</span> mu']);
     expect(hasPatch({ type: "create", structuredPatch: [] })).toBe(false);
     expect(hasPatch({ type: "update", structuredPatch: [{ lines: [] }] })).toBe(true);
   });
@@ -434,6 +448,9 @@ describe("libellés", () => {
     expect(seconds(63_000)).toBe("1m 3s");
     const t = new Date(2026, 10, 16, 13, 13).getTime();
     expect(hhmm(t)).toBe("13:13");
+    // Sans zéro initial (« done 8:08 », capture w1) ; l'horodatage de la vue détaillée garde le sien.
+    const m = new Date(2026, 10, 17, 8, 8).getTime();
+    expect([hhmm(m), clock12(m)]).toEqual(["8:08", "08:08 AM"]);
     expect(clock12(t)).toBe("01:13 PM");
   });
 });

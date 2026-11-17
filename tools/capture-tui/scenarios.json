@@ -404,90 +404,6 @@
       ]
     },
     {
-      "name": "echap",
-      "extra": true,
-      "prompt": "Reponds juste ok.",
-      "steps": [
-        {
-          "do": "waitStop",
-          "count": 1,
-          "timeoutMs": 90000
-        },
-        {
-          "do": "wait",
-          "ms": 1000
-        },
-        {
-          "do": "type",
-          "text": "texte en cours"
-        },
-        {
-          "do": "keys",
-          "send": "{ESC}"
-        },
-        {
-          "do": "wait",
-          "ms": 600
-        },
-        {
-          "do": "capture",
-          "id": "e1",
-          "name": "echap-saisie-non-vide"
-        },
-        {
-          "do": "keys",
-          "send": "{ESC}"
-        },
-        {
-          "do": "wait",
-          "ms": 600
-        },
-        {
-          "do": "capture",
-          "id": "e2",
-          "name": "echap-echap-saisie-non-vide"
-        },
-        {
-          "do": "wait",
-          "ms": 2500
-        },
-        {
-          "do": "keys",
-          "send": "{ESC}"
-        },
-        {
-          "do": "wait",
-          "ms": 300
-        },
-        {
-          "do": "keys",
-          "send": "{ESC}"
-        },
-        {
-          "do": "wait",
-          "ms": 1000
-        },
-        {
-          "do": "capture",
-          "id": "e3",
-          "name": "echap-echap-saisie-vide"
-        },
-        {
-          "do": "keys",
-          "send": "{ESC}"
-        },
-        {
-          "do": "wait",
-          "ms": 800
-        },
-        {
-          "do": "capture",
-          "id": "e4",
-          "name": "echap-apres"
-        }
-      ]
-    },
-    {
       "name": "ctrlc-tour",
       "extra": true,
       "prompt": "Lance la commande Bash `ping -n 90 127.0.0.1`, puis dis termine.",
@@ -1003,6 +919,44 @@
           "do": "capture",
           "id": "v5",
           "name": "echap-apres-v4"
+        }
+      ]
+    },
+    {
+      "name": "write",
+      "extra": true,
+      "prompt": "Avec un seul appel de l outil Write, cree le nouveau fichier liste.txt contenant exactement ces 12 lignes : alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda, mu (un mot par ligne). Ne lis aucun fichier avant. Puis reponds juste ok.",
+      "steps": [
+        {
+          "do": "waitStop",
+          "count": 1,
+          "timeoutMs": 120000
+        },
+        {
+          "do": "wait",
+          "ms": 1500
+        },
+        {
+          "do": "capture",
+          "id": "w1",
+          "name": "write-normal"
+        },
+        {
+          "do": "keys",
+          "send": "^o"
+        },
+        {
+          "do": "wait",
+          "ms": 2000
+        },
+        {
+          "do": "capture",
+          "id": "w1b",
+          "name": "write-detail-ctrl-o"
+        },
+        {
+          "do": "keys",
+          "send": "^o"
         }
       ]
     }

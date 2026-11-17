@@ -32,6 +32,7 @@ Les éléments suivants sont propres au poste de capture et **ne font pas partie
 pwsh tools/capture-tui/capture.ps1 -Only <n>          # ex. -Only 05, -Only 05,06, -Only 03b
 pwsh tools/capture-tui/capture.ps1                    # les 10 captures de référence (avec 03b et 09b)
 pwsh tools/capture-tui/capture.ps1 -Scenario ctrlc,ctrlc-tour,echap-intervalles   # captures d'observation c*, k*, a*, n*, v*
+pwsh tools/capture-tui/capture.ps1 -Scenario write -SandboxRoot .claude-work/j13-sandbox   # outil Write : w1, w1b
 pwsh tools/capture-tui/capture.ps1 -List              # liste, sans rien lancer
 ```
 
@@ -76,6 +77,13 @@ Captures d'observation du clavier (hors des 10, scénarios `ctrlc`, `ctrlc-tour`
 | k3 | `k3-echap-echap-saisie-vide-apres-tour` | double Échap sur une saisie vide après un tour : **menu Rewind** (premier relevé ; mesuré proprement en `v1` et `v4`) ; hors du prototype 1 |
 | k4 | `k4-echap-apres` | état après fermeture du menu Rewind |
 
+Capture de l'outil Write (hors des 10, scénario `write`, faite au J13 sur le CLI **2.1.326**, mis à jour automatiquement depuis J1 ; bac à sable `.claude-work/j13-sandbox/write`) :
+
+| Id | Fichier | Ce qu'elle montre |
+| - | - | - |
+| w1 | `w1-write-normal` | Write d'un nouveau fichier de 12 lignes en vue normale : `●` vert (`#4EBA65`) + « Write(liste.txt) », « Write » en gras, chemin souligné en pointillé ; « ⎿  Wrote 12 lines to liste.txt », « 12 » et le chemin en gras blanc vif (`#F2F2F2`), le chemin souligné en pointillé ; lignes 1 à 10 numérotées (numéro `#666666` aligné à droite sur 3 colonnes après le retrait de 5, texte `#CCCCCC`) ; « … +2 lines » gris (`#999999`) **sans** « (ctrl+o to expand) » ; fin de tour « done 8:08 » sans zéro initial |
+| w1b | `w1b-write-detail-ctrl-o` | la même session en vue détaillée : chemin absolu dans « Write(…) » et « Wrote 12 lines to … », les 12 lignes, pas de « Allowed by auto mode », « 08:08 AM claude-haiku-5-5 » à droite |
+
 Règle du double Échap, **mesurée** (plus d'incertitude sur ce point) :
 
 - **saisie non vide** : le premier Échap affiche « Esc again to clear » sans rien effacer ; un second Échap arrivé moins d'environ 0,8 s plus tard efface la saisie (effacée à 736 ms, gardée à 843 ms) ;
@@ -98,12 +106,12 @@ Messages :
 - [ ] Titres `##` et `###` en gras blanc, même taille, sans `#` (02).
 - [ ] Listes `-` et `1.` telles quelles ; gras et italique ; code en ligne bleu lavande sans fond (02).
 - [ ] Bloc de code sans cadre ni fond, retrait de 2, coloré : mots-clés bleus, fonctions jaunes, chaînes rouges, nombres verts (02).
-- [ ] Fin de tour : « ✻ <Verbe> for <durée> · done <HH:MM> » en gris (02, 04, 06, 09).
+- [ ] Fin de tour : « ✻ <Verbe> for <durée> · done <H:MM> » en gris, heure sans zéro initial (« done 8:08 ») (02, 04, 06, 09, w1).
 
 Outils :
 
 - [ ] Vue normale : appels regroupés en une ligne grise sans puce, comme « Read 1 file, ran 1 shell command », « Searched for 1 pattern, read 1 file » ou « Ran 2 shell commands » (03, 04, 09).
-- [ ] Edit reste sur sa propre ligne : `●` vert + « Update(<chemin relatif>) », « Update » en gras (04). **Write n'est pas capturé** dans le TUI : libellé probable `Write(…)`, à capturer et confirmer avant J5.
+- [ ] Edit reste sur sa propre ligne : `●` vert + « Update(<chemin relatif>) », « Update » en gras (04). Write aussi : `●` vert + « Write(<chemin relatif>) », puis « ⎿  Wrote N lines to <chemin> » (nombre et chemin en gras, chemin souligné en pointillé), 10 lignes numérotées (numéros gris foncé `#666666`) et « … +N lines » gris sans « (ctrl+o to expand) » ; en vue détaillée, chemin absolu et tout le contenu (w1, w1b).
 - [ ] Résultat : `  ⎿  ` (2 espaces, `⎿`, 2 espaces) en gris (04, 08, 09).
 - [ ] Ctrl+O bascule vers la vue détaillée : chaque appel sur sa ligne (`● Read(<chemin absolu>)`, `● Bash(<commande>)`) avec sa sortie complète, `⎿  Allowed by auto mode`, heure et modèle à droite, barre « Showing detailed transcript · ctrl+o to toggle… » ; Ctrl+O revient à la vue normale (03b, 09b).
 

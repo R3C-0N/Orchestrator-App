@@ -169,7 +169,8 @@ export function seconds(ms: number): string {
 /** « 12:20 » (fin de tour, `02`). */
 export function hhmm(at: number): string {
   const d = new Date(at);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  // Heure sans zéro initial : « done 8:08 » (`w1`), « done 13:13 » (`03`).
+  return `${d.getHours()}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 /** « 01:13 PM » (vue détaillée, `03b`). */
@@ -196,9 +197,13 @@ export function hasPatch(meta: unknown): boolean {
 }
 
 /**
- * Write d'un nouveau fichier (`type: "create"`, `t13`) : « Wrote N lines to
- * <chemin> » (nombre et chemin en gras), puis les premières lignes
- * numérotées (10 en vue normale, toutes en vue détaillée). HTML échappé.
+ * Write d'un nouveau fichier (`type: "create"`, `t13`), d'après la capture
+ * `w1`/`w1b` du TUI : « Wrote N lines to <chemin> » (nombre en gras blanc vif,
+ * chemin en gras souligné en pointillé comme dans `Write(<chemin>)`), puis
+ * les premières lignes numérotées (10 en vue normale, toutes en vue
+ * détaillée) : numéro gris foncé (`#666666`) aligné à droite sur
+ * (chiffres + 1) colonnes, une espace, la ligne en couleur du texte. Chemin
+ * relatif en vue normale, absolu en vue détaillée. HTML échappé.
  */
 export function writeSummary(
   input: JsonValue | null | unknown,
@@ -213,8 +218,8 @@ export function writeSummary(
   const shown = verbose ? all : all.slice(0, 10);
   const w = String(Math.max(1, all.length)).length + 1;
   return {
-    head: `Wrote <b>${n}</b> ${n === 1 ? "line" : "lines"} to <b>${esc(verbose ? path : relPath(path, cwd))}</b>`,
-    lines: shown.map((l, i) => `${String(i + 1).padStart(w)} ${esc(l)}`),
+    head: `Wrote <span class="b">${n}</span> ${n === 1 ? "line" : "lines"} to <span class="b link">${esc(verbose ? path : relPath(path, cwd))}</span>`,
+    lines: shown.map((l, i) => `<span class="ln">${String(i + 1).padStart(w)}</span> ${esc(l)}`),
     more: all.length - shown.length,
   };
 }

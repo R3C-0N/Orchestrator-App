@@ -41,6 +41,14 @@ const EXPECT: Record<string, string[]> = {
     "12:29 PM claude-haiku-5-5",
   ],
   k1: ["Running ping for 90 requests to localhost ·", "$ ping -n 90 127.0.0.1", "tokens · thought for 1s)"],
+  w1: ["Write(liste.txt)", "Wrote 12 lines to liste.txt", "1 alpha", "10 kappa", "… +2 lines", "ok", "for 15s · done 8:08"],
+  w1b: [
+    "Write(C:\\projets\\demo\\write\\liste.txt)",
+    "Wrote 12 lines to C:\\projets\\demo\\write\\liste.txt",
+    "11 lambda",
+    "12 mu",
+    "08:08 AM claude-haiku-5-5",
+  ],
 };
 
 /** Textes qui ne doivent pas apparaître (règles de la vue normale). */
@@ -51,6 +59,8 @@ const ABSENT: Record<string, string[]> = {
   "06": ["Done ("],
   "08": ["Interrupted by user"],
   "09": ["Bash(", "Exit code"],
+  w1: ["11 lambda", "ctrl+o to expand", "Allowed by auto mode"],
+  w1b: ["… +", "Allowed by auto mode"],
 };
 
 /** Couleur calculée (`color` ou `background-color`) du premier élément trouvé. */
@@ -88,6 +98,17 @@ const STYLE: Record<string, (page: Page) => Promise<void>> = {
   },
   "09": async (page) => {
     expect(await css(page, ".g.err", "color")).toBe("rgb(255, 107, 128)");
+  },
+  // Write (w1) : puce verte, « Write » et « 12 » en gras blanc vif (#F2F2F2), chemin en gras
+  // souligné en pointillé, numéros #666666, contenu #CCCCCC, « … +2 lines » #999999.
+  w1: async (page) => {
+    expect(await css(page, ".g.ok", "color")).toBe("rgb(78, 186, 101)");
+    expect(await css(page, ".r .x .b", "color")).toBe("rgb(242, 242, 242)");
+    const link = page.locator(".r .x .b.link").first();
+    expect(await link.evaluate((el) => getComputedStyle(el).textDecorationStyle)).toBe("dotted");
+    expect(await css(page, ".rc .ln", "color")).toBe("rgb(102, 102, 102)");
+    expect(await css(page, ".rc.x:not(.dim)", "color")).toBe("rgb(204, 204, 204)");
+    expect(await css(page, ".rc.x.dim", "color")).toBe("rgb(153, 153, 153)");
   },
   "09b": async (page) => {
     expect(await css(page, ".g.err", "color")).toBe("rgb(255, 107, 128)");
