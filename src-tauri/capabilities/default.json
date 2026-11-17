@@ -15,6 +15,12 @@
     "allow-list-projects",
     "allow-list-sessions",
     "allow-load-history",
-    "allow-stop-session"
+    "allow-stop-session",
+    "allow-attach-sessions",
+    "allow-ui-ready",
+    "allow-get-ui-info",
+    "allow-improve-start",
+    "allow-improve-cancel",
+    "allow-ui-rollback"
   ]
 }

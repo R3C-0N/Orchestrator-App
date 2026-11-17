@@ -9,12 +9,15 @@ import type { CoreEvent } from "./bindings/CoreEvent";
 import type { Diagnostics } from "./bindings/Diagnostics";
 import type { ExitInfo } from "./bindings/ExitInfo";
 import type { HistoryLoaded } from "./bindings/HistoryLoaded";
+import type { ImproveStatus } from "./bindings/ImproveStatus";
 import type { InterruptAck } from "./bindings/InterruptAck";
 import type { LaunchInfo } from "./bindings/LaunchInfo";
 import type { SessionKey } from "./bindings/SessionKey";
+import type { SessionResync } from "./bindings/SessionResync";
 import type { SessionStarted } from "./bindings/SessionStarted";
 import type { SessionSummary } from "./bindings/SessionSummary";
 import type { SkipReason } from "./bindings/SkipReason";
+import type { UiInfo } from "./bindings/UiInfo";
 
 export type {
   Answer,
@@ -23,12 +26,15 @@ export type {
   Diagnostics,
   ExitInfo,
   HistoryLoaded,
+  ImproveStatus,
   InterruptAck,
   LaunchInfo,
   SessionKey,
+  SessionResync,
   SessionStarted,
   SessionSummary,
   SkipReason,
+  UiInfo,
 };
 
 /** Erreur d'une commande : `{ kind, message? }` (CoreError côté Rust). */
@@ -85,3 +91,33 @@ export const loadHistory = (session: SessionKey, session_id: string) =>
 export const stopSession = (session: SessionKey) => invoke<ExitInfo>("stop_session", { session });
 
 export const getDiagnostics = () => invoke<Diagnostics>("get_diagnostics");
+
+// --- J14 : auto-amélioration (spec, décisions 15 à 19) ------------------------
+
+/**
+ * Rattache l'interface (re)chargée aux sessions vivantes du cœur : `onEvents`
+ * reçoit ensuite les lots de **toutes** les sessions (chaque `CoreEvent`
+ * porte sa `session`), y compris la session d'amélioration. La réponse donne
+ * de quoi reconstruire chaque session (historique repris, puis journal).
+ */
+export function attachSessions(onEvents: (batch: CoreEvent[]) => void): Promise<SessionResync[]> {
+  const events = new Channel<CoreEvent[]>();
+  events.onmessage = onEvents;
+  return invoke<SessionResync[]>("attach_sessions", { events });
+}
+
+/** Signal « prêt » (watchdog de 5 s) ; `hash` : `__UI_HASH__`, `null` pour l'interface embarquée. */
+export const uiReady = (hash: string | null) => invoke<boolean>("ui_ready", { hash });
+
+export const getUiInfo = () => invoke<UiInfo>("get_ui_info");
+
+/** `/ameliorer <request>` ; l'avancement arrive par l'événement global `IMPROVE_EVENT`. */
+export const improveStart = (request: string) => invoke<ImproveStatus>("improve_start", { request });
+
+export const improveCancel = (id: string) => invoke<void>("improve_cancel", { id });
+
+/** Revient à la version précédente de l'interface. */
+export const uiRollback = () => invoke<UiInfo>("ui_rollback");
+
+/** Nom de l'événement global Tauri qui porte un `ImproveStatus` (`IMPROVE_EVENT` côté Rust). */
+export const IMPROVE_EVENT = "improve_status";

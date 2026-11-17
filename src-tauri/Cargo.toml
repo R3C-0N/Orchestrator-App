@@ -39,6 +39,9 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 tracing-appender = "0.2"
+# J14 (étape 0) : empreintes SHA-256 du manifeste des versions d'interface
+# (`src/ui/`, agent B). Déjà dans Cargo.lock par Tauri.
+sha2 = "0.10.9"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

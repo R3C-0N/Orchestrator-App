@@ -205,7 +205,152 @@ pub enum CoreError {
     Io(String),
     #[error("transcript illisible : {0}")]
     TranscriptFormat(String),
+    /// J14, étape 0 : commande du contrat pas encore implémentée (le message
+    /// est le nom de la commande).
+    #[error("pas encore implémenté : {0}")]
+    NotImplemented(String),
 }
 
 /// Alias pratique pour les réponses aux questions.
 pub type Answers = BTreeMap<String, Answer>;
+
+// --- J14 : auto-amélioration (spec, décisions 15 à 19) ------------------------
+
+/// Rôle d'une session dans l'app : la session de l'utilisateur, ou la session
+/// `claude.exe` dédiée à une amélioration (`improve_start`), lancée par le
+/// cœur dans un worktree du clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SessionRole {
+    Main,
+    Improve,
+}
+
+/// Entrée de `attach_sessions` : tout ce qu'il faut à une interface
+/// (re)chargée pour reconstruire une session vivante à l'identique. `events`
+/// est le journal complet des `CoreEvent` émis depuis le démarrage (`seq`
+/// continus à partir de 0) ; `history` est l'historique repris tel que l'a
+/// renvoyé le premier `load_history`, à appliquer avant `events`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionResync {
+    pub session: SessionKey,
+    pub role: SessionRole,
+    pub cwd: String,
+    pub pid: u32,
+    /// `session_id` du CLI passé à `--resume`, s'il y en a un.
+    pub resumed_from: Option<String>,
+    pub history: Option<HistoryLoaded>,
+    pub events: Vec<super::events::CoreEvent>,
+    /// Faux si le processus est déjà sorti (son `exited` est dans `events`).
+    pub running: bool,
+}
+
+/// D'où vient l'interface affichée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum UiSource {
+    /// Interface embarquée dans l'exe (repli, ou aucune version sur disque).
+    Embedded,
+    /// `%LOCALAPPDATA%\orchestrator\ui\<hash>\`.
+    Disk,
+}
+
+/// État du clone du dépôt source de l'app (décision 16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[ts(export)]
+pub enum RepoStatus {
+    /// Pas encore examiné (démarrage).
+    Unknown,
+    /// Clonage en cours.
+    Cloning { path: String },
+    /// Clone utilisable : `/ameliorer` est permis.
+    Ready {
+        path: String,
+        url: String,
+        /// Tête de `main` dans le clone.
+        head: String,
+    },
+    /// `/ameliorer` désactivé (git, Node, npm ou clé SSH absents, pas de
+    /// réseau, dossier non inscriptible…) ; `reason` est affichée.
+    Disabled { reason: String },
+}
+
+/// Réponse de `get_ui_info` et de `ui_rollback`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct UiInfo {
+    pub source: UiSource,
+    /// Hash du commit de l'interface affichée (`None` : interface embarquée).
+    pub active_hash: Option<String>,
+    /// Version à laquelle `ui_rollback` reviendrait.
+    pub previous_hash: Option<String>,
+    /// Commit à partir duquel l'exe a été compilé (`unknown` si inconnu).
+    pub build_commit: String,
+    /// Empreinte du contrat de l'exe (liaisons TS, capability, `build.rs`) :
+    /// une interface d'empreinte différente n'est jamais activée.
+    pub contract: String,
+    /// Commit fusionné qui attend une relance (cœur Rust modifié, décision 18).
+    pub restart_required: Option<String>,
+    pub repo: RepoStatus,
+    /// Amélioration en cours, ou la dernière terminée.
+    pub improve: Option<ImproveStatus>,
+}
+
+/// Étape d'une amélioration (décision 17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ImproveStep {
+    /// Création du worktree et de la branche.
+    Preparing,
+    /// Session `claude.exe` dédiée au travail.
+    Working,
+    /// Contrôles : arbre propre, commits sur la branche, fichiers permis.
+    Checking,
+    Testing,
+    Building,
+    /// Interface prête : attente que la session principale soit au repos.
+    WaitingIdle,
+    /// Rechargement et attente du signal « prêt » (5 s).
+    Switching,
+    /// Fusion fast-forward faite (fin).
+    Merged,
+    /// Fusionnée, cœur Rust modifié : relance requise (fin).
+    RestartRequired,
+    /// Échec (fin) : version précédente gardée, branche non fusionnée.
+    Failed,
+    /// Annulée par `improve_cancel` (fin).
+    Cancelled,
+    /// Retour arrière par `ui_rollback` (fin).
+    RolledBack,
+}
+
+/// Avancement d'une amélioration : émis en événement global Tauri
+/// [`IMPROVE_EVENT`] (il survit au rechargement de l'interface) et repris
+/// dans `UiInfo::improve`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ImproveStatus {
+    pub id: String,
+    /// `auto/<AAAAMMJJ-HHMM>-<sujet>`.
+    pub branch: String,
+    /// Demande de l'utilisateur (texte après `/ameliorer`).
+    pub request: String,
+    pub step: ImproveStep,
+    /// Session dédiée (rôle `Improve`), dès qu'elle existe.
+    pub session: Option<SessionKey>,
+    /// Tête de la branche, dès qu'un commit existe.
+    pub commit: Option<String>,
+    /// Précision lisible (test en échec, raison d'un échec…).
+    pub detail: Option<String>,
+    /// Heure de la dernière transition (ms depuis l'epoch).
+    #[ts(type = "number")]
+    pub t: u64,
+}
+
+/// Nom de l'événement global Tauri qui porte un [`ImproveStatus`].
+pub const IMPROVE_EVENT: &str = "improve_status";

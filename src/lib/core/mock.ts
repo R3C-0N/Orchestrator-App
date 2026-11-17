@@ -16,7 +16,11 @@
 import type { AgentEvent } from "./bindings/AgentEvent";
 import type { CoreEvent } from "./bindings/CoreEvent";
 import type { EventBody } from "./bindings/EventBody";
+import type { ImproveStatus } from "./bindings/ImproveStatus";
+import type { ImproveStep } from "./bindings/ImproveStep";
 import type { QuestionItem } from "./bindings/QuestionItem";
+import type { SessionResync } from "./bindings/SessionResync";
+import type { UiInfo } from "./bindings/UiInfo";
 
 const SESSION = "mock-1";
 
@@ -556,4 +560,120 @@ export function mockOptionsFromUrl(search: string): (MockOptions & { name: strin
     rate: num("rate"),
     seed: num("seed"),
   };
+}
+
+// --- J14 : auto-amélioration simulée ------------------------------------------
+
+/** Étapes d'un cycle réussi, dans l'ordre (décision 17 de la spec). */
+export const MOCK_IMPROVE_STEPS: ImproveStep[] = [
+  "preparing",
+  "working",
+  "checking",
+  "testing",
+  "building",
+  "waiting_idle",
+  "switching",
+  "merged",
+];
+
+/**
+ * Commandes J14 simulées (`attach_sessions`, `ui_ready`, `get_ui_info`,
+ * `improve_start`, `improve_cancel`, `ui_rollback`) : réponses minimales
+ * conformes au contrat. `improveStart` déroule `MOCK_IMPROVE_STEPS`, une
+ * étape toutes les `stepMs` ms, et passe chaque `ImproveStatus` à
+ * `onStatus` (l'équivalent de l'événement global `improve_status`).
+ */
+export class MockSelfUpdate {
+  info: UiInfo = {
+    source: "embedded",
+    active_hash: null,
+    previous_hash: null,
+    build_commit: "mock000",
+    contract: "0000000000000000",
+    restart_required: null,
+    repo: { state: "ready", path: "C:\\mock\\repo", url: "git@example.invalid:mock.git", head: "mock000" },
+    improve: null,
+  };
+  readyCalls: (string | null)[] = [];
+  #timers: ReturnType<typeof setTimeout>[] = [];
+  #n = 0;
+  #onStatus: (s: ImproveStatus) => void;
+  #stepMs: number;
+
+  constructor(onStatus: (s: ImproveStatus) => void = () => {}, stepMs = 300) {
+    this.#onStatus = onStatus;
+    this.#stepMs = stepMs;
+  }
+
+  attachSessions(): Promise<SessionResync[]> {
+    return Promise.resolve([]);
+  }
+
+  uiReady(hash: string | null): Promise<boolean> {
+    this.readyCalls.push(hash);
+    return Promise.resolve(false);
+  }
+
+  getUiInfo(): Promise<UiInfo> {
+    return Promise.resolve(structuredClone(this.info));
+  }
+
+  improveStart(request: string): Promise<ImproveStatus> {
+    if (this.info.repo.state !== "ready") {
+      return Promise.reject({ kind: "unsupported", message: "clone indisponible" });
+    }
+    const id = `improve-${++this.#n}`;
+    const slug = request.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "demande";
+    const status = (step: ImproveStep): ImproveStatus => ({
+      id,
+      branch: `auto/20261117-1200-${slug}`,
+      request,
+      step,
+      session: null,
+      commit: step === "preparing" || step === "working" ? null : `mock${this.#n}`.padEnd(7, "0"),
+      detail: null,
+      t: Date.now(),
+    });
+    MOCK_IMPROVE_STEPS.forEach((step, i) => {
+      if (i === 0) return;
+      this.#timers.push(
+        setTimeout(() => {
+          const s = status(step);
+          this.info.improve = s;
+          if (step === "merged") {
+            this.info.previous_hash = this.info.active_hash;
+            this.info.active_hash = s.commit;
+            this.info.source = "disk";
+          }
+          this.#onStatus(s);
+        }, i * this.#stepMs),
+      );
+    });
+    const first = status("preparing");
+    this.info.improve = first;
+    return Promise.resolve(first);
+  }
+
+  improveCancel(id: string): Promise<void> {
+    const cur = this.info.improve;
+    if (!cur || cur.id !== id) return Promise.reject({ kind: "invalid_argument", message: id });
+    this.#timers.forEach(clearTimeout);
+    this.#timers = [];
+    const s: ImproveStatus = { ...cur, step: "cancelled", t: Date.now() };
+    this.info.improve = s;
+    this.#onStatus(s);
+    return Promise.resolve();
+  }
+
+  uiRollback(): Promise<UiInfo> {
+    this.info.active_hash = this.info.previous_hash;
+    this.info.previous_hash = null;
+    this.info.source = this.info.active_hash ? "disk" : "embedded";
+    return this.getUiInfo();
+  }
+
+  dispose(): void {
+    this.#timers.forEach(clearTimeout);
+    this.#timers = [];
+  }
 }

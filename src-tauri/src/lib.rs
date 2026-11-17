@@ -2,15 +2,19 @@
 //! `CoreEvent` normalisés à l'interface Svelte.
 
 pub mod api;
+pub mod build_info;
 pub mod colors;
 pub mod errors;
 pub mod logging;
 pub mod process;
 pub mod protocol;
+pub mod selfupdate;
 pub mod sessions;
 pub mod state;
+pub mod ui;
 
 use api::commands::{self, AppState};
+use api::self_update;
 use tauri::Manager;
 
 pub fn run() {
@@ -27,6 +31,12 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(AppState::with_launch(launch))
+        // J14, étape 0 : états de l'auto-amélioration, sans effet tant que
+        // l'étape 5 ne les branche pas (`set_assets`, watchdog, clone).
+        .manage(ui::UiHost::new(
+            ui::UiHost::default_root().unwrap_or_default(),
+        ))
+        .manage(selfupdate::SelfUpdate::default())
         // Rechargement de la webview : les canaux des sessions sont perdus,
         // ces sessions orphelines sont fermées (plan J6).
         .on_page_load(|webview, payload| {
@@ -50,6 +60,12 @@ pub fn run() {
             commands::load_history,
             commands::stop_session,
             commands::get_diagnostics,
+            commands::attach_sessions,
+            self_update::ui_ready,
+            self_update::get_ui_info,
+            self_update::improve_start,
+            self_update::improve_cancel,
+            self_update::ui_rollback,
         ])
         .build(tauri::generate_context!())
         .expect("échec de la construction de l'app Tauri");

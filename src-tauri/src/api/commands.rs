@@ -14,7 +14,7 @@ use tauri::{AppHandle, Manager, State};
 use super::events::CoreEvent;
 use super::types::{
     Answers, CoreError, Diagnostics, ExitInfo, HistoryLoaded, InterruptAck, LaunchInfo,
-    ProjectSummary, SessionKey, SessionStarted, SessionSummary, SkipReason,
+    ProjectSummary, SessionKey, SessionResync, SessionStarted, SessionSummary, SkipReason,
 };
 use crate::process::locate::{display_path, locate_claude, EXPECTED_CLAUDE_VERSION};
 use crate::process::spawn::LaunchOptions;
@@ -304,6 +304,18 @@ pub async fn stop_session(
         .close_session(&session)
         .await
         .ok_or(CoreError::NotRunning)
+}
+
+/// J14 (spec décision 15) : une interface (re)chargée se rattache aux
+/// sessions vivantes. `events` devient le canal de toutes les sessions (les
+/// `CoreEvent` portent leur `session`), y compris celles lancées par le cœur
+/// (amélioration) ; la réponse donne, par session, de quoi reconstruire son
+/// état (historique repris, journal des événements). Étape 0 : aucune
+/// session n'est gardée au rechargement, la liste est vide.
+#[tauri::command(rename_all = "snake_case")]
+pub fn attach_sessions(events: Channel<Vec<CoreEvent>>) -> Result<Vec<SessionResync>, CoreError> {
+    let _ = events;
+    Ok(Vec::new())
 }
 
 #[tauri::command(rename_all = "snake_case")]
