@@ -131,8 +131,7 @@ impl AppState {
                 *ui = None;
             }
         }
-        let all: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
-        let n = all.iter().filter(|s| s.outlet().detach_before(gen)).count();
+        let n = self.reaper().detach_before(gen);
         if n > 0 {
             tracing::info!(
                 sessions = n,
@@ -140,7 +139,6 @@ impl AppState {
                 grace_s = self.detach_grace.as_secs(),
                 "rechargement de l'interface : sessions détachées, en attente de rattachement"
             );
-            self.reaper().schedule();
         }
         n
     }
@@ -148,6 +146,14 @@ impl AppState {
     /// Génération de page courante.
     pub fn page_gen(&self) -> u64 {
         self.page_gen.load(Ordering::SeqCst)
+    }
+
+    /// Destination `sink` pour la génération de page courante (tests, outils).
+    pub fn attachment(&self, sink: Sink) -> Attachment {
+        Attachment {
+            sink,
+            page_gen: self.page_gen(),
+        }
     }
 
     fn reaper(&self) -> Reaper {
@@ -158,45 +164,75 @@ impl AppState {
         }
     }
 
-    /// Rattache toutes les sessions de la table à `sink` (page courante) et
-    /// rend, pour chacune, de quoi la reconstruire (`attach_sessions`). Les
-    /// sessions lancées ensuite par le cœur (`Improve`) partent aussi vers
-    /// `sink`. Ordre : du plus ancien démarrage au plus récent.
-    pub fn attach_all(&self, sink: Sink) -> Vec<SessionResync> {
-        let gen = self.page_gen();
-        *self.ui.lock().unwrap() = Some(Attachment {
-            sink: sink.clone(),
-            page_gen: gen,
-        });
+    /// Rattache toutes les sessions de la table à `page` et rend, pour
+    /// chacune, de quoi la reconstruire (`attach_sessions`). Les sessions
+    /// lancées ensuite par le cœur (`Improve`) partent aussi vers `page`.
+    /// Ordre : du plus ancien démarrage au plus récent.
+    ///
+    /// Une session morte est rendue une fois (son journal finit par
+    /// `exited`), puis retirée de la table : un rechargement suivant ne
+    /// re-sérialise pas son journal. Une page d'une génération déjà passée
+    /// (rechargée entre-temps) ne rattache rien.
+    pub fn attach_all(&self, page: Attachment) -> Vec<SessionResync> {
+        if page.page_gen < self.page_gen() {
+            tracing::warn!(
+                page_gen = page.page_gen,
+                "rattachement d'une page déjà rechargée : ignoré"
+            );
+            return Vec::new();
+        }
+        *self.ui.lock().unwrap() = Some(page.clone());
         let mut all: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
         all.sort_by_key(|s| s.started_at);
-        all.iter().map(|s| s.resync(sink.clone(), gen)).collect()
+        let out = all
+            .iter()
+            .map(|s| s.resync(page.sink.clone(), page.page_gen))
+            .collect();
+        self.forget_dead();
+        out
     }
 
     /// Lance une session et l'inscrit dans la table. `own` : destination
-    /// propre (canal de `start_session`) ; `None` : canal de la page courante
-    /// (`attach_sessions`), ou journal seul si aucune page n'est rattachée.
+    /// propre (canal de `start_session`, avec sa génération de page) ;
+    /// `None` : canal de la page courante (`attach_sessions`), ou journal
+    /// seul si aucune page n'est rattachée. Une session sans destination
+    /// (jamais rattachée, ou canal déjà refusé) est fermée après le délai si
+    /// aucune page ne s'y rattache.
     pub async fn spawn_session(
         &self,
         role: SessionRole,
         exe: &Path,
         cwd: &Path,
         opts: LaunchOptions,
-        own: Option<Sink>,
+        own: Option<Attachment>,
         config: SessionConfig,
     ) -> Result<Arc<Session>, CoreError> {
         self.forget_dead();
         let key = SessionKey(uuid::Uuid::new_v4().to_string());
-        let attachment = match own {
-            Some(sink) => Some(Attachment {
-                sink,
-                page_gen: self.page_gen(),
-            }),
-            None => self.ui.lock().unwrap().clone(),
-        };
+        let attachment = own.or_else(|| self.ui.lock().unwrap().clone());
         let session =
             Session::start_role(key.clone(), exe, cwd, opts, role, attachment, config).await?;
+        // Destination refusée plus tard (fenêtre fermée) : fermeture différée.
+        let reaper = self.reaper();
+        session
+            .outlet()
+            .set_on_detach(Arc::new(move || reaper.schedule()));
         self.sessions.lock().unwrap().insert(key, session.clone());
+        // Déjà sans destination (jamais rattachée, ou refusée pendant le
+        // démarrage, avant l'inscription dans la table).
+        if !session.outlet().is_attached() {
+            self.reaper().schedule();
+        }
+        if role == SessionRole::Improve {
+            // Fermeture sûre même si l'appelant oublie `close_session` : la
+            // session sort de la table à la fin de son processus.
+            let reaper = self.reaper();
+            let s = session.clone();
+            tokio::spawn(async move {
+                s.exited().await;
+                reaper.forget(&s.key);
+            });
+        }
         Ok(session)
     }
 
@@ -266,8 +302,10 @@ impl AppState {
     }
 }
 
-/// Fermeture différée des sessions détachées : après `grace`, toute session
-/// encore détachée depuis au moins `grace` est arrêtée et retirée.
+/// Fermeture différée des sessions détachées : une session détachée depuis
+/// au moins `grace` est arrêtée et retirée de la table. L'échéance se compte
+/// depuis le détachement de chaque session (`Outlet::detached_for`) : une
+/// passe trop tôt se reprogramme tant qu'il reste des sessions détachées.
 #[derive(Clone)]
 struct Reaper {
     sessions: SessionMap,
@@ -276,23 +314,51 @@ struct Reaper {
 }
 
 impl Reaper {
-    /// Programme une passe (runtime tokio requis : commandes, regroupeur).
+    /// Détache les sessions dont la destination vient d'une génération de
+    /// page antérieure à `gen`, puis programme leur fermeture.
+    fn detach_before(&self, gen: u64) -> usize {
+        let all: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let n = all.iter().filter(|s| s.outlet().detach_before(gen)).count();
+        if n > 0 {
+            self.schedule();
+        }
+        n
+    }
+
+    /// Programme des passes jusqu'à ce qu'aucune session ne soit détachée
+    /// (runtime tokio requis : commandes, regroupeur).
     fn schedule(&self) {
         let me = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(me.grace).await;
-            me.sweep().await;
+            let mut wait = me.grace;
+            loop {
+                tokio::time::sleep(wait).await;
+                match me.sweep().await {
+                    Some(next) => wait = next,
+                    None => break,
+                }
+            }
         });
     }
 
-    async fn sweep(&self) {
+    /// Ferme les sessions détachées depuis `grace` ; renvoie l'attente avant
+    /// l'échéance de la plus proche des autres sessions détachées.
+    async fn sweep(&self) -> Option<Duration> {
+        let mut next: Option<Duration> = None;
         let expired: Vec<Arc<Session>> = {
             let mut map = self.sessions.lock().unwrap();
-            let keys: Vec<SessionKey> = map
-                .iter()
-                .filter(|(_, s)| s.outlet().detached_for().is_some_and(|d| d >= self.grace))
-                .map(|(k, _)| k.clone())
-                .collect();
+            let mut keys = Vec::new();
+            for (k, s) in map.iter() {
+                match s.outlet().detached_for() {
+                    Some(d) if d >= self.grace => keys.push(k.clone()),
+                    Some(d) => {
+                        // Marge de 10 ms : l'échéance est passée au réveil.
+                        let left = self.grace - d + Duration::from_millis(10);
+                        next = Some(next.map_or(left, |n| n.min(left)));
+                    }
+                    None => {}
+                }
+            }
             keys.iter().filter_map(|k| map.remove(k)).collect()
         };
         for s in expired {
@@ -305,19 +371,33 @@ impl Reaper {
             s.stop().await;
             *self.last.lock().unwrap() = Some(s);
         }
+        next
+    }
+
+    /// Retire une session de la table (gardée pour les diagnostics).
+    fn forget(&self, key: &SessionKey) {
+        if let Some(s) = self.sessions.lock().unwrap().remove(key) {
+            *self.last.lock().unwrap() = Some(s);
+        }
     }
 }
 
 /// Destination des événements vers un canal de l'interface, valable pour la
-/// génération de page `gen` seulement : une page rechargée garde un canal
-/// où `send` réussit sans que personne ne lise (essai J14), donc un canal
-/// d'une génération passée est tenu pour fermé. Fermé (ou en erreur) : la
-/// session est détachée par son journal (`Outlet`), et sera fermée sans
-/// rattachement dans le délai.
-fn channel_sink(events: Channel<Vec<CoreEvent>>, page_gen: Arc<AtomicU64>, reaper: Reaper) -> Sink {
+/// génération de page courante seulement (renvoyée avec le `Sink`) : une
+/// page rechargée garde un canal où `send` réussit sans que personne ne
+/// lise (essai J14), donc un canal d'une génération passée est tenu pour
+/// fermé. Un envoi refusé (fenêtre fermée sans rechargement) vaut perte de
+/// la page : toutes les sessions de cette génération sont détachées, y
+/// compris celles qui n'émettent rien, et fermées sans rattachement dans le
+/// délai.
+fn channel_sink(
+    events: Channel<Vec<CoreEvent>>,
+    page_gen: Arc<AtomicU64>,
+    reaper: Reaper,
+) -> Attachment {
     let gen = page_gen.load(Ordering::SeqCst);
     let failed = Arc::new(AtomicBool::new(false));
-    Arc::new(move |batch| {
+    let sink: Sink = Arc::new(move |batch| {
         if page_gen.load(Ordering::SeqCst) != gen {
             return false;
         }
@@ -325,11 +405,21 @@ fn channel_sink(events: Channel<Vec<CoreEvent>>, page_gen: Arc<AtomicU64>, reape
             return true;
         }
         if !failed.swap(true, Ordering::SeqCst) {
-            tracing::warn!("canal de l'interface fermé : sessions détachées");
-            reaper.schedule();
+            tracing::warn!(
+                page_gen = gen,
+                "canal de l'interface fermé : sessions détachées"
+            );
+            // Les sessions de la page qui n'émettent rien sont détachées
+            // aussi ; celle dont le lot vient d'échouer se détache elle-même
+            // (`Outlet::deliver`, rappel `on_detach`).
+            reaper.detach_before(gen + 1);
         }
         false
-    })
+    });
+    Attachment {
+        sink,
+        page_gen: gen,
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -347,7 +437,7 @@ pub async fn start_session(
 ) -> Result<SessionStarted, CoreError> {
     let exe = locate_claude().map_err(|tried| CoreError::ClaudeNotFound(tried.join(" ; ")))?;
     let cwd = PathBuf::from(cwd);
-    let sink = channel_sink(events, state.page_gen.clone(), state.reaper());
+    let page = channel_sink(events, state.page_gen.clone(), state.reaper());
     let session = state
         .spawn_session(
             SessionRole::Main,
@@ -358,7 +448,7 @@ pub async fn start_session(
                 model,
                 extra_args: vec![],
             },
-            Some(sink),
+            Some(page),
             SessionConfig::default(),
         )
         .await?;
@@ -509,13 +599,18 @@ pub async fn stop_session(
 /// état (historique repris, journal des événements). Les événements émis
 /// après l'instantané arrivent ensuite sur `events`, sans trou ni doublon de
 /// `seq` (voir `process::supervisor::Outlet`).
+///
+/// `async` : une commande synchrone tourne sur le thread principal de la
+/// webview ; ici la copie des journaux (≈ 5 ms pour 10 000 événements) et la
+/// sérialisation de la réponse (≈ 0,1 à 0,4 s en debug) se font sur un fil
+/// du runtime, l'interface reste fluide.
 #[tauri::command(rename_all = "snake_case")]
-pub fn attach_sessions(
+pub async fn attach_sessions(
     state: State<'_, AppState>,
     events: Channel<Vec<CoreEvent>>,
 ) -> Result<Vec<SessionResync>, CoreError> {
-    let sink = channel_sink(events, state.page_gen.clone(), state.reaper());
-    Ok(state.attach_all(sink))
+    let page = channel_sink(events, state.page_gen.clone(), state.reaper());
+    Ok(state.attach_all(page))
 }
 
 #[tauri::command(rename_all = "snake_case")]

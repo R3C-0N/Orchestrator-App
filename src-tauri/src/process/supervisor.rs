@@ -114,8 +114,8 @@ struct Route {
     /// Numéro de rattachement : un échec d'envoi ne détache que le `sink`
     /// qui a échoué, pas un `sink` posé depuis.
     epoch: u64,
-    /// Depuis quand la session n'a plus de destination (après en avoir eu
-    /// une) ; `None` si attachée, ou jamais attachée.
+    /// Depuis quand la session n'a plus de destination (détachement, ou
+    /// création sans destination) ; `None` si attachée.
     detached_since: Option<Instant>,
 }
 
@@ -141,16 +141,23 @@ pub struct Outlet {
     route: Mutex<Route>,
     /// Nombre d'événements émis ; réveille les attentes (`Session::wait_*`).
     activity: watch::Sender<u64>,
+    /// Appelé (hors verrou) quand un envoi refusé détache la session.
+    on_detach: Mutex<Option<DetachHook>>,
 }
+
+/// Rappel de détachement (fermeture différée, `AppState`).
+pub type DetachHook = Arc<dyn Fn() + Send + Sync>;
 
 impl Outlet {
     /// Crée le journal et lance son regroupeur (runtime tokio requis).
     /// `attachment` : destination initiale ; `None` : journal seul.
     pub fn spawn(session: SessionKey, attachment: Option<Attachment>) -> Arc<Outlet> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let (page_gen, sink) = match attachment {
-            Some(a) => (a.page_gen, Some(a.sink)),
-            None => (0, None),
+        // Sans destination au départ, la session compte comme détachée dès
+        // maintenant : fermée si aucune page ne s'y rattache dans le délai.
+        let (page_gen, sink, detached_since) = match attachment {
+            Some(a) => (a.page_gen, Some(a.sink), None),
+            None => (0, None, Some(Instant::now())),
         };
         let outlet = Arc::new(Outlet {
             session,
@@ -164,9 +171,10 @@ impl Outlet {
                 from_seq: 0,
                 page_gen,
                 epoch: 0,
-                detached_since: None,
+                detached_since,
             }),
             activity: watch::channel(0).0,
+            on_detach: Mutex::new(None),
         });
         // Référence faible : le regroupeur s'arrête quand le journal (donc
         // l'émetteur) disparaît.
@@ -223,12 +231,24 @@ impl Outlet {
         if batch.is_empty() || sink(batch) {
             return;
         }
-        let mut r = self.route.lock().unwrap();
-        if r.epoch == epoch && r.sink.is_some() {
+        {
+            let mut r = self.route.lock().unwrap();
+            if r.epoch != epoch || r.sink.is_none() {
+                return;
+            }
             tracing::warn!(session = %self.session.0, "destination fermée : session détachée");
             r.sink = None;
             r.detached_since = Some(Instant::now());
         }
+        let hook = self.on_detach.lock().unwrap().clone();
+        if let Some(f) = hook {
+            f();
+        }
+    }
+
+    /// Rappel appelé quand un envoi refusé détache la session.
+    pub fn set_on_detach(&self, f: DetachHook) {
+        *self.on_detach.lock().unwrap() = Some(f);
     }
 
     /// Rattache la session à `sink` et renvoie le journal complet. Les
@@ -263,7 +283,8 @@ impl Outlet {
         self.route.lock().unwrap().sink.is_some()
     }
 
-    /// Durée depuis le détachement ; `None` si attachée ou jamais attachée.
+    /// Durée depuis le détachement (ou depuis la création, si créée sans
+    /// destination) ; `None` si attachée.
     pub fn detached_for(&self) -> Option<Duration> {
         self.route
             .lock()
@@ -867,6 +888,13 @@ impl Session {
             .ok()
             .and_then(|r| r.ok().map(|c| *c))
             .flatten()
+    }
+
+    /// Attend la fin du processus, sans délai ; renvoie son code.
+    pub async fn exited(&self) -> Option<i32> {
+        let mut rx = self.exit_rx.clone();
+        let code = rx.wait_for(|x| x.is_some()).await.ok().and_then(|c| *c);
+        code.flatten()
     }
 
     /// Fichier de copie du flux brut, si le journal est actif.

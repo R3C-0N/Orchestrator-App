@@ -542,7 +542,7 @@ async fn reload_detaches_then_attach_resumes_the_same_process() {
             &fake_exe(),
             &std::env::temp_dir(),
             opts(&[]),
-            Some(page1.sink()),
+            Some(state.attachment(page1.sink())),
             fast(),
         )
         .await
@@ -572,7 +572,7 @@ async fn reload_detaches_then_attach_resumes_the_same_process() {
     // Nouvelle page : rattachement.
     let page2 = Events::default();
     let t0 = Instant::now();
-    let resync = state.attach_all(page2.sink());
+    let resync = state.attach_all(state.attachment(page2.sink()));
     println!(
         "rattachement : {} session(s), {} événements en {:?}",
         resync.len(),
@@ -629,7 +629,7 @@ async fn detached_sessions_are_closed_after_the_grace_delay() {
                 &fake_exe(),
                 &std::env::temp_dir(),
                 opts(args),
-                Some(ev.sink()),
+                Some(state.attachment(ev.sink())),
                 fast(),
             )
             .await
@@ -672,7 +672,7 @@ async fn attach_within_the_delay_keeps_the_session() {
             &fake_exe(),
             &std::env::temp_dir(),
             opts(&[]),
-            Some(ev.sink()),
+            Some(state.attachment(ev.sink())),
             fast(),
         )
         .await
@@ -680,7 +680,7 @@ async fn attach_within_the_delay_keeps_the_session() {
     state.close_orphans().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let page2 = Events::default();
-    assert_eq!(state.attach_all(page2.sink()).len(), 1);
+    assert_eq!(state.attach_all(state.attachment(page2.sink())).len(), 1);
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(state.sessions.lock().unwrap().len(), 1);
     assert!(alive(s.pid) && s.is_running());
@@ -694,7 +694,7 @@ async fn attach_within_the_delay_keeps_the_session() {
 async fn improve_session_reports_to_the_attached_page() {
     let state = AppState::new(std::env::temp_dir());
     let page = Events::default();
-    assert!(state.attach_all(page.sink()).is_empty());
+    assert!(state.attach_all(state.attachment(page.sink())).is_empty());
     assert!(state.main_idle(), "aucune session principale");
 
     let main_ev = Events::default();
@@ -704,7 +704,7 @@ async fn improve_session_reports_to_the_attached_page() {
             &fake_exe(),
             &std::env::temp_dir(),
             opts(&["--fake-interrupt-no-result"]),
-            Some(main_ev.sink()),
+            Some(state.attachment(main_ev.sink())),
             fast(),
         )
         .await
@@ -753,7 +753,7 @@ async fn improve_session_reports_to_the_attached_page() {
     // démarrage.
     state.close_orphans().await;
     let page2 = Events::default();
-    let resync = state.attach_all(page2.sink());
+    let resync = state.attach_all(state.attachment(page2.sink()));
     let roles: Vec<SessionRole> = resync.iter().map(|r| r.role).collect();
     assert_eq!(roles, vec![SessionRole::Main, SessionRole::Improve]);
     assert_eq!(
@@ -782,4 +782,123 @@ async fn close_session_removes_one_session() {
     assert_eq!(info.code, Some(0));
     assert!(state.close_session(&key).await.is_none(), "déjà retirée");
     assert!(!alive(a.pid));
+}
+
+async fn wait_gone(state: &AppState, pids: &[u32], within: Duration) -> Duration {
+    let t0 = Instant::now();
+    while !state.sessions.lock().unwrap().is_empty() || pids.iter().any(|p| alive(*p)) {
+        assert!(
+            t0.elapsed() < within,
+            "sessions encore là : {} dans la table, vivantes {:?}",
+            state.sessions.lock().unwrap().len(),
+            pids.iter().filter(|p| alive(**p)).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    t0.elapsed()
+}
+
+/// Relecture de 9d91aea, bloquant 1 : un canal qui refuse les lots sans
+/// changement de génération (fenêtre fermée sans rechargement), partagé par
+/// plusieurs sessions : toutes sont fermées après le délai.
+#[tokio::test]
+async fn refused_channel_closes_all_its_sessions_after_the_delay() {
+    let mut state = AppState::new(std::env::temp_dir());
+    state.detach_grace = Duration::from_millis(500);
+    let refused: Sink = Arc::new(|_| false);
+    let mut pids = Vec::new();
+    for _ in 0..3 {
+        let s = state
+            .spawn_session(
+                SessionRole::Main,
+                &fake_exe(),
+                &std::env::temp_dir(),
+                opts(&[]),
+                Some(state.attachment(refused.clone())),
+                fast(),
+            )
+            .await
+            .unwrap();
+        pids.push(s.pid);
+    }
+    assert_eq!(state.page_gen(), 0, "aucun rechargement");
+    let took = wait_gone(&state, &pids, Duration::from_secs(10)).await;
+    println!("canal refusé : 3 sessions fermées en {took:?}");
+}
+
+/// Relecture de 9d91aea, bloquant 2 : une session `Improve` lancée sans page
+/// rattachée est fermée après le délai si aucune page ne s'y rattache.
+#[tokio::test]
+async fn never_attached_improve_is_closed_after_the_delay() {
+    let mut state = AppState::new(std::env::temp_dir());
+    state.detach_grace = Duration::from_millis(500);
+    let imp = state
+        .start_improve_with(
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "améliore",
+            opts(&["--fake-ignore-stdin-eof"]),
+            fast(),
+        )
+        .await
+        .unwrap();
+    assert!(!imp.outlet().is_attached());
+    assert!(
+        imp.outlet().detached_for().is_some(),
+        "compte comme détachée"
+    );
+    let took = wait_gone(&state, &[imp.pid], Duration::from_secs(10)).await;
+    println!("amélioration sans page : fermée en {took:?}");
+    assert_eq!(imp.turns(), 1, "son tour a eu lieu (journal)");
+}
+
+/// Une session `Improve` sort de la table à la fin de son processus, même
+/// sans `close_session`. Une session morte est rendue une fois par
+/// `attach_all`, puis retirée.
+#[tokio::test]
+async fn dead_sessions_leave_the_table() {
+    let state = AppState::new(std::env::temp_dir());
+    let page = Events::default();
+    state.attach_all(state.attachment(page.sink()));
+    let imp = state
+        .start_improve_with(
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "améliore",
+            opts(&["--fake-mode", "die-mid-turn"]),
+            fast(),
+        )
+        .await
+        .unwrap();
+    wait_gone(&state, &[imp.pid], Duration::from_secs(10)).await;
+    assert_eq!(
+        imp.wait_turn_end(0, Duration::from_secs(1)).await,
+        TurnWait::Exited
+    );
+
+    let ev = Events::default();
+    let main = state
+        .spawn_session(
+            SessionRole::Main,
+            &fake_exe(),
+            &std::env::temp_dir(),
+            opts(&["--fake-mode", "die-mid-turn"]),
+            Some(state.attachment(ev.sink())),
+            fast(),
+        )
+        .await
+        .unwrap();
+    main.send_message("x").unwrap();
+    assert!(main.wait_exit(Duration::from_secs(10)).await.is_some());
+    state.close_orphans().await;
+    let first = state.attach_all(state.attachment(Events::default().sink()));
+    assert_eq!(first.len(), 1);
+    assert!(!first[0].running);
+    assert!(first[0].events.iter().any(|e| is_exited(&e.body)));
+    state.close_orphans().await;
+    let second = state.attach_all(state.attachment(Events::default().sink()));
+    assert!(
+        second.is_empty(),
+        "journal d'une session morte rendu une seule fois"
+    );
 }

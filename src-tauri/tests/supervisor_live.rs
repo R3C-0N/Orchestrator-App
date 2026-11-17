@@ -69,7 +69,7 @@ async fn live_reload_keeps_the_process_then_closes_it_without_page() {
                 model: Some("haiku".into()),
                 extra_args: vec!["--no-session-persistence".into()],
             },
-            Some(sink),
+            Some(state.attachment(sink)),
             SessionConfig::default(),
         )
         .await
@@ -85,7 +85,7 @@ async fn live_reload_keeps_the_process_then_closes_it_without_page() {
     assert!(alive(s.pid), "claude.exe survit au rechargement");
 
     // La nouvelle page se rattache : même session, même pid, journal sans trou.
-    let resync = state.attach_all(Arc::new(|_| true));
+    let resync = state.attach_all(state.attachment(Arc::new(|_| true)));
     assert_eq!(resync.len(), 1);
     assert_eq!(resync[0].pid, s.pid);
     assert!(resync[0].running);
