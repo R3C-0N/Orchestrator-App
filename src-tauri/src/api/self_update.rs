@@ -143,6 +143,33 @@ pub fn ui_contract_matches(dir: &Path, contract: &str) -> bool {
     walk(dir, contract, 0)
 }
 
+/// Démarrage : la version d'interface active a été construite pour un autre
+/// contrat que celui de l'exe (exe recompilé et réinstallé après une
+/// « relance requise », par exemple) ; elle appellerait des commandes
+/// absentes ou changées. On la quitte, sans la marquer fautive, pour la
+/// précédente compatible, sinon l'interface embarquée. À appeler avant
+/// `install_assets`. Renvoie les versions quittées.
+pub fn leave_incompatible_ui(ui: &UiHost, contract: &str) -> Vec<String> {
+    let mut left = Vec::new();
+    for _ in 0..crate::ui::KEEP_RECENT + 2 {
+        let Some(h) = ui.store().read_pointer().active else {
+            break;
+        };
+        if ui_contract_matches(&ui.store().version_dir(&h), contract) {
+            break;
+        }
+        tracing::warn!(
+            "interface {h} construite pour un autre contrat que celui de l'exe ({contract}) : \
+             non servie"
+        );
+        if ui.step_back().is_err() {
+            break;
+        }
+        left.push(h);
+    }
+    left
+}
+
 /// Supprime les verrous de build `<hash>.lock` laissés par un arrêt brutal
 /// (aucun build ne tourne au démarrage) ; sans cela, `build_lock` du même
 /// hash échouerait et le `.tmp` resterait protégé du nettoyage. Renvoie le
@@ -671,6 +698,45 @@ mod tests {
         std::fs::write(d.join("assets/index-x.js"), "c=\"0123456789abcdef`").unwrap();
         assert!(!ui_contract_matches(&d, "0123456789abcdef"));
         assert!(!ui_contract_matches(&d, "fedcba9876543210"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn active_ui_of_another_contract_is_left_at_startup() {
+        let d = std::env::temp_dir().join(format!("orch-leave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let build = |name: &str, contract: &str| {
+            let b = d.join("builds").join(name);
+            std::fs::create_dir_all(b.join("assets")).unwrap();
+            std::fs::write(b.join("index.html"), "<!doctype html>").unwrap();
+            std::fs::write(b.join("assets/i.js"), format!("Ze=`{contract}`")).unwrap();
+            b
+        };
+        let ui = UiHost::new(d.join("ui"));
+        ui.install("aaaaaaa", &build("a", "1111111111111111"))
+            .unwrap();
+        ui.switch_to("aaaaaaa").unwrap();
+        ui.install("bbbbbbb", &build("b", "2222222222222222"))
+            .unwrap();
+        ui.switch_to("bbbbbbb").unwrap();
+        // Contrat de l'exe = celui de « aaaaaaa » : « bbbbbbb » est quittée.
+        let fresh = UiHost::new(d.join("ui"));
+        assert_eq!(
+            leave_incompatible_ui(&fresh, "1111111111111111"),
+            vec!["bbbbbbb".to_string()]
+        );
+        assert_eq!(
+            fresh.store().read_pointer().active.as_deref(),
+            Some("aaaaaaa")
+        );
+        assert!(fresh.store().read_state().bad.is_empty(), "pas fautive");
+        // Aucun compatible : interface embarquée.
+        assert_eq!(
+            leave_incompatible_ui(&fresh, "3333333333333333"),
+            vec!["aaaaaaa".to_string()]
+        );
+        assert_eq!(fresh.store().read_pointer().active, None);
+        assert!(leave_incompatible_ui(&fresh, "3333333333333333").is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 

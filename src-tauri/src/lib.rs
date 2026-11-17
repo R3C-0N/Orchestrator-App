@@ -40,6 +40,9 @@ pub fn run() {
     );
     // Verrous de build laissés par un arrêt brutal : aucun build ne tourne.
     self_update::clear_orphan_build_locks(ui.root());
+    // Version active construite pour un autre contrat (exe réinstallé) :
+    // jamais servie, retour à une compatible ou à l'embarquée.
+    self_update::leave_incompatible_ui(&ui, build_info::CONTRACT);
     ui.install_assets(&mut context);
 
     let app = tauri::Builder::default()
