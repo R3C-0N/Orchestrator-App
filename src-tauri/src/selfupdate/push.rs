@@ -292,6 +292,7 @@ pub async fn check_write_access(
     clone: &Path,
     url: &str,
     canonical: &str,
+    env: &PushEnv,
     timeout: Duration,
 ) -> Result<(), CheckError> {
     super::repo::check_url(url).map_err(CheckError::Refused)?;
@@ -304,7 +305,7 @@ pub async fn check_write_access(
     let probe = format!("{commit}:{PROBE_PREFIX}{}", uuid::Uuid::new_v4().simple());
     let mut args: Vec<&str> = PUSH_CONFIG.to_vec();
     args.extend(["push", "--dry-run", "--porcelain", "--", url, &probe]);
-    match git_timeout_out(clone, &args, timeout).await {
+    match git_timeout_out(env, clone, &args, timeout).await {
         Ok(()) => Ok(()),
         Err(e) if is_denied(&e) => Err(CheckError::Denied(format!(
             "pas de droit d'écriture sur {url} : {}",
@@ -317,10 +318,17 @@ pub async fn check_write_access(
     }
 }
 
-/// `git -C dir args` dans le délai ; `Err` : sortie et erreur de git.
-async fn git_timeout_out(dir: &Path, args: &[&str], timeout: Duration) -> Result<(), String> {
+/// `git -C dir args` de l'envoi ([`PushEnv::command`]) dans le délai ;
+/// `Err` : sortie et erreur de git.
+async fn git_timeout_out(
+    env: &PushEnv,
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<(), String> {
     let what = format!("git {}", args.join(" "));
-    let out = git::run(git::git_command(dir, args), timeout, &what).await?;
+    let cmd = env.command(dir, args)?;
+    let out = git::run(cmd, timeout, &what).await?;
     if out.ok {
         Ok(())
     } else {
@@ -336,6 +344,7 @@ pub async fn push_branch(
     clone: &Path,
     url: &str,
     canonical: &str,
+    env: &PushEnv,
     branch: &str,
     commit: &str,
     timeout: Duration,
@@ -360,9 +369,201 @@ pub async fn push_branch(
     let refspec = format!("{commit}:refs/heads/{branch}");
     let mut args: Vec<&str> = PUSH_CONFIG.to_vec();
     args.extend(["push", "--porcelain", "--", url, &refspec]);
-    git_timeout_out(clone, &args, timeout)
+    git_timeout_out(env, clone, &args, timeout)
         .await
         .map_err(|e| summarize(&e))
+}
+
+/// Variables d'environnement héritées retirées de la sonde et de l'envoi
+/// (en plus de `GIT_CONFIG_KEY_*` et `GIT_CONFIG_VALUE_*`) : configuration
+/// passée par l'environnement, ssh choisi ailleurs, dépôt imposé.
+pub const PUSH_ENV_REMOVED: &[&str] = &[
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_ALLOW_PROTOCOL",
+    "GIT_PROXY_COMMAND",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+];
+
+/// Environnement de la sonde et de l'envoi, coupé de toute configuration
+/// que la session pourrait écrire avec le compte de l'utilisateur :
+/// `~/.gitconfig` et la configuration système de git ignorés
+/// (`GIT_CONFIG_GLOBAL` = fichier vide de l'app, `GIT_CONFIG_NOSYSTEM`),
+/// `~/.ssh/config` ignoré (`ssh -F <fichier vide>`), serveur, utilisateur
+/// et port imposés, sans mandataire, clé d'hôte vérifiée (`known_hosts` de
+/// l'utilisateur). Les clés `IdentityFile` de `~/.ssh/config` qui
+/// s'appliquent à l'hôte sont relevées une fois au lancement de l'app
+/// ([`ssh_identities`]) et passées explicitement.
+#[derive(Debug, Clone)]
+pub struct PushEnv {
+    /// Dossier des fichiers vides (`empty.gitconfig`, `empty.ssh_config`).
+    pub dir: PathBuf,
+    /// Programme ssh (`ssh` ; un faux ssh dans les tests).
+    pub ssh_program: String,
+    /// Hôte du dépôt canonique (`github.com`).
+    pub host: String,
+    /// Clés relevées au lancement (vide : clés par défaut et agent ssh).
+    pub identities: Vec<PathBuf>,
+}
+
+/// Chemin pour la ligne de commande ssh (`/` au lieu de `\`).
+fn slash(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// Mot entre apostrophes pour le shell qui lance `GIT_SSH_COMMAND`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+impl PushEnv {
+    /// Commande ssh de l'envoi (valeur de `GIT_SSH_COMMAND`).
+    pub fn ssh_command(&self, ssh_config: &Path) -> String {
+        let mut parts = vec![
+            sh_quote(&self.ssh_program),
+            "-F".to_string(),
+            sh_quote(&slash(ssh_config)),
+        ];
+        let mut opts = vec![
+            format!("HostName={}", self.host),
+            "User=git".into(),
+            "Port=22".into(),
+            "ProxyCommand=none".into(),
+            "ProxyJump=none".into(),
+            "BatchMode=yes".into(),
+            "StrictHostKeyChecking=yes".into(),
+            "ConnectTimeout=20".into(),
+            "ServerAliveInterval=15".into(),
+            "ServerAliveCountMax=3".into(),
+        ];
+        if !self.identities.is_empty() {
+            opts.push("IdentitiesOnly=yes".into());
+            for id in &self.identities {
+                opts.push(format!("IdentityFile={}", slash(id)));
+            }
+        }
+        for o in opts {
+            parts.push("-o".into());
+            parts.push(sh_quote(&o));
+        }
+        parts.join(" ")
+    }
+
+    /// Commande git de la sonde et de l'envoi : celle de
+    /// [`git::git_command`] (hooks coupés, pas d'invite, `ext::` interdit ;
+    /// lancée dans un Job Object avec délai par [`git::run`]), sans
+    /// configuration globale ni système, sans variables git héritées
+    /// ([`PUSH_ENV_REMOVED`]), avec le ssh de [`PushEnv::ssh_command`] et
+    /// `safe.directory` = le clone (la configuration globale de
+    /// l'utilisateur, qui pouvait l'autoriser, n'est plus lue).
+    pub fn command(&self, clone: &Path, args: &[&str]) -> Result<tokio::process::Command, String> {
+        std::fs::create_dir_all(&self.dir).map_err(|e| format!("{} : {e}", self.dir.display()))?;
+        let global = self.dir.join("empty.gitconfig");
+        let ssh_config = self.dir.join("empty.ssh_config");
+        for f in [&global, &ssh_config] {
+            std::fs::write(f, b"").map_err(|e| format!("{} : {e}", f.display()))?;
+        }
+        let safe = format!("safe.directory={}", slash(clone));
+        let mut full: Vec<&str> = vec!["-c", &safe];
+        full.extend_from_slice(args);
+        let mut c = git::git_command(clone, &full);
+        for k in PUSH_ENV_REMOVED {
+            c.env_remove(k);
+        }
+        for (k, _) in std::env::vars_os() {
+            let k = k.to_string_lossy().to_ascii_uppercase();
+            if k.starts_with("GIT_CONFIG_KEY_") || k.starts_with("GIT_CONFIG_VALUE_") {
+                c.env_remove(&k);
+            }
+        }
+        c.env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_SSH_VARIANT", "ssh")
+            .env("GIT_SSH_COMMAND", self.ssh_command(&ssh_config));
+        Ok(c)
+    }
+}
+
+/// Motif d'hôte de `~/.ssh/config` (`*` et `?`, sans casse).
+fn host_glob(pat: &str, host: &str) -> bool {
+    fn m(p: &[u8], h: &[u8]) -> bool {
+        match (p.first(), h.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => m(&p[1..], h) || (!h.is_empty() && m(p, &h[1..])),
+            (Some(b'?'), Some(_)) => m(&p[1..], &h[1..]),
+            (Some(a), Some(b)) if a == b => m(&p[1..], &h[1..]),
+            _ => false,
+        }
+    }
+    m(
+        pat.to_ascii_lowercase().as_bytes(),
+        host.to_ascii_lowercase().as_bytes(),
+    )
+}
+
+/// Clés `IdentityFile` de `~/.ssh/config` (texte `config`) qui s'appliquent
+/// à `host` : directives globales et blocs `Host` dont un motif correspond
+/// (et aucun motif `!` exclu). Les blocs `Match` et les `Include` sont
+/// ignorés (jamais évalués : `Match exec` lancerait une commande). `~` et
+/// `%d` sont remplacés par `home` ; une valeur avec un autre `%` ou `${`
+/// est ignorée ; seuls les fichiers existants sont gardés.
+pub fn ssh_identities(config: &str, host: &str, home: &Path) -> Vec<PathBuf> {
+    let mut applies = true;
+    let mut out: Vec<PathBuf> = Vec::new();
+    for line in config.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, rest) = match line.find(|c: char| c.is_whitespace() || c == '=') {
+            Some(i) => (
+                &line[..i],
+                line[i..].trim_start_matches(|c: char| c.is_whitespace() || c == '='),
+            ),
+            None => (line, ""),
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "host" => {
+                let pats: Vec<&str> = rest.split_whitespace().collect();
+                let neg = pats
+                    .iter()
+                    .filter_map(|p| p.strip_prefix('!'))
+                    .any(|p| host_glob(p, host));
+                let pos = pats
+                    .iter()
+                    .filter(|p| !p.starts_with('!'))
+                    .any(|p| host_glob(p, host));
+                applies = pos && !neg;
+            }
+            "match" => applies = false,
+            "identityfile" if applies => {
+                let v = rest.trim().trim_matches('"');
+                let v = if let Some(r) = v.strip_prefix("~/").or_else(|| v.strip_prefix("~\\")) {
+                    home.join(r).to_string_lossy().into_owned()
+                } else {
+                    v.replace("%d", &home.to_string_lossy())
+                };
+                if v.is_empty() || v.contains('%') || v.contains("${") {
+                    continue;
+                }
+                let p = PathBuf::from(v);
+                if p.is_absolute() && p.is_file() && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Envoi en attente (échec précédent).

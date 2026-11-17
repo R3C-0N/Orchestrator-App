@@ -169,6 +169,8 @@ struct FakeHost {
     dirty: Option<(&'static str, &'static str)>,
     /// La session ne finit jamais (annulation).
     hang: bool,
+    /// La session se termine en erreur (après ses actions).
+    fail: bool,
     switch_ok: bool,
     /// Action pendant la bascule (reçoit le dossier du build).
     on_switch: Hook,
@@ -218,6 +220,9 @@ impl PipelineHost for FakeHost {
             }
             if let Some((rel, content)) = self.dirty {
                 write(cwd, rel, content);
+            }
+            if self.fail {
+                return Err(CoreError::Io("session simulée en échec".into()));
             }
             Ok(())
         })
@@ -1510,11 +1515,13 @@ use orchestrator_lib::selfupdate::push;
 const FAKE_SSH: &str = r#"#!/bin/sh
 # Faux ssh des tests d'envoi : `[options…] <hôte> <commande>`.
 [ "$1" = "-G" ] && exit 1
+all="$*"
 while [ $# -gt 2 ]; do shift; done
 host="${1#*@}"
 cmd="$2"
 dir="${0%/*}"
 printf '%s\n' "$cmd" >> "$dir/$host.log"
+printf '%s\n' "$all" >> "$dir/$host.args"
 if [ -e "$dir/$host.down" ]; then
   echo "ssh: connect to host $host port 22: Connection timed out" >&2
   exit 255
@@ -1531,7 +1538,11 @@ esac
 "#;
 
 /// Dossier du faux ssh (dans `target`, pas dans `%TEMP%`), installé une fois
-/// et branché par `GIT_SSH_COMMAND`.
+/// et branché par `GIT_SSH_COMMAND` pour les commandes git ordinaires. Une
+/// configuration git globale de test (`GIT_CONFIG_GLOBAL`, qui inclut celle
+/// de l'utilisateur) y ajoute un `pushInsteadOf` « pirate » pour le seul
+/// dépôt du test `global_git_config_cannot_redirect_the_push` : elle imite
+/// un `~/.gitconfig` modifié par une session.
 fn fake_ssh_dir() -> PathBuf {
     static ONCE: std::sync::Once = std::sync::Once::new();
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fake-ssh");
@@ -1539,12 +1550,37 @@ fn fake_ssh_dir() -> PathBuf {
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("fake-ssh.sh");
         std::fs::write(&script, FAKE_SSH).unwrap();
-        std::env::set_var(
-            "GIT_SSH_COMMAND",
-            script.to_string_lossy().replace('\\', "/"),
+        std::env::set_var("GIT_SSH_COMMAND", fake_ssh_program(&dir));
+        let pid = std::process::id();
+        let b1 = std::env::temp_dir().join(format!("orch-c-push-b1-{pid}"));
+        let slash = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
+        let user = std::env::var_os("USERPROFILE")
+            .map(|h| slash(PathBuf::from(h).join(".gitconfig")))
+            .unwrap_or_default();
+        let global = format!(
+            "[include]\n\tpath = {user}\n[url \"git@allow-pirate-{pid}:{}\"]\n\tpushInsteadOf = git@allow-b1-{pid}:{}\n",
+            slash(b1.join("pirate.git")),
+            slash(b1.join("origin.git")),
         );
+        let gpath = dir.join(format!("global-{pid}.gitconfig"));
+        std::fs::write(&gpath, global).unwrap();
+        std::env::set_var("GIT_CONFIG_GLOBAL", &gpath);
     });
     dir
+}
+
+/// Chemin du faux ssh, pour `GIT_SSH_COMMAND` ou [`Pipeline::with_ssh`].
+fn fake_ssh_program(dir: &Path) -> String {
+    dir.join("fake-ssh.sh").to_string_lossy().replace('\\', "/")
+}
+
+/// Arguments reçus par le faux ssh pour `host` (une ligne par connexion).
+fn ssh_args(host: &str) -> Vec<String> {
+    std::fs::read_to_string(fake_ssh_dir().join(format!("{host}.args")))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
 }
 
 /// Hôte `<mode>-<nom>-<pid>` du faux ssh, journal remis à zéro.
@@ -1553,6 +1589,7 @@ fn fake_host(mode: &str, name: &str) -> String {
     let host = format!("{mode}-{name}-{}", std::process::id());
     let _ = std::fs::remove_file(dir.join(format!("{host}.log")));
     let _ = std::fs::remove_file(dir.join(format!("{host}.down")));
+    let _ = std::fs::remove_file(dir.join(format!("{host}.args")));
     host
 }
 
@@ -1613,7 +1650,9 @@ fn push_pipeline(
     tc: Arc<FakeToolchain>,
 ) -> Pipeline {
     let url = cfg.url.clone();
-    pipeline(root, cfg, host, tc).with_push_origin(url)
+    pipeline(root, cfg, host, tc)
+        .with_push_origin(url)
+        .with_ssh(fake_ssh_program(&fake_ssh_dir()), None)
 }
 
 fn pushes(log: &[ImproveStatus]) -> Vec<Option<PushResult>> {
@@ -2110,6 +2149,12 @@ async fn push_branch_refuses_main_unmerged_and_bad_refspecs() {
     let (cfg, bare, c1, c2) = push_clone(&root, &host).await;
     let before = remote_refs(&bare);
     let t = Duration::from_secs(60);
+    let env = push::PushEnv {
+        dir: root.join("push-env"),
+        ssh_program: fake_ssh_program(&fake_ssh_dir()),
+        host: host.clone(),
+        identities: Vec::new(),
+    };
     for (branch, commit) in [
         ("main", c1.as_str()),
         ("auto/x:refs/heads/main", c1.as_str()),
@@ -2118,7 +2163,7 @@ async fn push_branch_refuses_main_unmerged_and_bad_refspecs() {
         // c2 n'est pas dans le main du clone (placé sur c1).
         ("auto/x", c2.as_str()),
     ] {
-        let r = push::push_branch(&cfg.dir, &cfg.url, &cfg.url, branch, commit, t).await;
+        let r = push::push_branch(&cfg.dir, &cfg.url, &cfg.url, &env, branch, commit, t).await;
         assert!(r.is_err(), "{branch} {commit}");
     }
     assert!(ssh_log(&host).is_empty(), "rien n'a joint le distant");
@@ -2360,5 +2405,233 @@ async fn session_cannot_touch_config_json_or_pending_list() {
     assert!(
         !pending.exists(),
         "fichier rétabli depuis la mémoire (vide)"
+    );
+}
+
+/// B1 : une configuration git globale modifiée (`pushInsteadOf` vers un
+/// dépôt « pirate ») détourne une commande git ordinaire (contrôle), mais
+/// ni la sonde ni l'envoi : ils ne lisent ni `~/.gitconfig` ni la
+/// configuration système. Le dépôt pirate ne reçoit que le contrôle.
+#[tokio::test]
+async fn global_git_config_cannot_redirect_the_push() {
+    let root = TempRoot::new("push-b1");
+    let host = fake_host("allow", "b1");
+    let pirate_host = fake_host("allow", "pirate");
+    let (cfg, bare, c1, _) = push_clone(&root, &host).await;
+    let pirate = root.join("pirate.git");
+    sh(&root, &["init", "-q", "--bare", &pirate.to_string_lossy()]);
+    let pirate_s = pirate.to_string_lossy().into_owned();
+
+    // Contrôle : `git push` ordinaire (environnement hérité) part au pirate.
+    let control = format!("{c1}:refs/heads/controle");
+    let out = orchestrator_lib::selfupdate::git::run(
+        orchestrator_lib::selfupdate::git::git_command(
+            &cfg.dir,
+            [
+                "push",
+                "--porcelain",
+                "--",
+                cfg.url.as_str(),
+                control.as_str(),
+            ],
+        ),
+        Duration::from_secs(60),
+        "contrôle",
+    )
+    .await
+    .unwrap();
+    assert!(out.ok, "{}", out.tail(6));
+    assert_eq!(
+        remote_refs(&pirate_s),
+        vec![("refs/heads/controle".to_string(), c1.clone())],
+        "le contrôle doit être détourné (sinon le test ne prouve rien)"
+    );
+    assert_eq!(ssh_log(&pirate_host).len(), 1);
+    let before = remote_refs(&bare);
+
+    // Sonde et envoi du pipeline : vers le bon dépôt seulement.
+    let p = push_pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(success_host(vec![commit_src(
+            vec![("src/a.txt", "a\n")],
+            "a",
+        )])),
+        Arc::new(FakeToolchain::new()),
+    );
+    assert!(matches!(
+        p.enable_push(true).await,
+        PushStatus::Enabled { .. }
+    ));
+    let req = p.request("a").unwrap();
+    let (sink, statuses) = collector();
+    let out = p.run(req.clone(), sink).await.unwrap();
+    let ImproveOutcome::Merged { commit } = out else {
+        panic!("{out:?}")
+    };
+    let last = statuses.lock().unwrap().last().unwrap().clone();
+    assert!(
+        matches!(last.push, Some(PushResult::Pushed { .. })),
+        "{:?}",
+        last.push
+    );
+    let mut want = before.clone();
+    want.push((format!("refs/heads/{}", req.branch), commit));
+    want.sort();
+    assert_eq!(remote_refs(&bare), want, "envoi au bon dépôt");
+    assert_eq!(
+        remote_refs(&pirate_s),
+        vec![("refs/heads/controle".to_string(), c1)],
+        "rien d'autre chez le pirate"
+    );
+    assert_eq!(
+        ssh_log(&pirate_host).len(),
+        1,
+        "aucune connexion de l'envoi"
+    );
+}
+
+/// B2 : ssh de l'envoi lancé sans `~/.ssh/config` (`-F` fichier vide), avec
+/// serveur, utilisateur, port imposés, sans mandataire, clé d'hôte
+/// vérifiée ; les `IdentityFile` relevés au lancement sont passés.
+#[tokio::test]
+async fn push_ssh_ignores_user_ssh_config_but_keeps_identity() {
+    let root = TempRoot::new("push-b2");
+    let host = fake_host("allow", "b2");
+    let (cfg, _, _, _) = push_clone(&root, &host).await;
+    let key = root.join("id_test");
+    std::fs::write(&key, "clé de test").unwrap();
+    let key_s = key.to_string_lossy().replace('\\', "/");
+    let ssh_config = format!(
+        "Host autre\n  IdentityFile {}/autre\nHost allow-*\n  HostName pirate.example\n  ProxyCommand calc.exe\n  IdentityFile \"{key_s}\"\n",
+        root.to_string_lossy().replace('\\', "/")
+    );
+    let p = push_pipeline(
+        &root,
+        cfg.clone(),
+        Arc::new(FakeHost::default()),
+        Arc::new(FakeToolchain::new()),
+    )
+    .with_ssh(fake_ssh_program(&fake_ssh_dir()), Some(ssh_config));
+    assert!(matches!(
+        p.enable_push(true).await,
+        PushStatus::Enabled { .. }
+    ));
+    let args = ssh_args(&host);
+    assert_eq!(args.len(), 1, "{args:?}");
+    let a = &args[0];
+    let empty = root
+        .join("work")
+        .join(".push-env")
+        .join("empty.ssh_config")
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(a.contains(&format!("-F {empty}")), "{a}");
+    for o in [
+        format!("HostName={host}"),
+        "User=git".into(),
+        "Port=22".into(),
+        "ProxyCommand=none".into(),
+        "ProxyJump=none".into(),
+        "BatchMode=yes".into(),
+        "StrictHostKeyChecking=yes".into(),
+        "IdentitiesOnly=yes".into(),
+        format!("IdentityFile={key_s}"),
+    ] {
+        assert!(a.contains(&format!("-o {o}")), "{o} absent de : {a}");
+    }
+    assert!(
+        !a.contains("pirate.example") && !a.contains("calc.exe"),
+        "{a}"
+    );
+    assert!(!a.contains("/autre"), "{a}");
+    assert_eq!(
+        std::fs::read(root.join("work/.push-env/empty.ssh_config")).unwrap(),
+        b""
+    );
+}
+
+#[test]
+fn ssh_identities_from_user_config() {
+    let root = TempRoot::new("ssh-ids");
+    let home = root.to_path_buf();
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    for f in ["global", "gh", "star", "tilde", "pct"] {
+        std::fs::write(home.join(".ssh").join(f), "").unwrap();
+    }
+    let h = home.to_string_lossy().replace('\\', "/");
+    let config = format!(
+        "IdentityFile {h}/.ssh/global\n\
+         Host github.com\n  IdentityFile={h}/.ssh/gh\n  IdentityFile {h}/.ssh/absent\n\
+         Host *.com !gitlab.com\n  IdentityFile \"{h}/.ssh/star\"\n\
+         Host gitlab.com\n  IdentityFile {h}/.ssh/autre\n\
+         Match exec \"calc.exe\"\n  IdentityFile {h}/.ssh/pct\n\
+         Host GITHUB.COM\n  IdentityFile ~/.ssh/tilde\n  IdentityFile %d/.ssh/pct\n  IdentityFile ~/.ssh/%h\n"
+    );
+    let ids = push::ssh_identities(&config, "github.com", &home);
+    let names: Vec<String> = ids
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["global", "gh", "star", "tilde", "pct"]);
+    let ids = push::ssh_identities(&config, "gitlab.com", &home);
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert!(push::ssh_identities("", "github.com", &home).is_empty());
+}
+
+/// C1 et C3 : les fichiers de l'app sont rétablis même si la session échoue
+/// ; un `push-pending.json` illisible au démarrage est réécrit tout de
+/// suite (pas de refus à tort). C2 : `config.json` déjà changé avant la
+/// session : échec immédiat, sans session.
+#[tokio::test]
+async fn app_files_restored_on_failed_session_and_checked_before() {
+    let root = TempRoot::new("push-files2");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    let pending = root.join("work").join(push::PENDING_FILE);
+    std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+    std::fs::write(&pending, "pas du json").unwrap();
+    let forged = pending.clone();
+    let host = Arc::new(FakeHost {
+        commits: vec![commit_src(vec![("src/a.txt", "a\n")], "a")],
+        extra: Some(Box::new(move |_wt| {
+            std::fs::write(
+                &forged,
+                r#"[{ "branch": "auto/pirate", "commit": "0123456789012345678901234567890123456789" }]"#,
+            )
+            .unwrap();
+        })),
+        fail: true,
+        switch_ok: true,
+        ..Default::default()
+    });
+    let p = pipeline(
+        &root,
+        cfg.clone(),
+        host.clone(),
+        Arc::new(FakeToolchain::new()),
+    );
+    assert!(!pending.exists(), "fichier illisible réécrit au démarrage");
+    let (out, _) = run(&p, "liste").await;
+    assert_refused(&out, "push-pending.json");
+    assert_refused(&out, "session simulée en échec");
+    assert!(!pending.exists(), "rétabli");
+    assert!(p.pending_pushes().is_empty());
+    assert_eq!(main_of(&cfg), c1);
+
+    // config.json changé avant le cycle : refus avant la session.
+    std::fs::write(root.join("config.json"), "{}").unwrap();
+    let prompts = host.prompts.lock().unwrap().len();
+    let (out, _) = run(&p, "config").await;
+    match out {
+        ImproveOutcome::Failed {
+            step: ImproveStep::Preparing,
+            reason,
+        } => assert!(reason.contains("config.json"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        host.prompts.lock().unwrap().len(),
+        prompts,
+        "pas de session"
     );
 }

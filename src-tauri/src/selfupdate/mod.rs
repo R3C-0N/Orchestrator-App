@@ -187,6 +187,30 @@ pub struct Pipeline {
     /// absent) : une session qui le modifie fait refuser le cycle.
     config_file: Option<PathBuf>,
     config_digest: Option<Vec<u8>>,
+    /// Programme ssh de l'envoi (`ssh` ; faux ssh dans les tests).
+    ssh_program: String,
+    /// `~/.ssh/config` lu une seule fois au lancement (clés `IdentityFile`
+    /// de l'envoi, [`push::ssh_identities`]).
+    ssh_config_text: Option<String>,
+}
+
+/// Envois en attente relus depuis `file` ; illisible : réécrit aussitôt
+/// depuis une liste vide (sinon le contrôle d'après session le prendrait
+/// pour une modification de la session).
+fn load_pending(file: &push::PendingFile) -> Vec<push::Pending> {
+    match file.read() {
+        Some(v) => v,
+        None => {
+            tracing::warn!("{} illisible : remis à vide", file.0.display());
+            file.write(&[]);
+            Vec::new()
+        }
+    }
+}
+
+/// `%USERPROFILE%`.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").map(PathBuf::from)
 }
 
 /// SHA-256 d'un fichier, `None` s'il est absent ou illisible.
@@ -201,9 +225,9 @@ impl Pipeline {
         let config_file = config_path();
         let config_digest = config_file.as_deref().and_then(file_digest);
         let work_root = data.join("work");
-        let pending = push::PendingFile(work_root.join(push::PENDING_FILE))
-            .read()
-            .unwrap_or_default();
+        let pending = load_pending(&push::PendingFile(work_root.join(push::PENDING_FILE)));
+        let ssh_config_text =
+            home_dir().and_then(|h| std::fs::read_to_string(h.join(".ssh").join("config")).ok());
         Pipeline {
             repo,
             host,
@@ -220,6 +244,8 @@ impl Pipeline {
             pending: Mutex::new(pending),
             config_file,
             config_digest,
+            ssh_program: "ssh".into(),
+            ssh_config_text,
         }
     }
 
@@ -234,7 +260,7 @@ impl Pipeline {
     pub fn with_dirs(mut self, work_root: PathBuf, ui_root: PathBuf) -> Self {
         self.work_root = work_root;
         self.ui_root = ui_root;
-        let pending = self.pending_file().read().unwrap_or_default();
+        let pending = load_pending(&self.pending_file());
         self.pending = Mutex::new(pending);
         self
     }
@@ -249,6 +275,30 @@ impl Pipeline {
     pub fn with_push_origin(mut self, url: impl Into<String>) -> Self {
         self.push_origin = url.into();
         self
+    }
+
+    /// Remplace le programme ssh de l'envoi et `~/.ssh/config` (tests).
+    pub fn with_ssh(mut self, program: impl Into<String>, config_text: Option<String>) -> Self {
+        self.ssh_program = program.into();
+        self.ssh_config_text = config_text;
+        self
+    }
+
+    /// Environnement de la sonde et de l'envoi ([`push::PushEnv`]).
+    pub fn push_env(&self) -> push::PushEnv {
+        let host = push::ssh_repo_key(&self.push_origin)
+            .map(|(h, _)| h)
+            .unwrap_or_default();
+        let identities = match (&self.ssh_config_text, home_dir()) {
+            (Some(text), Some(home)) => push::ssh_identities(text, &host, &home),
+            _ => Vec::new(),
+        };
+        push::PushEnv {
+            dir: self.work_root.join(".push-env"),
+            ssh_program: self.ssh_program.clone(),
+            host,
+            identities,
+        }
     }
 
     /// Remplace `config.json` (tests) ; son empreinte est relevée ici.
@@ -355,6 +405,7 @@ impl Pipeline {
                 &self.repo.dir,
                 &self.repo.url,
                 &self.push_origin,
+                &self.push_env(),
                 timeout,
             )
             .await
@@ -407,6 +458,7 @@ impl Pipeline {
                 &self.repo.dir,
                 &url,
                 &self.push_origin,
+                &self.push_env(),
                 &p.branch,
                 &p.commit,
                 push::PUSH_TIMEOUT,
@@ -459,6 +511,14 @@ impl Pipeline {
     /// `push-pending.json` identique à la liste en mémoire (sinon il est
     /// réécrit depuis la mémoire). `Err` : raison lisible.
     pub(crate) fn check_app_files(&self) -> Result<(), String> {
+        // Liste rétablie d'abord, même si `config.json` fait aussi refuser.
+        let pending = self.check_pending_file();
+        self.check_config_file()?;
+        pending
+    }
+
+    /// `config.json` identique à son état au lancement de l'app.
+    pub(crate) fn check_config_file(&self) -> Result<(), String> {
         if let Some(cfg) = &self.config_file {
             if file_digest(cfg) != self.config_digest {
                 return Err(format!(
@@ -468,6 +528,12 @@ impl Pipeline {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// `push-pending.json` identique à la liste en mémoire, sinon réécrit
+    /// depuis elle.
+    fn check_pending_file(&self) -> Result<(), String> {
         let mem = self.pending_pushes();
         if self.pending_file().read().as_ref() != Some(&mem) {
             self.pending_file().write(&mem);

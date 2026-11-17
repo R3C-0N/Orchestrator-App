@@ -809,6 +809,7 @@ impl Pipeline {
                     &self.repo.dir,
                     &url,
                     &self.push_origin,
+                    &self.push_env(),
                     branch,
                     commit,
                     push::PUSH_TIMEOUT,
@@ -908,6 +909,9 @@ impl Pipeline {
 
         // --- Session dédiée.
         if let Mode::Improve = mode {
+            // `config.json` déjà changé depuis le lancement : échec immédiat.
+            self.check_config_file()
+                .map_err(|e| Stop::Failed(S::Preparing, e))?;
             rep.emit(S::Working, None);
             let prompt = build_prompt(&wt, req);
             // `.git/config` en lecture seule pendant la session (rétabli à la
@@ -925,11 +929,23 @@ impl Pipeline {
             self.host.session_stopped().await;
             drop(ro);
             drop(lock);
-            done?.map_err(|e| Stop::Failed(S::Working, e.to_string()))?;
             // Fichiers de l'app atteignables par la session (`config.json`,
-            // envois en attente) : inchangés, sinon cycle refusé.
-            self.check_app_files()
-                .map_err(|e| Stop::Failed(S::Checking, e))?;
+            // envois en attente) : contrôlés et rétablis après l'arrêt de la
+            // session, qu'elle ait abouti, échoué ou été annulée.
+            match (done, self.check_app_files()) {
+                // Annulée : fichiers rétablis, annulation rapportée.
+                (Err(stop), files) => {
+                    if let Err(e) = files {
+                        tracing::warn!("après la session annulée : {e}");
+                    }
+                    return Err(stop);
+                }
+                (Ok(Ok(())), Err(e)) => return Err(Stop::Failed(S::Checking, e)),
+                (Ok(Err(se)), Err(e)) => {
+                    return Err(Stop::Failed(S::Checking, format!("{e} ; session : {se}")))
+                }
+                (Ok(r), Ok(())) => r.map_err(|e| Stop::Failed(S::Working, e.to_string()))?,
+            }
         }
 
         // --- Contrôles déterministes.
