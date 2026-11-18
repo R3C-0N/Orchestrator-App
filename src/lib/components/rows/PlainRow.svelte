@@ -17,7 +17,7 @@
 
 <style>
   .warn {
-    color: #c19c00;
+    color: var(--warn);
   }
   .plain {
     color: var(--t-dim);

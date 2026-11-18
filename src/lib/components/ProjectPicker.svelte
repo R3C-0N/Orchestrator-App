@@ -152,7 +152,7 @@
     color: var(--t-dim);
   }
   .rule {
-    border-top: 1px solid #555;
+    border-top: 1px solid var(--rule);
     margin: 2px 0;
   }
   ul {
@@ -183,7 +183,8 @@
   }
   li.gone .path,
   li.gone .info {
-    color: #5a5a5a;
+    /* Plus éteint que `--t-dim`, dans les deux thèmes. */
+    color: var(--t-rule-detail);
   }
   li.gone .path {
     text-decoration: line-through;

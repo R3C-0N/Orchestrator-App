@@ -1,51 +1,181 @@
-/* Police du terminal de référence (Windows Terminal, Cascadia Mono 12 pt),
-   embarquée pour un rendu identique sur toute machine (licence OFL :
-   src/assets/fonts/CascadiaMono-LICENSE.txt). Police variable (graisse
-   200 à 700). Les glyphes absents (⎿, ✻, ✽…) passent par la police de
-   secours du système, comme dans le terminal. */
+/* Police de l'interface : JetBrains Mono (maquette « Orchestrator », J15),
+   embarquée pour un rendu identique sur toute machine, sans réseau (licence
+   OFL : src/assets/fonts/JetBrainsMono-LICENSE.txt). Polices variables
+   (graisse 100 à 800). Les glyphes absents (⎿, ✻, ✽…) passent par la police
+   de secours du système. */
 @font-face {
-  font-family: "Cascadia Mono";
-  src: url("./assets/fonts/CascadiaMono.woff2") format("woff2");
-  font-weight: 200 700;
+  font-family: "JetBrains Mono";
+  src: url("./assets/fonts/JetBrainsMono.woff2") format("woff2");
+  font-weight: 100 800;
   font-style: normal;
   font-display: block;
 }
 @font-face {
-  font-family: "Cascadia Mono";
-  src: url("./assets/fonts/CascadiaMonoItalic.woff2") format("woff2");
-  font-weight: 200 700;
+  font-family: "JetBrains Mono";
+  src: url("./assets/fonts/JetBrainsMonoItalic.woff2") format("woff2");
+  font-weight: 100 800;
   font-style: italic;
   font-display: block;
 }
 
+/* Palette de la maquette « Orchestrator » : thème sombre par défaut (`:root`),
+   thème clair sous `:root[data-theme="light"]` (plus bas). Le thème est posé
+   par `state/theme.svelte.ts` (bouton Clair/Sombre de la barre d'état, choix
+   gardé dans le `localStorage`). Toute variable ajoutée ici doit l'être aussi
+   dans le bloc clair. */
 :root {
-  --bg: #18181b;
-  --fg: #e4e4e7;
-  --dim: #8b8b93;
-  --accent: #d97757;
-  --warn: #e5c07b;
-  --error: #e06c75;
-  --line: #2e2e33;
+  --bg: #161616;
+  --surface: #202020;
+  --bar: #101010;
+  --fg: #d4d4d2;
+  --strong: #f5f5f3;
+  --dim: #8c8c88;
+  --muted: #a5a5a1;
+  --code: #9ccfd8;
+  --ok: #9bd17f;
+  --danger: #ff7f86;
+  --warn: #f2c26b;
+  --warn-bg: #2a2316;
+  --tree: #3a3a3a;
+  --rule: #2c2c2c;
+  --thumb: #3a3a3a;
+  --on-accent: #161616;
+  /* Texte des pastilles d'agent (fonds pastel) : foncé dans les deux thèmes. */
+  --on-agent: #161616;
+  --accent: #8fe3ff;
+  --accent-grad: radial-gradient(circle at 18% 22%, #e0f7ff 0%, #8fe3ff 35%, #a7a3ff 70%, #ff9fd8 100%);
+  /* Anciens noms, gardés pour les composants qui les lisent. */
+  --error: var(--danger);
+  --line: var(--rule);
 
-  /* Terminal de référence : TUI 2.1.325, thème dark, jeu Campbell (J1).
-     Valeurs relevées sur les pixels des captures ; voir render/colors.ts. */
-  --t-bg: #0c0c0c;
-  --t-fg: #cccccc;
-  --t-bold: #f2f2f2;
-  --t-white: #ffffff;
-  --t-dim: #999999;
-  --t-band: #373737;
-  --t-lavender: #b1b9f9;
-  --t-ok: #4eba65;
-  --t-error: #ff6b80;
-  --t-spinner: #d77757;
-  --t-spinner-text: #df8666;
-  --t-rule: #888888;
-  --t-rule-detail: #666666;
+  /* Variables de la conversation (`--t-*`) : mêmes rôles qu'au prototype 1
+     (relevés sur le TUI), valeurs de la maquette. Voir render/colors.ts. */
+  --t-bg: var(--bg);
+  --t-fg: var(--fg);
+  --t-bold: var(--strong);
+  --t-white: var(--strong);
+  --t-dim: var(--dim);
+  --t-band: var(--surface);
+  --t-lavender: var(--code);
+  --t-ok: var(--ok);
+  --t-error: var(--danger);
+  --t-spinner: var(--accent);
+  --t-spinner-text: var(--muted);
+  --t-rule: var(--tree);
+  --t-rule-detail: #6a6a66;
   /* Grille : une ligne de texte par ligne de grille. */
-  --t-font-size: 16px;
-  --t-lh: 19px;
+  --t-font-size: 14px;
+  --t-lh: 20px;
+
+  /* Fond d'un bandeau d'erreur (rouge très sombre). */
+  --danger-bg: #2a1618;
+  /* Modes de permission de la ligne d'état (`StatusLine`, thème `dark` du TUI). */
+  --mode-auto: #ffc107;
+  --mode-accept: #af87ff;
+  --mode-plan: #48968c;
+  /* Diffs d'un Edit (`EditDiff`, `04`) : numéros, fonds et signes des lignes
+     supprimées / ajoutées, fonds plus soutenus des mots changés. */
+  --diff-no: #7c7c79;
+  --diff-del-bg: #3d0100;
+  --diff-del-fg: #dc5a5a;
+  --diff-del-word: #5c0200;
+  --diff-add-bg: #022800;
+  --diff-add-fg: #50c850;
+  --diff-add-word: #044700;
+  /* Coloration des blocs de code (`.hl-ansi`, ANSI Campbell, `02`). */
+  --hl-ansi-keyword: #0037da;
+  --hl-ansi-title: #c19c00;
+  --hl-ansi-string: #c50f1f;
+  --hl-ansi-builtin: #3a96dd;
+  --hl-ansi-number: #13a10e;
+  --hl-ansi-comment: #767676;
+  --hl-ansi-meta: #881798;
+  /* Coloration des diffs (`.hl-diff`, couleurs vraies, `04`). */
+  --hl-diff-fg: #f8f8f2;
+  --hl-diff-keyword: #f92672;
+  --hl-diff-string: #e6db74;
+  --hl-diff-number: #be84ff;
+  --hl-diff-title: #a6e22e;
+  --hl-diff-builtin: #66d9ef;
+  --hl-diff-comment: #75715e;
   color-scheme: dark;
+}
+
+/* Thème clair de la maquette : mêmes rôles, valeurs claires. Les alias
+   (`--error`, `--line`, `--t-*` sauf `--t-rule-detail`) suivent seuls. Les
+   couleurs de coloration et de diff n'ont pas de mesure de référence : elles
+   reprennent les teintes du thème sombre, assombries pour rester lisibles
+   sur fond clair. */
+:root[data-theme="light"] {
+  --bg: #f6f6f4;
+  --surface: #eaeae6;
+  --bar: #ececea;
+  --fg: #2a2a28;
+  --strong: #000000;
+  --dim: #64645f;
+  --muted: #4f4f4b;
+  --code: #1d6f8a;
+  --ok: #2f8a3c;
+  --danger: #c4283a;
+  --warn: #9a5b00;
+  --warn-bg: #f6e7cf;
+  --tree: #c6c6c0;
+  --rule: #dadad5;
+  --thumb: #c6c6c0;
+  --on-accent: #ffffff;
+  --accent: #2367c0;
+  --accent-grad: radial-gradient(circle at 18% 22%, #1b8fc0 0%, #2367c0 35%, #5a3fd0 70%, #b0306c 100%);
+  --t-rule-detail: #a8a8a2;
+
+  --danger-bg: #f9e1e3;
+  --mode-auto: #9a5b00;
+  --mode-accept: #6a3fc8;
+  --mode-plan: #2b7368;
+  --diff-no: #8a8a85;
+  --diff-del-bg: #fbe1e1;
+  --diff-del-fg: #c4283a;
+  --diff-del-word: #f4bcbc;
+  --diff-add-bg: #e0f3dc;
+  --diff-add-fg: #2f8a3c;
+  --diff-add-word: #b9e4b0;
+  --hl-ansi-keyword: #0037da;
+  --hl-ansi-title: #7d6400;
+  --hl-ansi-string: #b00d1b;
+  --hl-ansi-builtin: #1a6aa8;
+  --hl-ansi-number: #0b7a08;
+  --hl-ansi-comment: #6b6b67;
+  --hl-ansi-meta: #881798;
+  --hl-diff-fg: #2a2a28;
+  --hl-diff-keyword: #c0185a;
+  --hl-diff-string: #7d6400;
+  --hl-diff-number: #6a3fc8;
+  --hl-diff-title: #3f7a00;
+  --hl-diff-builtin: #0b7290;
+  --hl-diff-comment: #6b6852;
+  color-scheme: light;
+}
+
+/* Glyphes de l'accent (❯ ● ✻ ⎿) : texte peint par le dégradé. */
+.grad {
+  background: var(--accent-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Barres de défilement fines, comme la maquette. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--thumb);
+  border: 3px solid var(--bg);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 * {
@@ -58,7 +188,7 @@ body {
   height: 100%;
   background: var(--t-bg);
   color: var(--fg);
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, monospace;
   font-size: 14px;
 }
 
@@ -69,7 +199,7 @@ body {
 /* ---- Conversation « terminal » (plan 1.7) ------------------------------ */
 
 .term {
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, monospace;
   font-size: var(--t-font-size);
   line-height: var(--t-lh);
   color: var(--t-fg);
@@ -208,35 +338,35 @@ body {
 .hl-ansi .hljs-keyword,
 .hl-ansi .hljs-literal,
 .hl-ansi .hljs-selector-tag {
-  color: #0037da;
+  color: var(--hl-ansi-keyword);
 }
 .hl-ansi .hljs-title,
 .hl-ansi .hljs-title.function_,
 .hl-ansi .hljs-title.class_,
 .hl-ansi .hljs-section {
-  color: #c19c00;
+  color: var(--hl-ansi-title);
 }
 .hl-ansi .hljs-string,
 .hl-ansi .hljs-regexp,
 .hl-ansi .hljs-char {
-  color: #c50f1f;
+  color: var(--hl-ansi-string);
 }
 .hl-ansi .hljs-built_in,
 .hl-ansi .hljs-type,
 .hl-ansi .hljs-attr,
 .hl-ansi .hljs-attribute {
-  color: #3a96dd;
+  color: var(--hl-ansi-builtin);
 }
 .hl-ansi .hljs-number {
-  color: #13a10e;
+  color: var(--hl-ansi-number);
 }
 .hl-ansi .hljs-comment,
 .hl-ansi .hljs-quote {
-  color: #767676;
+  color: var(--hl-ansi-comment);
 }
 .hl-ansi .hljs-meta,
 .hl-ansi .hljs-variable.language_ {
-  color: #881798;
+  color: var(--hl-ansi-meta);
 }
 .hl-ansi .hljs-subst {
   color: var(--t-fg);
@@ -245,30 +375,30 @@ body {
 /* ---- Coloration : diffs (couleurs vraies, `04`) ------------------------- */
 
 .hl-diff {
-  color: #f8f8f2;
+  color: var(--hl-diff-fg);
 }
 .hl-diff .hljs-keyword,
 .hl-diff .hljs-selector-tag {
-  color: #f92672;
+  color: var(--hl-diff-keyword);
 }
 .hl-diff .hljs-string,
 .hl-diff .hljs-regexp {
-  color: #e6db74;
+  color: var(--hl-diff-string);
 }
 .hl-diff .hljs-number,
 .hl-diff .hljs-literal {
-  color: #be84ff;
+  color: var(--hl-diff-number);
 }
 .hl-diff .hljs-title,
 .hl-diff .hljs-title.function_,
 .hl-diff .hljs-attr {
-  color: #a6e22e;
+  color: var(--hl-diff-title);
 }
 .hl-diff .hljs-built_in,
 .hl-diff .hljs-type {
-  color: #66d9ef;
+  color: var(--hl-diff-builtin);
 }
 .hl-diff .hljs-comment,
 .hl-diff .hljs-meta {
-  color: #75715e;
+  color: var(--hl-diff-comment);
 }

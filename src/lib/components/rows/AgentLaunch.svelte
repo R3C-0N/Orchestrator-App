@@ -62,7 +62,8 @@
     white-space: pre-wrap;
   }
   .name {
-    color: #000000;
+    color: var(--on-agent);
+    border-radius: 3px;
   }
   .gap {
     height: var(--t-lh);

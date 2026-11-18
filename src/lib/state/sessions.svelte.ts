@@ -422,6 +422,9 @@ export type UiSnapshot = {
   sent: string[];
   agentsOpen: string[];
   agentsDoneOpen: boolean;
+  /** Groupes « En attente d'action » et « En cours » ouverts (maquette J15 ; vrai si absent). */
+  agentsWaitingOpen: boolean;
+  agentsRunningOpen: boolean;
   /** Vue détaillée (Ctrl+O). */
   verbose: boolean;
   /** Bandeau d'amélioration fermé (id de l'amélioration). */
@@ -502,6 +505,8 @@ export function loadUiSnapshot(): UiSnapshot | null {
       sent: strings(v.sent).slice(-500),
       agentsOpen: strings(v.agentsOpen),
       agentsDoneOpen: v.agentsDoneOpen === true,
+      agentsWaitingOpen: v.agentsWaitingOpen !== false,
+      agentsRunningOpen: v.agentsRunningOpen !== false,
       verbose: v.verbose === true,
       improveDismissed: typeof v.improveDismissed === "string" ? v.improveDismissed : null,
     };

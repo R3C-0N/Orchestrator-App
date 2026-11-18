@@ -112,7 +112,7 @@ test("historique tronqué : ligne grise en tête du fil, qui défile avec lui", 
   await page.keyboard.press("Enter");
   const cut = page.getByTestId("plain-row");
   await expect(cut).toHaveText("  ⎿  Début de l'historique omis (1200 lignes)");
-  expect(await cut.evaluate((e) => getComputedStyle(e).color)).toBe("rgb(153, 153, 153)");
+  expect(await cut.evaluate((e) => getComputedStyle(e).color)).toBe("rgb(140, 140, 136)");
   // Dans la liste virtualisée (et non au-dessus d'elle), avant l'historique.
   const kinds = await page.locator(".vlist [data-row-kind]").evaluateAll((els) => els.map((e) => e.getAttribute("data-row-kind")));
   expect(kinds).toEqual(["plain", "user"]);

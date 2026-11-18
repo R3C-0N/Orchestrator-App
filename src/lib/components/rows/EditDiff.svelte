@@ -2,7 +2,9 @@
   // Diff d'un Edit (`04`) : « ⎿  Added 3 lines, removed 2 lines » (nombres
   // en gras), puis les lignes : numéro aligné à droite, espace, signe, texte ;
   // suppressions sur fond rouge sombre (ancien fichier), ajouts sur fond vert
-  // sombre (nouveau fichier), contexte en coloration syntaxique.
+  // sombre (nouveau fichier), contexte en coloration syntaxique. Couleurs
+  // en variables (`--diff-*`, `--hl-diff-fg` dans app.css) : le thème clair
+  // les remplace par des fonds pâles.
   import { diffForRow, diffSummaryHtml } from "../../render/diff";
   import type { ToolCallRow } from "../../state/session.svelte";
   import ToolResult from "./ToolResult.svelte";
@@ -40,33 +42,33 @@
     overflow-wrap: anywhere;
   }
   .no {
-    color: #7c7c79;
+    color: var(--diff-no);
   }
   .ctx .sg {
     color: transparent;
   }
   .del {
-    background: #3d0100;
+    background: var(--diff-del-bg);
   }
   .del .no,
   .del .sg {
-    color: #dc5a5a;
+    color: var(--diff-del-fg);
   }
   .del .tx {
-    color: #f8f8f2;
+    color: var(--hl-diff-fg);
   }
   .add {
-    background: #022800;
+    background: var(--diff-add-bg);
   }
   .add .no,
   .add .sg {
-    color: #50c850;
+    color: var(--diff-add-fg);
   }
   /* Mots changés, sur un fond plus soutenu (`04` : « 60 », « 5 »). */
   .del :global(.dw) {
-    background: #5c0200;
+    background: var(--diff-del-word);
   }
   .add :global(.dw) {
-    background: #044700;
+    background: var(--diff-add-word);
   }
 </style>

@@ -20,7 +20,7 @@
 </script>
 
 <div class="l indicator">
-  <span class="g spin">{glyph}</span>
+  <span class="g grad">{glyph}</span>
   <span class="x"
     ><span class="verb">{verb}…</span>
     <span class="dim"
@@ -30,9 +30,6 @@
 </div>
 
 <style>
-  .spin {
-    color: var(--t-spinner);
-  }
   .verb {
     color: var(--t-spinner-text);
   }

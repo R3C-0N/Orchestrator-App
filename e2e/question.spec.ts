@@ -147,19 +147,19 @@ test("rendu de la capture 07 et comparaison côte à côte", async ({ page, brow
   // Une règle avant la pastille, une avant « Chat about this », pas d'encadré.
   await expect(card.locator(".rule")).toHaveCount(2);
   expect(await css(page, `${CARD}`, "border-top-style")).toBe("none");
-  // Pastille : noir sur bleu lavande ; sélection en bleu lavande ; question en gras.
-  expect(await css(page, `${CARD} .pill.on`, "background-color")).toBe("rgb(177, 185, 249)");
-  expect(await css(page, `${CARD} .pill.on`, "color")).toBe("rgb(0, 0, 0)");
-  expect(await css(page, `${CARD} .opt.sel`, "color")).toBe("rgb(177, 185, 249)");
+  // Pastille : noir sur cyan (--code, #9CCFD8) ; sélection en cyan ; question en gras.
+  expect(await css(page, `${CARD} .pill.on`, "background-color")).toBe("rgb(156, 207, 216)");
+  expect(await css(page, `${CARD} .pill.on`, "color")).toBe("rgb(22, 22, 22)");
+  expect(await css(page, `${CARD} .opt.sel`, "color")).toBe("rgb(156, 207, 216)");
   expect(Number(await css(page, `${CARD} .qtext`, "font-weight"))).toBeGreaterThanOrEqual(700);
-  expect(await css(page, `${CARD} .desc`, "color")).toBe("rgb(153, 153, 153)");
+  expect(await css(page, `${CARD} .desc`, "color")).toBe("rgb(140, 140, 136)");
   // Valeurs relevées sur les pixels de 07 : question #FFFFFF, numéros et
   // règles #999999, options et « Chat about this » #CCCCCC.
-  expect(await css(page, `${CARD} .qtext`, "color")).toBe("rgb(255, 255, 255)");
-  expect(await css(page, `${CARD} .opt.sel .num`, "color")).toBe("rgb(153, 153, 153)");
-  expect(await css(page, `${CARD} .rule`, "color")).toBe("rgb(153, 153, 153)");
-  expect(await css(page, `${CARD} .opt:not(.sel)`, "color")).toBe("rgb(204, 204, 204)");
-  expect(await css(page, `${CARD} .opt[data-kind="chat"] .num`, "color")).toBe("rgb(204, 204, 204)");
+  expect(await css(page, `${CARD} .qtext`, "color")).toBe("rgb(245, 245, 243)");
+  expect(await css(page, `${CARD} .opt.sel .num`, "color")).toBe("rgb(140, 140, 136)");
+  expect(await css(page, `${CARD} .rule`, "color")).toBe("rgb(140, 140, 136)");
+  expect(await css(page, `${CARD} .opt:not(.sel)`, "color")).toBe("rgb(212, 212, 210)");
+  expect(await css(page, `${CARD} .opt[data-kind="chat"] .num`, "color")).toBe("rgb(212, 212, 210)");
   // La carte prend la place de la saisie et de la ligne d'état.
   await expect(page.locator(PROMPT)).toHaveCount(0);
   await expect(page.getByTestId("status-line")).toHaveCount(0);

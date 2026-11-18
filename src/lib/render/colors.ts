@@ -32,20 +32,20 @@ export const PALETTE = {
 } as const;
 
 /**
- * Fond du nom d'un agent (texte noir dessus), d'après sa couleur
+ * Fond du nom d'un agent (texte `--on-accent` dessus), d'après sa couleur
  * (`AgentEvent.color`, ou le nom `agent-<couleur>` après `trim()`).
- * Mesurés : bleu `#6A9BCC`, rouge `#DC2626` (`05`). Les autres viennent
- * de la même gamme du thème `dark` et ne sont pas capturés.
+ * Teintes pastel de la maquette J15 (au prototype 1 : couleurs du TUI,
+ * bleu `#6A9BCC` et rouge `#DC2626` mesurés sur `05`).
  */
 const AGENT_BG: Record<string, string> = {
-  blue: "#6A9BCC",
-  red: "#DC2626",
-  green: "#16A34A",
-  yellow: "#CA8A04",
-  purple: "#9333EA",
-  orange: "#EA580C",
-  pink: "#DB2777",
-  cyan: "#0891B2",
+  blue: "#8FB8E8",
+  red: "#FF7F86",
+  green: "#9BD17F",
+  yellow: "#E8CF7C",
+  purple: "#C4A6EF",
+  orange: "#F2A96B",
+  pink: "#F29CC4",
+  cyan: "#88D3DC",
 };
 
 const FR: Record<string, string> = {
@@ -60,7 +60,7 @@ const FR: Record<string, string> = {
 };
 
 /** Agent inconnu : gris neutre (décision 4). */
-export const AGENT_NEUTRAL = "#767676";
+export const AGENT_NEUTRAL = "#8C8C88";
 
 function norm(name: string | null | undefined): string | null {
   if (!name) return null;

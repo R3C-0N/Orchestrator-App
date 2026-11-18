@@ -70,14 +70,14 @@ const css = (page: Page, sel: string, prop: "color" | "background-color") =>
 /** Assertions de style ciblées (valeurs relevées sur les pixels des captures). */
 const STYLE: Record<string, (page: Page) => Promise<void>> = {
   "02": async (page) => {
-    expect(await css(page, ".md-code", "color")).toBe("rgb(177, 185, 249)");
+    expect(await css(page, ".md-code", "color")).toBe("rgb(156, 207, 216)");
     // f-string : seul `f"Bonjour, ` est rouge, la suite garde la couleur du texte.
     const strings = await page.locator(".md-pre .hljs-string").allInnerTexts();
     expect(strings[0]).toBe('f"Bonjour, ');
     // Deux lignes vides avant `if __name__` (02.uia.txt, lignes 25-26).
     expect(await page.locator(".md-pre").innerText()).toContain("print(message)\n\n\nif __name__");
     // Bande du message utilisateur.
-    expect(await css(page, ".user-band", "background-color")).toBe("rgb(55, 55, 55)");
+    expect(await css(page, ".user-band", "background-color")).toBe("rgb(32, 32, 32)");
   },
   "03": async (page) => {
     await expect(page.locator('[aria-label="Message"]')).toBeVisible();
@@ -89,7 +89,7 @@ const STYLE: Record<string, (page: Page) => Promise<void>> = {
     await expect(page.getByTestId("detail-bar")).toBeVisible();
   },
   "04": async (page) => {
-    expect(await css(page, ".g.ok", "color")).toBe("rgb(78, 186, 101)");
+    expect(await css(page, ".g.ok", "color")).toBe("rgb(155, 209, 127)");
     expect(await css(page, ".dl.del", "background-color")).toBe("rgb(61, 1, 0)");
     expect(await css(page, ".dl.add", "background-color")).toBe("rgb(2, 40, 0)");
     // Mots changés : fonds relevés sur 04 (« 30 » #5C0200 en (199, 365), « 5 » #044700 en (199, 422)).
@@ -97,27 +97,27 @@ const STYLE: Record<string, (page: Page) => Promise<void>> = {
     expect(await css(page, ".dl.add .dw", "background-color")).toBe("rgb(4, 71, 0)");
   },
   "09": async (page) => {
-    expect(await css(page, ".g.err", "color")).toBe("rgb(255, 107, 128)");
+    expect(await css(page, ".g.err", "color")).toBe("rgb(255, 127, 134)");
   },
   // Write (w1) : puce verte, « Write » et « 12 » en gras blanc vif (#F2F2F2), chemin en gras
   // souligné en pointillé, numéros #666666, contenu #CCCCCC, « … +2 lines » #999999.
   w1: async (page) => {
-    expect(await css(page, ".g.ok", "color")).toBe("rgb(78, 186, 101)");
-    expect(await css(page, ".r .x .b", "color")).toBe("rgb(242, 242, 242)");
+    expect(await css(page, ".g.ok", "color")).toBe("rgb(155, 209, 127)");
+    expect(await css(page, ".r .x .b", "color")).toBe("rgb(245, 245, 243)");
     const link = page.locator(".r .x .b.link").first();
     expect(await link.evaluate((el) => getComputedStyle(el).textDecorationStyle)).toBe("dotted");
-    expect(await css(page, ".rc .ln", "color")).toBe("rgb(102, 102, 102)");
-    expect(await css(page, ".rc.x:not(.dim)", "color")).toBe("rgb(204, 204, 204)");
-    expect(await css(page, ".rc.x.dim", "color")).toBe("rgb(153, 153, 153)");
+    expect(await css(page, ".rc .ln", "color")).toBe("rgb(106, 106, 102)");
+    expect(await css(page, ".rc.x:not(.dim)", "color")).toBe("rgb(212, 212, 210)");
+    expect(await css(page, ".rc.x.dim", "color")).toBe("rgb(140, 140, 136)");
     // Libellé « Write(liste.txt) » : « Write » en gras blanc vif, chemin souligné en pointillé.
     const title = page.locator(".l .x .b", { hasText: "Write" }).first();
     expect(await title.evaluate((el) => getComputedStyle(el).fontWeight)).toBe("700");
-    expect(await title.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(242, 242, 242)");
+    expect(await title.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(245, 245, 243)");
     const argLink = page.locator(".l .x .link", { hasText: "liste.txt" }).first();
     expect(await argLink.evaluate((el) => getComputedStyle(el).textDecorationStyle)).toBe("dotted");
   },
   "09b": async (page) => {
-    expect(await css(page, ".g.err", "color")).toBe("rgb(255, 107, 128)");
+    expect(await css(page, ".g.err", "color")).toBe("rgb(255, 127, 134)");
     await expect(page.locator('[aria-label="Message"]')).toHaveCount(0);
   },
 };

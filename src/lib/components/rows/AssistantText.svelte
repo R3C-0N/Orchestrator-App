@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Réponse de l'assistant (`02`) : puce « ● » blanche en colonne 0, texte
+  // Réponse de l'assistant (`02`) : puce « ● » (en dégradé depuis J15) en colonne 0, texte
   // markdown en retrait de 2.
   //
   // Pendant le streaming, le markdown est réanalysé à chaque mise à jour tant
@@ -58,7 +58,7 @@
   <div class="stamp dim">{clock12(row.at)}{model ? ` ${model}` : ""}</div>
 {/if}
 <div class="l">
-  <span class="g white">{BULLET}</span>
+  <span class="g grad">{BULLET}</span>
   <!-- Sans espace entre les balises : `.x` garde les espaces (pre-wrap). -->
   <div class="x"><div class="md">{@html html}</div>{#if tail}<span class="tail">{tail}</span>{/if}</div>
 </div>

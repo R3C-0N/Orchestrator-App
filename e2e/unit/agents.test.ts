@@ -6,12 +6,12 @@ import t3 from "../../fixtures/ui-events/t3.json";
 import type { AgentEvent } from "../../src/lib/core/bindings/AgentEvent";
 import type { CoreEvent } from "../../src/lib/core/bindings/CoreEvent";
 import {
-  RUNNING_GLYPH,
+  WAITING_GLYPH,
   agentDetail,
   agentElapsed,
   agentGlyph,
   agentStats,
-  doneHeader,
+  agentSummary,
   groupAgents,
   isLive,
   threadLines,
@@ -66,9 +66,11 @@ describe("modèle d'une ligne d'agent", () => {
     expect(agentElapsed(agent({ status: "Stopped" }), 99_000)).toBeNull();
   });
 
-  it("donne l'état par le glyphe : ◯ gris en cours, ● vert / rouge / gris une fois fini", () => {
-    expect(agentGlyph("Starting")).toEqual({ glyph: RUNNING_GLYPH, tone: "dim" });
-    expect(agentGlyph("Running")).toEqual({ glyph: "◯", tone: "dim" });
+  it("donne l'état par la pastille : ● en dégradé en cours, ◆ en attente, ● vert / rouge / gris une fois fini", () => {
+    expect(agentGlyph("Starting")).toEqual({ glyph: "●", tone: "run" });
+    expect(agentGlyph("Running")).toEqual({ glyph: "●", tone: "run" });
+    expect(agentGlyph("Running", true)).toEqual({ glyph: WAITING_GLYPH, tone: "ask" });
+    expect(agentGlyph("Completed", true)).toEqual({ glyph: "●", tone: "ok" });
     expect(agentGlyph("Completed")).toEqual({ glyph: "●", tone: "ok" });
     expect(agentGlyph("Failed")).toEqual({ glyph: "●", tone: "err" });
     expect(agentGlyph("Stopped")).toEqual({ glyph: "●", tone: "dim" });
@@ -88,8 +90,8 @@ describe("modèle d'une ligne d'agent", () => {
   });
 
   it("colore le nom d'après color, gris pour un agent inconnu", () => {
-    expect(agentColor("blue", "agent-bleu")).toBe("#6A9BCC");
-    expect(agentColor("red", " agent-rouge ")).toBe("#DC2626");
+    expect(agentColor("blue", "agent-bleu")).toBe("#8FB8E8");
+    expect(agentColor("red", " agent-rouge ")).toBe("#FF7F86");
     expect(agentColor(null, "general-purpose")).toBe(AGENT_NEUTRAL);
   });
 });
@@ -109,8 +111,8 @@ describe("t3 rejoué dans le magasin", () => {
     expect(agentStats(bleu, 0)).toBe("0s · ↓ 35.6k tokens");
     expect(agentDetail(bleu).text).toBe("Done · 1 tool use");
     expect(agentStats(rouge, 0)).toBe("0s · ↓ 24.0k tokens");
-    expect(agentColor(bleu.color, bleu.agent_type)).toBe("#6A9BCC");
-    expect(agentColor(rouge.color, rouge.agent_type)).toBe("#DC2626");
+    expect(agentColor(bleu.color, bleu.agent_type)).toBe("#8FB8E8");
+    expect(agentColor(rouge.color, rouge.agent_type)).toBe("#FF7F86");
   });
 
   it("étiré par la démo, la durée avance pendant l'exécution puis se fige", () => {
@@ -214,14 +216,14 @@ describe("tri de la colonne : en attente, en cours, terminés", () => {
     expect([...waitingIds([{ thread: "main" }, { thread: "toolu_x" }, { thread: "toolu_y" }])]).toEqual(["toolu_x", "toolu_y"]);
   });
 
-  it("ligne ⎿ « ☐ Waiting for your answer » tant qu'il attend et qu'il tourne", () => {
-    expect(agentDetail(agent({ last_tool: "Read" }), true)).toEqual({ text: "☐ Waiting for your answer", tone: "ask" });
+  it("ligne « Waiting for your answer » tant qu'il attend et qu'il tourne", () => {
+    expect(agentDetail(agent({ last_tool: "Read" }), true)).toEqual({ text: "Waiting for your answer", tone: "ask" });
     expect(agentDetail(agent({ status: "Completed", tool_uses: 1 }), true).text).toBe("Done · 1 tool use");
   });
 
-  it("en-tête du panneau : ▸ replié, ▾ ouvert", () => {
-    expect(doneHeader(3, false)).toEqual({ glyph: "▸", text: "3 done" });
-    expect(doneHeader(1, true)).toEqual({ glyph: "▾", text: "1 done" });
+  it("pied de colonne : en attente (si besoin), en cours, total", () => {
+    expect(agentSummary(0, 2, 5)).toBe("2 en cours · 5 agents");
+    expect(agentSummary(1, 0, 1)).toBe("1 en attente · 0 en cours · 1 agent");
   });
 
   it("scénario sort : vert en attente, bleu en cours, rouge puis orange terminés", () => {

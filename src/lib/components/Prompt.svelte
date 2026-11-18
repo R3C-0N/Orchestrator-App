@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Saisie (jalon J7), rendu de la capture `01` : `❯` gris entre deux règles
-  // `─` grises pleine largeur, collée en bas ; indication à droite au-dessus
+  // Saisie (jalon J7), restylée d'après la maquette J15 : cadre arrondi sur
+  // fond `--surface`, « ❯ » en dégradé, collée en bas ; indication à droite au-dessus
   // de la saisie (« Esc again to clear », `a*`), à la place de
   // « ◐ medium · /effort ». Texte d'invite gris tant qu'aucun message n'a été
   // envoyé (`01`), rien ensuite (`n*`).
@@ -64,9 +64,6 @@
   /** Brouillon gardé quand on remonte l'historique. */
   let saved = "";
   let pick = $state(0);
-
-  /** Règle `─` pleine largeur (coupée par `overflow: hidden`). */
-  const RULE = "─".repeat(400);
 
   export function focus(): void {
     el?.focus();
@@ -217,9 +214,8 @@
   {:else}
     <div class="hint dim" data-testid="prompt-hint">{hint ?? ""}</div>
   {/if}
-  <div class="rule" aria-hidden="true">{RULE}</div>
   <div class="line">
-    <span class="g caret">❯</span>
+    <span class="g caret grad">❯</span>
     <textarea
       bind:this={el}
       bind:value={draft}
@@ -233,12 +229,12 @@
       aria-label="Message"
     ></textarea>
   </div>
-  <div class="rule" aria-hidden="true">{RULE}</div>
 </div>
 
 <style>
   .prompt {
     flex: none;
+    padding: 0 14px;
   }
   .hint {
     text-align: right;
@@ -247,18 +243,13 @@
     height: var(--t-lh);
     overflow: hidden;
   }
-  .rule {
-    color: var(--t-rule);
-    white-space: pre;
-    overflow: hidden;
-    height: var(--t-lh);
-  }
   .line {
     display: grid;
     grid-template-columns: 2ch minmax(0, 1fr);
-  }
-  .caret {
-    color: var(--t-dim);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    background: var(--surface);
+    padding: 10px 12px;
   }
   textarea {
     display: block;
@@ -269,8 +260,8 @@
     resize: none;
     overflow-y: auto;
     background: transparent;
-    color: var(--t-fg);
-    caret-color: var(--t-fg);
+    color: var(--strong);
+    caret-color: var(--strong);
     border: none;
     outline: none;
     padding: 0;

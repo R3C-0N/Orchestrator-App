@@ -58,9 +58,10 @@
   .banner {
     display: flex;
     gap: 1ch;
-    padding: 0 1ch;
-    color: #0c0c0c;
-    background: var(--warn);
+    padding: 2px 1ch;
+    color: var(--warn);
+    background: var(--warn-bg);
+    border-bottom: 1px solid var(--rule);
   }
   .msg {
     flex: 1;
@@ -80,6 +81,6 @@
     opacity: 1;
   }
   .close:focus-visible {
-    outline: 1px solid #0c0c0c;
+    outline: 1px solid var(--warn);
   }
 </style>

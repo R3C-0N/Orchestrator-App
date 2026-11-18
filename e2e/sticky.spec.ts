@@ -276,12 +276,18 @@ test("Ctrl+O puis molette pendant le recalage : la molette n'est pas écrasée",
   // Ce qui est vu : la boucle s'arrête quand j est aligné en haut à 0,5 px
   // près (`Math.abs(d) > 0.5`), ou le perd de vue (j non rendu, `Infinity`)
   // en le visant par son décalage estimé. Après la molette, j reste rendu
-  // à chaque image et n'est jamais aligné : il finit 7 px au-dessus du haut
-  // (mesure : -68,5 avant la molette, 231,5 juste après, puis -7 une fois
-  // mesurées les lignes découvertes, plus petites qu'estimé).
+  // à chaque image et n'est jamais aligné. Où il finit dépend de la
+  // géométrie (hauteurs estimées contre mesurées des lignes découvertes) :
+  // -68,5 avant la molette, 231,5 juste après, puis -7 avec la police de
+  // 16 px ; 0, 300, puis 72 avec celle de 14 px. Le signe n'est donc pas
+  // vérifié, seulement qu'il ne bouge plus à la fin (mesures faites, aucune
+  // boucle en cours) sans être aligné. Sans l'arrêt sur geste, la boucle
+  // remet `scrollTop` à sa valeur d'avant la molette et j à 0 (mesuré en
+  // retirant l'événement `wheel`) : ce sont les bornes ci-dessus qui cassent.
   for (const top of m.tops) expect(Number.isFinite(top)).toBe(true);
   for (const top of m.tops.slice(1)) expect(Math.abs(top)).toBeGreaterThan(0.5);
-  expect(m.tops[m.tops.length - 1]).toBeLessThan(-0.5);
+  const last = m.tops.slice(-3);
+  for (const top of last) expect(Math.abs(top - last[0])).toBeLessThanOrEqual(0.5);
   expect(await sticky(page)).toBe(false);
 });
 

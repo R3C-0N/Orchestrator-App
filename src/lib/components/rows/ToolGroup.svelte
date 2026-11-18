@@ -1,6 +1,6 @@
 <script lang="ts">
   // Appels regroupés en vue normale : une ligne grise en retrait de 2, sans
-  // puce ni résultat (« Read 1 file, ran 1 shell command », `03`, `04`, `09`).
+  // puce ni résultat, précédée d'un « ⎿ » en dégradé (maquette J15) (« Read 1 file, ran 1 shell command », `03`, `04`, `09`).
   // Appel en cours : puce grise, libellé et durée vivante, puis
   // « ⎿  $ <commande> » (`k1`). Appels coupés par une interruption :
   // « No result recorded for N call » et « ⎿  $ <commande> » (`08`).
@@ -25,7 +25,7 @@
   {/each}
 {:else}
   {#if done.length > 0}
-    <div class="l"><span></span><span class="x dim">{groupLabel(done)}</span></div>
+    <div class="l"><span></span><span class="x dim"><span class="grad elbow" aria-hidden="true">⎿</span>{groupLabel(done)}</span></div>
   {/if}
   {#each running as r (r.id)}
     <div class="l">
@@ -37,3 +37,11 @@
     {/if}
   {/each}
 {/if}
+
+<style>
+  /* « ⎿ » vient de la police de secours, plus étroite : largeur fixe. */
+  .elbow {
+    display: inline-block;
+    width: 2ch;
+  }
+</style>

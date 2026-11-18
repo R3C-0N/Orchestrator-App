@@ -206,6 +206,8 @@ describe("UiSnapshot", () => {
         sent: ["a", "b"],
         agentsOpen: ["toolu_1"],
         agentsDoneOpen: true,
+        agentsWaitingOpen: false,
+        agentsRunningOpen: true,
         verbose: true,
         improveDismissed: null,
       };
@@ -218,6 +220,9 @@ describe("UiSnapshot", () => {
         sent: ["x"],
         agentsOpen: [],
         agentsDoneOpen: false,
+        // Absents d'une ancienne sauvegarde : groupes ouverts.
+        agentsWaitingOpen: true,
+        agentsRunningOpen: true,
         verbose: false,
         improveDismissed: null,
       });
@@ -247,6 +252,8 @@ describe("UiSnapshot plafonné", () => {
     sent,
     agentsOpen: [],
     agentsDoneOpen: false,
+    agentsWaitingOpen: true,
+    agentsRunningOpen: true,
     verbose: false,
     improveDismissed: null,
   });

@@ -14,16 +14,10 @@ import { BULLET, DOT } from "../../render/glyphs";
 import { seconds, shortResult, tokens, toolArg, toolTitle } from "../../render/tools";
 import type { Row, ToolCallRow } from "../../state/session.svelte";
 
-/** Agent en cours dans le panneau du TUI (`05`). */
-export const RUNNING_GLYPH = "◯";
+export type AgentTone = "dim" | "ok" | "err" | "ask" | "run";
 
-export type AgentTone = "dim" | "ok" | "err" | "ask";
-
-/**
- * Question en attente (pastille de la carte de question, capture `07` :
- * « ☐ <header> »), reprise sur la ligne `⎿` d'un agent qui attend la réponse.
- */
-export const WAITING_GLYPH = "☐";
+/** Agent en attente d'une réponse (groupe « En attente d'action », maquette J15). */
+export const WAITING_GLYPH = "◆";
 
 const OVER = new Set<AgentStatus>(["Completed", "Failed", "Stopped"]);
 
@@ -69,17 +63,18 @@ export function waitingIds(questions: readonly { thread: string }[]): ReadonlySe
   return new Set(questions.filter((q) => q.thread !== "main").map((q) => q.thread));
 }
 
-/** En-tête du panneau des agents terminés : « ▸ 3 done » (replié), « ▾ 3 done » (ouvert). */
-export function doneHeader(count: number, open: boolean): { glyph: string; text: string } {
-  return { glyph: open ? "▾" : "▸", text: `${count} done` };
+/** Pied de la colonne : « 1 en attente · 2 en cours · 5 agents » (maquette J15). */
+export function agentSummary(waiting: number, running: number, total: number): string {
+  return `${waiting > 0 ? `${waiting} en attente ${DOT} ` : ""}${running} en cours ${DOT} ${total} ${total === 1 ? "agent" : "agents"}`;
 }
 
 /**
- * Glyphe d'état : `◯` gris pendant l'exécution (`05`) ; une fois fini,
- * `●` vert (terminé), rouge (échec) ou gris (arrêté). Le TUI retire la ligne
- * d'un agent fini ; la colonne la garde (écart assumé, voir le rapport J9).
+ * Pastille d'état (maquette J15) : `◆` jaune en attente d'une réponse,
+ * `●` en dégradé pendant l'exécution ; une fois fini, `●` vert (terminé),
+ * rouge (échec) ou gris (arrêté).
  */
-export function agentGlyph(status: AgentStatus): { glyph: string; tone: AgentTone } {
+export function agentGlyph(status: AgentStatus, waiting = false): { glyph: string; tone: AgentTone } {
+  if (waiting && isLive({ status })) return { glyph: WAITING_GLYPH, tone: "ask" };
   switch (status) {
     case "Completed":
       return { glyph: BULLET, tone: "ok" };
@@ -88,7 +83,7 @@ export function agentGlyph(status: AgentStatus): { glyph: string; tone: AgentTon
     case "Stopped":
       return { glyph: BULLET, tone: "dim" };
     default:
-      return { glyph: RUNNING_GLYPH, tone: "dim" };
+      return { glyph: BULLET, tone: "run" };
   }
 }
 
@@ -119,7 +114,7 @@ function plural(n: number, one: string, many: string): string {
  * l'état final ensuite.
  */
 export function agentDetail(a: AgentEvent, waiting = false): { text: string; tone: AgentTone } {
-  if (waiting && isLive(a)) return { text: `${WAITING_GLYPH} Waiting for your answer`, tone: "ask" };
+  if (waiting && isLive(a)) return { text: "Waiting for your answer", tone: "ask" };
   const uses = a.tool_uses !== null ? ` ${DOT} ${plural(a.tool_uses, "tool use", "tool uses")}` : "";
   switch (a.status) {
     case "Starting":

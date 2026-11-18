@@ -51,20 +51,20 @@ test("t3 : deux agents bleu et rouge, état, durée qui avance puis se fige, las
   await expect(card(page, BLEU)).toBeVisible();
   await expect(card(page, ROUGE)).toBeVisible();
   const col = page.getByTestId("agent-column");
-  await expect(col).toContainText("● main");
+  await expect(col).toContainText("── agents");
   await expect(col.locator(".card")).toHaveCount(2);
 
-  // Couleurs : nom noir sur le fond de l'agent (capture 05 : bleu #6A9BCC, rouge #DC2626).
+  // Couleurs : nom foncé sur le fond pastel de l'agent (maquette J15 : bleu #8FB8E8, rouge #FF7F86).
   const bg = (id: string) => card(page, id).locator(".name").evaluate((el) => getComputedStyle(el).backgroundColor);
-  expect(await bg(BLEU)).toBe("rgb(106, 155, 204)");
-  expect(await bg(ROUGE)).toBe("rgb(220, 38, 38)");
-  expect(await card(page, BLEU).locator(".name").evaluate((el) => getComputedStyle(el).color)).toBe("rgb(0, 0, 0)");
+  expect(await bg(BLEU)).toBe("rgb(143, 184, 232)");
+  expect(await bg(ROUGE)).toBe("rgb(255, 127, 134)");
+  expect(await card(page, BLEU).locator(".name").evaluate((el) => getComputedStyle(el).color)).toBe("rgb(22, 22, 22)");
   await expect(card(page, BLEU).locator(".name")).toHaveText("agent-bleu");
   await expect(card(page, BLEU).locator(".desc")).toHaveText("Lecture a.txt en 3 mots");
 
-  // Pendant l'exécution : ◯, outil en cours, durée qui avance.
-  await expect(card(page, BLEU).getByTestId("agent-detail")).toHaveText("Read…", { timeout: 10_000 });
-  await expect(card(page, BLEU).getByTestId("agent-glyph")).toHaveText("◯");
+  // Pendant l'exécution : ● en dégradé, outil en cours, durée qui avance.
+  await expect(card(page, BLEU).getByTestId("agent-detail")).toHaveText("└ Read…", { timeout: 10_000 });
+  await expect(card(page, BLEU).getByTestId("agent-glyph")).toHaveText("●");
   await expect(card(page, BLEU)).toHaveAttribute("data-status", "Running");
   const s1 = await stats(page, BLEU);
   expect(s1).toMatch(/^\d+s · ↓ 25\.7k tokens$/);
@@ -80,9 +80,9 @@ test("t3 : deux agents bleu et rouge, état, durée qui avance puis se fige, las
   await expect(card(page, BLEU)).toHaveAttribute("data-status", "Completed");
   await expect(card(page, BLEU).getByTestId("agent-glyph")).toHaveText("●");
   expect(await card(page, BLEU).getByTestId("agent-glyph").evaluate((el) => getComputedStyle(el).color)).toBe(
-    "rgb(78, 186, 101)",
+    "rgb(155, 209, 127)",
   );
-  await expect(card(page, BLEU).getByTestId("agent-detail")).toHaveText("Done · 1 tool use");
+  await expect(card(page, BLEU).getByTestId("agent-detail")).toHaveText("└ Done · 1 tool use");
   const f1 = await stats(page, BLEU);
   expect(f1).toBe("7s · ↓ 35.6k tokens");
   await page.waitForTimeout(1500);
@@ -148,11 +148,11 @@ test("4 agents + 1 gris : lisible, sans débordement, 2 lignes par agent", async
   // Gris pour la couleur inconnue.
   expect(
     await card(page, "toolu_four_inconnu").locator(".name").evaluate((el) => getComputedStyle(el).backgroundColor),
-  ).toBe("rgb(118, 118, 118)");
+  ).toBe("rgb(140, 140, 136)");
   await page.waitForFunction(() => window.__agentsDemo.done(), null, { timeout: 30_000 });
   await page.getByTestId("agents-done-toggle").click();
   await expect(card(page, "toolu_four_orange")).toHaveAttribute("data-status", "Failed");
-  await expect(card(page, "toolu_four_orange").getByTestId("agent-detail")).toHaveText("Failed · 2 tool uses");
+  await expect(card(page, "toolu_four_orange").getByTestId("agent-detail")).toHaveText("└ Failed · 2 tool uses");
   await page.screenshot({ path: `${OUT_DIR}/four-termine.png` });
 });
 
@@ -207,26 +207,29 @@ test("tri : en attente, puis en cours, puis terminés dans un panneau replié", 
   // orange (terminé, échec) sont repliés.
   expect(await order(page)).toEqual(["toolu_sort_vert", "toolu_sort_bleu"]);
   await expect(card(page, "toolu_sort_vert")).toHaveAttribute("data-waiting", "true");
-  await expect(card(page, "toolu_sort_vert").getByTestId("agent-detail")).toHaveText("☐ Waiting for your answer");
+  await expect(card(page, "toolu_sort_vert").getByTestId("agent-detail")).toHaveText("└ Waiting for your answer");
+  await expect(card(page, "toolu_sort_vert").getByTestId("agent-glyph")).toHaveText("◆");
   expect(
     await card(page, "toolu_sort_vert").getByTestId("agent-detail").evaluate((el) => getComputedStyle(el).color),
-  ).toBe("rgb(177, 185, 249)");
+  ).toBe("rgb(242, 194, 107)");
+  await expect(col.getByTestId("agents-waiting-count")).toHaveText("1");
+  await expect(col.getByTestId("agents-running-count")).toHaveText("1");
   expect(await card(page, "toolu_sort_bleu").getAttribute("data-waiting")).toBeNull();
   const toggle = page.getByTestId("agents-done-toggle");
-  await expect(toggle).toHaveText("▸ 2 done");
+  await expect(toggle).toContainText("Terminés");
+  await expect(col.getByTestId("agents-done-count")).toHaveText("2");
   await expect(toggle).toHaveAttribute("aria-expanded", "false");
   await expect(done.locator(".card")).toHaveCount(0);
-  await expect(col.getByTestId("agent-count")).toHaveText("2 running · 4 agents");
-  // Le dernier agent vivant ferme l'arbre (`└`), le panneau suit.
-  await expect(card(page, "toolu_sort_bleu").locator(".line").first()).toContainText("└");
+  await expect(col.getByTestId("agent-count")).toHaveText("1 en attente · 1 en cours · 4 agents");
+  // Ligne d'état sous l'agent, précédée de `└` (maquette J15).
+  await expect(card(page, "toolu_sort_bleu").getByTestId("agent-detail")).toContainText("└");
   mkdirSync(OUT_DIR, { recursive: true });
   await col.screenshot({ path: `${OUT_DIR}/tri-replie.png` });
 
-  // Clic : ouvert, terminés dans l'ordre de lancement.
+  // Clic : ouvert, terminés du plus récent au plus ancien (maquette J15).
   await toggle.click();
-  await expect(toggle).toHaveText("▾ 2 done");
   await expect(toggle).toHaveAttribute("aria-expanded", "true");
-  expect(await order(page)).toEqual(["toolu_sort_vert", "toolu_sort_bleu", "toolu_sort_rouge", "toolu_sort_orange"]);
+  expect(await order(page)).toEqual(["toolu_sort_vert", "toolu_sort_bleu", "toolu_sort_orange", "toolu_sort_rouge"]);
   await expect(card(page, "toolu_sort_orange")).toHaveAttribute("data-status", "Failed");
   await col.screenshot({ path: `${OUT_DIR}/tri-ouvert.png` });
 
@@ -248,7 +251,7 @@ test("tri : en attente, puis en cours, puis terminés dans un panneau replié", 
     ]),
   );
   await expect.poll(() => order(page)).toEqual(["toolu_sort_bleu", "toolu_sort_vert"]);
-  await expect(card(page, "toolu_sort_vert").getByTestId("agent-detail")).toHaveText("Read…");
+  await expect(card(page, "toolu_sort_vert").getByTestId("agent-detail")).toHaveText("└ Read…");
 });
 
 test("tri : un agent qui finit passe dans le panneau ; fil déroulé, il reste visible", async ({ page }) => {
@@ -261,7 +264,7 @@ test("tri : un agent qui finit passe dans le panneau ; fil déroulé, il reste v
   // cours pour le panneau replié, le focus passe à l'en-tête du panneau.
   await card(page, "toolu_sort_bleu").locator("button.head").focus();
   await applyAgent(page, "toolu_sort_bleu", "agent-bleu", "blue", { status: "Completed", ended_at: Date.now(), tool_uses: 1 });
-  await expect(toggle).toHaveText("▸ 3 done");
+  await expect(page.getByTestId("agents-done-count")).toHaveText("3");
   await expect(toggle).toBeFocused();
   expect(await order(page)).toEqual(["toolu_sort_vert"]);
   // Un agent en cours, fil déroulé, qui finit : il reste sous l'en-tête replié, fil ouvert.
@@ -272,7 +275,7 @@ test("tri : un agent qui finit passe dans le panneau ; fil déroulé, il reste v
   await expect(cyan.getByTestId("agent-thread")).toBeVisible();
   await cyan.locator("button.head").focus();
   await applyAgent(page, "toolu_sort_cyan", "agent-cyan", "cyan", { status: "Completed", ended_at: Date.now(), tool_uses: 1 });
-  await expect(toggle).toHaveText("▸ 4 done");
+  await expect(page.getByTestId("agents-done-count")).toHaveText("4");
   // Sa carte reste affichée : le focus la suit.
   await expect(cyan.locator("button.head")).toBeFocused();
   await expect(cyan).toHaveAttribute("data-status", "Completed");

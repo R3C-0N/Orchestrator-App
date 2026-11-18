@@ -25,7 +25,7 @@ async function shot(page, name) {
 }
 
 const status = (page) =>
-  page.evaluate(() => document.querySelector("footer span:nth-child(2)")?.textContent?.split(" · ")[0] ?? "");
+  page.evaluate(() => document.querySelector('[data-testid="footer-status"]')?.textContent?.split(" · ")[0] ?? "");
 const footer = (page) => page.evaluate(() => [...document.querySelectorAll("footer span")].map((s) => s.textContent));
 const rowsText = (page) => page.evaluate(() => document.querySelector(".vlist")?.innerText ?? "");
 
@@ -236,7 +236,7 @@ async function resumeSession() {
     await ready(page);
     await sleep(1500);
     const hist = await rowsText(page);
-    const rowsN = await page.evaluate(() => document.querySelector("footer span:nth-child(2)")?.textContent);
+    const rowsN = await page.evaluate(() => document.querySelector('[data-testid="footer-status"]')?.textContent);
     const c2 = await shot(page, "reprise-historique");
     await send(page, "Quelle couleur ai-je choisie tout à l'heure ? Un mot, aucun outil.");
     await waitStatus(page, /^(Requesting|Streaming)$/, 30_000);

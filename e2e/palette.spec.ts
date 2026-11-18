@@ -55,10 +55,10 @@ test("`/` en début de saisie : t11 (108 commandes), /formulaire-dynamique et /o
   await expect(page.locator(PALETTE)).toBeVisible();
   expect(await shownNames(page)).toEqual(["formulaire-dynamique", "graphify", "orchestrateur"]);
   expect(await selected(page)).toBe("formulaire-dynamique");
-  // Au-dessus de la saisie : le menu finit sur la règle du haut.
+  // Au-dessus de la saisie : le menu finit sur le cadre de la saisie (maquette J15).
   const pal = (await page.locator(PALETTE).boundingBox())!;
-  const rule = (await page.locator('[data-testid="prompt"] .rule').first().boundingBox())!;
-  expect(Math.abs(pal.y + pal.height - rule.y)).toBeLessThan(2);
+  const box = (await page.locator('[data-testid="prompt"] .line').first().boundingBox())!;
+  expect(Math.abs(pal.y + pal.height - box.y)).toBeLessThan(2);
   // Les deux skills de l'utilisateur, par leur filtre.
   await page.keyboard.type("orch");
   expect((await shownNames(page))[0]).toBe("orchestrateur");
@@ -86,12 +86,12 @@ test("rendu de la capture 10 et comparaison côte à côte", async ({ page, brow
     "/artifact-capabilities Runtime capabilities for published Artifacts",
     expect.stringMatching(/^\/formulaire-dynamique Faire trancher à l'utilisateur une série de choix/),
   ]);
-  // Entrée choisie (nom et description) en bleu lavande, les autres en gris (#999999, relevé sur 10).
+  // Entrée choisie (nom et description) en cyan (--code, #9CCFD8), les autres en gris (#999999, relevé sur 10).
   const color = (sel: string) => page.locator(sel).first().evaluate((el) => getComputedStyle(el).color);
-  expect(await color(`${PALETTE} .sel .name`)).toBe("rgb(177, 185, 249)");
-  expect(await color(`${PALETTE} .sel .desc`)).toBe("rgb(177, 185, 249)");
-  expect(await color(`${PALETTE} .row:not(.sel) .name`)).toBe("rgb(153, 153, 153)");
-  expect(await color(`${PALETTE} .row:not(.sel) .desc`)).toBe("rgb(153, 153, 153)");
+  expect(await color(`${PALETTE} .sel .name`)).toBe("rgb(156, 207, 216)");
+  expect(await color(`${PALETTE} .sel .desc`)).toBe("rgb(156, 207, 216)");
+  expect(await color(`${PALETTE} .row:not(.sel) .name`)).toBe("rgb(140, 140, 136)");
+  expect(await color(`${PALETTE} .row:not(.sel) .desc`)).toBe("rgb(140, 140, 136)");
   // Descriptions alignées en colonne ; la longue repliée sur 2 lignes puis tronquée.
   const measure = () =>
     page.locator(`${PALETTE} .desc`).evaluateAll((els) =>

@@ -238,7 +238,7 @@
   .improve {
     flex: none;
     padding: 0 1ch;
-    border-bottom: 1px solid #333;
+    border-bottom: 1px solid var(--rule);
     background: var(--t-bg);
   }
   .head {
@@ -299,7 +299,7 @@
   button {
     background: var(--t-bg);
     color: var(--t-fg);
-    border: 1px solid #555;
+    border: 1px solid var(--tree);
     font: inherit;
     padding: 0 1ch;
     cursor: pointer;

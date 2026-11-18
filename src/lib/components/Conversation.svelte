@@ -487,7 +487,7 @@
     bottom: 8px;
     background: var(--t-bg);
     color: var(--t-fg);
-    border: 1px solid #555;
+    border: 1px solid var(--tree);
     font: inherit;
     padding: 0 1ch;
     cursor: pointer;

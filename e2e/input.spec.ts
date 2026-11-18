@@ -67,11 +67,11 @@ const turnDone = (page: Page, before: number) =>
   );
 
 test.describe("rendu de la saisie (01)", () => {
-  test("❯ entre deux règles ─, texte d'invite avant le premier message", async ({ page }) => {
+  test("❯ dans un cadre arrondi (maquette J15), texte d'invite avant le premier message", async ({ page }) => {
     await open(page, 0);
     const p = page.getByTestId("prompt");
-    await expect(p.locator(".rule")).toHaveCount(2);
-    expect((await p.locator(".rule").first().innerText()).startsWith("────")).toBe(true);
+    await expect(p.locator(".rule")).toHaveCount(0);
+    expect(await p.locator(".line").evaluate((el) => getComputedStyle(el).borderTopLeftRadius)).toBe("8px");
     await expect(p.locator(".caret")).toHaveText("❯");
     await expect(page.locator(PROMPT)).toHaveAttribute("placeholder", 'Try "how do I log an error?"');
     // La ligne d'état suit la saisie.

@@ -438,7 +438,7 @@
     color: var(--t-dim);
   }
   .pill.on {
-    color: #000000;
+    color: var(--on-accent);
     background: var(--t-lavender);
   }
   /* Question : blanc pur, gras (#FFFFFF sur `07`). */

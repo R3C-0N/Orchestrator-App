@@ -31,7 +31,12 @@
   import QuestionCard from "./lib/components/QuestionCard.svelte";
   import SessionPicker from "./lib/components/SessionPicker.svelte";
   import StatusLine from "./lib/components/StatusLine.svelte";
+  import UiNotice from "./lib/components/UiNotice.svelte";
   import VersionNotice from "./lib/components/VersionNotice.svelte";
+  import TitleBar from "./lib/components/TitleBar.svelte";
+  import ThemeToggle from "./lib/components/ThemeToggle.svelte";
+  // Applique le thème mémorisé dès le démarrage.
+  import "./lib/state/theme.svelte";
   import {
     answerQuestion,
     describeError,
@@ -120,6 +125,8 @@
   let agentsOpen: string[] = $state([]);
   // Panneau des agents terminés : replié au départ, gardé tant que l'app tourne.
   let agentsDoneOpen = $state(false);
+  let agentsWaitingOpen = $state(true);
+  let agentsRunningOpen = $state(true);
 
   let session: SessionKey | null = $state(null);
   let cwd = $state("");
@@ -811,6 +818,8 @@
       sent: sent.slice(-500),
       agentsOpen: [...agentsOpen],
       agentsDoneOpen,
+      agentsWaitingOpen,
+      agentsRunningOpen,
       verbose,
       improveDismissed,
     };
@@ -835,6 +844,8 @@
       sent.push(...saved.sent);
       agentsOpen = saved.agentsOpen;
       agentsDoneOpen = saved.agentsDoneOpen;
+      agentsWaitingOpen = saved.agentsWaitingOpen;
+      agentsRunningOpen = saved.agentsRunningOpen;
       verbose = saved.verbose;
     } catch {
       // État illisible : on garde l'état neuf.
@@ -856,7 +867,7 @@
     }, SAVE_DELAY_MS);
   }
   $effect(() => {
-    void [draft, agentsOpen, agentsDoneOpen, verbose, improveDismissed, session, mockReady];
+    void [draft, agentsOpen, agentsDoneOpen, agentsWaitingOpen, agentsRunningOpen, verbose, improveDismissed, session, mockReady];
     if (booted) scheduleSave();
   });
 
@@ -1119,6 +1130,7 @@
 <svelte:window onkeydown={onWindowKey} />
 
 <main>
+  <TitleBar version={store.meta.version} />
   {#each store.banners as b (b.id)}
     {#if b.code === VERSION_NOTICE_CODE}
       <VersionNotice
@@ -1130,6 +1142,7 @@
       <div class="banner {b.level.toLowerCase()}">{b.message}</div>
     {/if}
   {/each}
+  <UiNotice uiHash={UI_HASH} {uiInfo} contract={CONTRACT} />
   {#if startError}
     <div class="banner error">{startError}</div>
   {/if}
@@ -1214,19 +1227,34 @@
             onpalettemove={movePalette}
             onpalettechoose={choosePalette}
           />
-          <StatusLine {store} uiHash={UI_HASH} {uiInfo} contract={CONTRACT} />
+          <StatusLine {store} />
         {/if}
       {/if}
     </div>
-    <AgentColumn {store} width="48ch" bind:open={agentsOpen} bind:doneOpen={agentsDoneOpen} />
+    <AgentColumn {store} width="430px" bind:open={agentsOpen} bind:doneOpen={agentsDoneOpen}
+      bind:waitingOpen={agentsWaitingOpen}
+      bind:runningOpen={agentsRunningOpen}
+    />
   </div>
+  <!-- Barre d'état (maquette J15) : segments en flèche. -->
   <footer>
-    <span>{cwd}</span>
+    {#if UI_HASH}
+      <span class="seg accent first" data-testid="ui-hash" title="Interface exécutée"
+        >ui {UI_HASH.slice(0, 7)}{uiInfo ? (uiInfo.source === "disk" ? " (disque)" : " (embarquée)") : ""}</span
+      >
+    {/if}
+    <span class="seg surface path" class:alone={!UI_HASH}>{cwd}</span>
     <!-- data-* : mesures de la recette sur l'exe (J14 : lignes, trous de seq). -->
-    <span data-testid="footer-status" data-rows={store.rows.length} data-gaps={store.gaps} data-last-seq={store.lastSeq}
-      >{store.status} · {store.rows.length} lignes</span
+    <span
+      class="mid"
+      data-testid="footer-status"
+      data-rows={store.rows.length}
+      data-gaps={store.gaps}
+      data-last-seq={store.lastSeq}>{store.status} · {store.rows.length} lignes</span
     >
-    <span>latence token p50 {p50} ms · p95 {p95} ms</span>
+    <span class="seg surface rev" title="Latence d'affichage d'un token (médiane)">p50 {p50} ms</span>
+    <span class="seg accent rev last" title="Latence d'affichage d'un token (95 %)">p95 {p95} ms</span>
+    <ThemeToggle />
   </footer>
 </main>
 
@@ -1235,7 +1263,7 @@
     display: flex;
     flex-direction: column;
     height: 100%;
-    background: #0c0c0c;
+    background: var(--bg);
   }
   .split {
     flex: 1 1 auto;
@@ -1257,7 +1285,7 @@
   .start-failed button {
     background: var(--t-bg);
     color: var(--t-fg);
-    border: 1px solid #555;
+    border: 1px solid var(--tree);
     font: inherit;
     padding: 0 1ch;
     cursor: pointer;
@@ -1266,19 +1294,71 @@
     outline: 1px solid var(--t-fg);
   }
   .banner {
-    padding: 0 1ch;
-    color: #0c0c0c;
-    background: var(--warn);
+    padding: 2px 1ch;
+    color: var(--warn);
+    background: var(--warn-bg);
+    border-bottom: 1px solid var(--rule);
   }
   .banner.error {
-    background: var(--error);
+    color: var(--danger);
+    background: var(--danger-bg);
   }
   footer {
+    flex: 0 0 auto;
     display: flex;
-    justify-content: space-between;
-    gap: 2ch;
-    padding: 0 1ch;
-    color: #8b8b8b;
+    align-items: stretch;
+    height: 24px;
     font-size: 12px;
+    background: var(--bar);
+    white-space: nowrap;
+  }
+  .seg {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .seg.accent {
+    background: var(--accent-grad);
+    color: var(--on-accent);
+    font-weight: 700;
+  }
+  .seg.surface {
+    background: var(--surface);
+    color: var(--fg);
+  }
+  .seg.first {
+    flex: 0 0 auto;
+    padding: 0 18px 0 12px;
+    clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 50%, calc(100% - 10px) 100%, 0 100%);
+  }
+  .seg.path {
+    flex: 0 1 auto;
+    padding: 0 20px 0 16px;
+    margin-left: -8px;
+    text-overflow: ellipsis;
+    clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 50%, calc(100% - 10px) 100%, 0 100%, 10px 50%);
+  }
+  .seg.rev {
+    flex: 0 0 auto;
+    padding: 0 12px 0 20px;
+    clip-path: polygon(10px 0, 100% 0, 100% 100%, 10px 100%, 0 50%);
+  }
+  /* Sans hash d'interface : le dossier ouvre la barre, sans encoche à gauche. */
+  .seg.path.alone {
+    margin-left: 0;
+    clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 50%, calc(100% - 10px) 100%, 0 100%);
+  }
+  .seg.last {
+    margin-left: -8px;
+  }
+  .mid {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 1ch;
+    color: var(--muted);
+    overflow: hidden;
   }
 </style>

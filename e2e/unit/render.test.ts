@@ -239,10 +239,10 @@ describe("sous-agents", () => {
   });
 
   it("couleur de l'agent : nom anglais, nom français ou `agent-<couleur>` après trim()", () => {
-    expect(agentColor("blue")).toBe("#6A9BCC");
-    expect(agentColor(null, " agent-rouge ")).toBe("#DC2626");
-    expect(agentColor("vert")).toBe("#16A34A");
-    expect(agentColor("inconnue", "Explore")).toBe("#767676");
+    expect(agentColor("blue")).toBe("#8FB8E8");
+    expect(agentColor(null, " agent-rouge ")).toBe("#FF7F86");
+    expect(agentColor("vert")).toBe("#9BD17F");
+    expect(agentColor("inconnue", "Explore")).toBe("#8C8C88");
     expect(agentName("\u00a0agent-bleu ")).toBe("agent-bleu");
   });
 });

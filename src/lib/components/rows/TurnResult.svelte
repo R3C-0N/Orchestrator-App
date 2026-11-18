@@ -11,7 +11,7 @@
 </script>
 
 <div class="l dim">
-  <span class="g">{TURN_DONE}</span>
+  <span class="g grad">{TURN_DONE}</span>
   {#if row.waiting > 0}
     <span class="x"
       >Waiting for <span class="b">{row.waiting}</span> background {row.waiting === 1 ? "agent" : "agents"} to finish</span
