@@ -157,7 +157,8 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    git_command_with("git", dir, args)
+    // Chemin résolu au démarrage (`tools::program`), sinon le nom nu.
+    git_command_with(super::tools::program("git"), dir, args)
 }
 
 /// [`git_command`] avec un programme git choisi (chemin absolu de l'envoi).

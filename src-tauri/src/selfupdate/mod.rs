@@ -75,7 +75,17 @@ impl RepoConfig {
 /// par [`repo::CloneOptions::clone_timeout`] : à lancer en tâche de fond
 /// (état `Cloning` affiché pendant ce temps).
 pub async fn ensure_clone(config: &RepoConfig) -> RepoStatus {
-    repo::ensure_clone_with(config, &repo::CloneOptions::default()).await
+    // `CloneOptions::default()` lit le registre (processus `reg`) : hors du
+    // contexte async.
+    let opts = match tokio::task::spawn_blocking(repo::CloneOptions::default).await {
+        Ok(o) => o,
+        Err(e) => {
+            return RepoStatus::Disabled {
+                reason: format!("lecture de l'environnement interrompue : {e}"),
+            }
+        }
+    };
+    repo::ensure_clone_with(config, &opts).await
 }
 
 /// Demande d'amélioration (`/ameliorer <texte>`).

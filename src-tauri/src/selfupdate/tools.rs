@@ -78,6 +78,11 @@ impl ToolEnv {
             .filter(|v| !v.is_empty())
     }
 
+    /// Variable désignant un dossier ou un fichier : absolue seulement.
+    fn abs_var(&self, name: &str) -> Option<&str> {
+        self.var(name).filter(|v| Path::new(v).is_absolute())
+    }
+
     /// Dossiers du PATH du processus, puis du registre (utilisateur, machine),
     /// sans doublon.
     pub fn path_dirs(&self) -> Vec<PathBuf> {
@@ -94,6 +99,11 @@ impl ToolEnv {
                     continue;
                 }
                 let p = PathBuf::from(part);
+                // Jamais d'entrée relative (`.`, `bin`, `%VAR%` non développée) :
+                // elle serait résolue dans le dossier courant.
+                if !p.is_absolute() {
+                    continue;
+                }
                 if !out.iter().any(|q| same_path(q, &p)) {
                     out.push(p);
                 }
@@ -169,7 +179,9 @@ pub fn parse_reg_query(out: &str) -> Option<String> {
 #[cfg(windows)]
 fn read_registry_path(key: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("reg")
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let reg = Path::new(&root).join("System32").join("reg.exe");
+    let out = std::process::Command::new(reg)
         .args(["query", key, "/v", "Path"])
         .creation_flags(0x0800_0000)
         .output()
@@ -324,13 +336,18 @@ fn candidates(env: &ToolEnv, tool: &str, extra_dirs: &[PathBuf]) -> Vec<Candidat
         "cargo" => env.cargo_path.as_ref(),
         _ => None,
     };
-    if let Some(p) = over {
+    // Réglage relatif ignoré : il serait résolu dans le dossier courant.
+    if let Some(p) = over.filter(|p| p.is_absolute()) {
         out.push(cand(
             if p.is_dir() { p.join(&exe) } else { p.clone() },
             false,
         ));
     }
-    let mut dirs: Vec<PathBuf> = extra_dirs.to_vec();
+    let mut dirs: Vec<PathBuf> = extra_dirs
+        .iter()
+        .filter(|d| d.is_absolute())
+        .cloned()
+        .collect();
     dirs.extend(env.path_dirs());
     for d in &dirs {
         for ext in EXTS {
@@ -339,23 +356,23 @@ fn candidates(env: &ToolEnv, tool: &str, extra_dirs: &[PathBuf]) -> Vec<Candidat
     }
     match tool {
         "node" => {
-            if let Some(link) = env.var("NVM_SYMLINK").map(PathBuf::from) {
+            if let Some(link) = env.abs_var("NVM_SYMLINK").map(PathBuf::from) {
                 out.push(cand(link.join(&exe), false));
                 if let Ok(target) = std::fs::read_link(&link) {
                     out.push(cand(target.join(&exe), true));
                 }
             }
-            if let Some(home) = env.var("NVM_HOME") {
+            if let Some(home) = env.abs_var("NVM_HOME") {
                 for v in nvm_versions(Path::new(home)) {
                     out.push(cand(v.join(&exe), true));
                 }
             }
         }
         "cargo" => {
-            if let Some(h) = env.var("CARGO_HOME") {
+            if let Some(h) = env.abs_var("CARGO_HOME") {
                 out.push(cand(Path::new(h).join("bin").join(&exe), true));
             }
-            if let Some(h) = env.var("USERPROFILE") {
+            if let Some(h) = env.abs_var("USERPROFILE") {
                 out.push(cand(
                     Path::new(h).join(".cargo").join("bin").join(&exe),
                     true,
@@ -364,7 +381,7 @@ fn candidates(env: &ToolEnv, tool: &str, extra_dirs: &[PathBuf]) -> Vec<Candidat
         }
         "git" => {
             for k in ["ProgramFiles", "ProgramW6432", "LOCALAPPDATA"] {
-                if let Some(h) = env.var(k) {
+                if let Some(h) = env.abs_var(k) {
                     let base = Path::new(h);
                     out.push(cand(base.join("Git").join("cmd").join(&exe), true));
                     out.push(cand(
@@ -456,7 +473,7 @@ pub fn build_path(env: &ToolEnv, resolved: &HashMap<String, PathBuf>) -> String 
     let mut dirs: Vec<PathBuf> = Vec::new();
     for key in ["node", "npm", "cargo", "git"] {
         if let Some(d) = resolved.get(key).and_then(|p| p.parent()) {
-            if !dirs.iter().any(|q| same_path(q, d)) {
+            if d.is_absolute() && !dirs.iter().any(|q| same_path(q, d)) {
                 dirs.push(d.to_path_buf());
             }
         }
@@ -634,7 +651,10 @@ mod tests {
         let home = root.join("nvm");
         let old = touch(&home.join("v18.9.0"), "node");
         let new = touch(&home.join("v24.4.1"), "node");
-        let _ = touch(&home.join("v9.0.0"), "node");
+        let nine = touch(&home.join("v9.0.0"), "node");
+        // Dossiers sans version : ignorés par le tri.
+        let _ = touch(&home.join("vendor"), "node");
+        let _ = touch(&home.join("v18-x"), "node");
         let via_link = link.join(exe_name("node"));
         let env = env_with(
             &[
@@ -643,12 +663,20 @@ mod tests {
                 ("NVM_HOME", home.to_string_lossy().into_owned()),
             ],
             probe(
-                vec![old, new.clone()],
+                vec![old.clone(), new.clone(), nine.clone()],
                 vec![(via_link, "point de montage non approuvé")],
             ),
         );
         let r = resolve_tool(&env, "node", &[]).unwrap();
         assert!(same_path(&r.path, &new), "v24 attendue : {:?}", r.path);
+        // Tri numérique (v24 > v18 > v9, un tri lexical mettrait v9 en tête),
+        // sans les dossiers qui n'ont pas de version.
+        let order: Vec<String> = nvm_versions(&home)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(order, ["v24.4.1", "v18.9.0", "v9.0.0"]);
+        let _ = (old, nine);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -694,6 +722,42 @@ mod tests {
             &resolve_tool(&env, "node", &[]).unwrap().path,
             &in_path
         ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Entrées relatives (`.`, `bin`, `%VAR%` inconnue) : jamais candidates,
+    /// ni dans le PATH enrichi ; `node_path` relatif ignoré.
+    #[test]
+    fn relative_entries_are_ignored() {
+        let root = tmp("relatif");
+        let abs = root.join("abs");
+        let mut env = env_with(
+            &[(
+                "PATH",
+                format!(".{PATH_SEP}bin{PATH_SEP}%INCONNUE%{PATH_SEP}"),
+            )],
+            probe(vec![], vec![]),
+        );
+        env.user_path = Some(format!("{PATH_SEP}..{PATH_SEP}{}", abs.display()));
+        assert_eq!(env.path_dirs(), vec![abs.clone()]);
+        let mut resolved = HashMap::new();
+        resolved.insert("node".to_string(), PathBuf::from("node.exe"));
+        let p = build_path(&env, &resolved);
+        assert_eq!(p, abs.to_string_lossy());
+        // Un node.exe posé dans le dossier courant n'est pas essayé.
+        let tried = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let t2 = tried.clone();
+        env.probe = Arc::new(move |p: &Path| {
+            t2.lock().unwrap().push(p.to_path_buf());
+            Err("non".into())
+        });
+        env.node_path = Some(PathBuf::from("node.exe"));
+        let _ = resolve_tool(&env, "node", &[PathBuf::from("rel")]);
+        assert!(
+            tried.lock().unwrap().iter().all(|p| p.is_absolute()),
+            "{:?}",
+            tried.lock().unwrap()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -808,8 +872,11 @@ mod tests {
     #[ignore = "diagnostic de la machine réelle"]
     fn real_machine() {
         let env = ToolEnv::real();
-        println!("NVM_SYMLINK défini : {}", env.var("NVM_SYMLINK").is_some());
-        println!("NVM_HOME défini : {}", env.var("NVM_HOME").is_some());
+        println!(
+            "NVM_SYMLINK défini : {}",
+            env.abs_var("NVM_SYMLINK").is_some()
+        );
+        println!("NVM_HOME défini : {}", env.abs_var("NVM_HOME").is_some());
         println!(
             "dossiers du PATH (process + registre) : {}",
             env.path_dirs().len()
