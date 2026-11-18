@@ -184,3 +184,22 @@ export function threadLines(rows: readonly Row[], cwd: string | null): ThreadLin
   }
   return out;
 }
+
+/**
+ * État en clair de l'en-tête de la conversation d'un agent (maquette J15,
+ * vue détaillée) : « En attente d'action », « En cours », puis « Terminé »,
+ * « Échec » ou « Arrêté ».
+ */
+export function agentStateLabel(status: AgentStatus, waiting = false): { text: string; tone: AgentTone } {
+  if (waiting && isLive({ status })) return { text: "En attente d'action", tone: "ask" };
+  switch (status) {
+    case "Completed":
+      return { text: "Terminé", tone: "ok" };
+    case "Failed":
+      return { text: "Échec", tone: "err" };
+    case "Stopped":
+      return { text: "Arrêté", tone: "dim" };
+    default:
+      return { text: "En cours", tone: "run" };
+  }
+}

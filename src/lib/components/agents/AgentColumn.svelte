@@ -23,14 +23,19 @@
   // - `waitingOpen`, `runningOpen` (bindables) : groupes « En attente » et
   //   « En cours » ouverts, vrais par défaut ; gardés par l'app de même, pour
   //   survivre au remontage de la colonne.
+  // - `detail` : clic sur un agent → sa conversation à la place de la liste
+  //   (maquette J15, vue détaillée), faux par défaut (fil déroulé sur place).
+  // - `selected` (bindable) : `tool_use_id` de l'agent affiché en détail.
   //
   // Coût : l'horloge d'une seconde (`render/clock`) n'est lue que tant qu'un
   // agent tourne ; une colonne d'agents finis ne se redessine plus.
+  import { tick } from "svelte";
   import { seconds } from "../../render/clock.svelte";
   import { BULLET } from "../../render/glyphs";
   import type { AgentEvent } from "../../core/bindings/AgentEvent";
   import type { SessionStore } from "../../state/session.svelte";
   import AgentCard from "./AgentCard.svelte";
+  import AgentDetail from "./AgentDetail.svelte";
   import { WAITING_GLYPH, agentSummary, groupAgents, isLive, waitingIds } from "./agentView";
 
   let {
@@ -41,6 +46,8 @@
     doneOpen = $bindable(false),
     waitingOpen = $bindable(true),
     runningOpen = $bindable(true),
+    detail = false,
+    selected = $bindable(null),
   }: {
     store: SessionStore;
     width?: string;
@@ -49,6 +56,8 @@
     doneOpen?: boolean;
     waitingOpen?: boolean;
     runningOpen?: boolean;
+    detail?: boolean;
+    selected?: string | null;
   } = $props();
 
   const agents = $derived(store.agents);
@@ -59,10 +68,28 @@
   const groups = $derived(groupAgents(agents, waiting));
   // « Terminés » : le plus récent en haut, comme la maquette.
   const over = $derived(groups.over.slice().reverse());
-  /** Groupe replié : seuls ses agents dont le fil est déroulé restent affichés. */
+  /** Groupe replié : seuls ses agents dont le fil est déroulé restent affichés (aucun avec `detail`). */
   const shown = (list: AgentEvent[], isOpen: boolean) =>
-    isOpen ? list : list.filter((a) => open.includes(a.tool_use_id));
+    isOpen ? list : detail ? [] : list.filter((a) => open.includes(a.tool_use_id));
   const summary = $derived(agentSummary(groups.waiting.length, groups.running.length, agents.length));
+
+  /** Agent affiché en détail ; `null` (liste) s'il n'existe plus. */
+  const current = $derived(detail && selected !== null ? (agents.find((a) => a.tool_use_id === selected) ?? null) : null);
+  const currentQuestion = $derived(current ? (store.questions.find((q) => q.thread === current.tool_use_id) ?? null) : null);
+
+  /** Ouvre la conversation de l'agent ; le focus passe au bouton « Agents ». */
+  async function select(id: string) {
+    selected = id;
+    await tick();
+    column?.querySelector<HTMLElement>('[data-testid="agent-detail-back"]')?.focus();
+  }
+  /** Retour à la liste ; le focus revient sur l'agent quitté. */
+  async function back() {
+    const id = selected;
+    selected = null;
+    await tick();
+    if (id) column?.querySelector<HTMLElement>(`[data-agent="${CSS.escape(id)}"] button.head`)?.focus();
+  }
 
   function toggle(id: string) {
     open = open.includes(id) ? open.filter((x) => x !== id) : [...open, id];
@@ -137,6 +164,17 @@
 </script>
 
 <aside class="agents term" style:width aria-label="Agents" data-testid="agent-column" bind:this={column}>
+  {#if current}
+    <AgentDetail
+      agent={current}
+      {now}
+      waiting={waiting.has(current.tool_use_id)}
+      question={currentQuestion}
+      rows={threadOf(current.tool_use_id) ?? []}
+      cwd={store.meta.cwd}
+      onback={back}
+    />
+  {:else}
   <div class="title">
     <span class="dim">── agents ──────────────</span>
     <span class="state dim" data-testid="agent-main-state">{store.status}</span>
@@ -182,10 +220,11 @@
                 agent={a}
                 {now}
                 waiting={waiting.has(a.tool_use_id)}
-                open={expandable && open.includes(a.tool_use_id)}
-                thread={expandable && open.includes(a.tool_use_id) ? threadOf(a.tool_use_id) : null}
+                open={!detail && expandable && open.includes(a.tool_use_id)}
+                thread={!detail && expandable && open.includes(a.tool_use_id) ? threadOf(a.tool_use_id) : null}
                 cwd={store.meta.cwd}
-                ontoggle={expandable ? toggle : undefined}
+                opensDetail={detail && expandable}
+                ontoggle={expandable ? (detail ? select : toggle) : undefined}
               />
             {/each}
           </div>
@@ -218,6 +257,7 @@
     )}
     {@render group("done", "Terminés", BULLET, "ok", over, doneOpen, toggleDone, "Aucun agent terminé", false)}
   </div>
+  {/if}
   <div class="foot" data-testid="agent-count">{summary}</div>
 </aside>
 

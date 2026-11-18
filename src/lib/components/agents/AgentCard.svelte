@@ -5,7 +5,8 @@
   // Pastille d'état (`agentGlyph`), nom sur fond de sa couleur, description ;
   // dessous l'outil en cours ou l'état final, la durée et les tokens à droite.
   // Agent inconnu (`color: null`) en gris. La ligne est un bouton : clic,
-  // Entrée ou Espace déroule le fil de l'agent (bonus).
+  // Entrée ou Espace déroule le fil de l'agent (bonus), ou, avec `opensDetail`,
+  // ouvre sa conversation à la place de la liste (maquette J15).
   import type { AgentEvent } from "../../core/bindings/AgentEvent";
   import { agentColor, agentName } from "../../render/colors";
   import type { Row } from "../../state/session.svelte";
@@ -19,6 +20,7 @@
     waiting = false,
     thread = null,
     cwd = null,
+    opensDetail = false,
     ontoggle,
   }: {
     /** État complet de l'agent (dernier `AgentEvent` reçu). */
@@ -33,6 +35,8 @@
     thread?: readonly Row[] | null;
     /** Dossier de travail (chemins relatifs du fil). */
     cwd?: string | null;
+    /** Le clic ouvre la conversation de l'agent (pas de fil déroulé sur place). */
+    opensDetail?: boolean;
     /** Clic sur la ligne ; absent = ligne non dépliable. */
     ontoggle?: (toolUseId: string) => void;
   } = $props();
@@ -47,9 +51,11 @@
     type="button"
     class="head"
     disabled={!ontoggle}
-    aria-expanded={ontoggle ? open : undefined}
+    aria-expanded={ontoggle && !opensDetail ? open : undefined}
     aria-label={agentLabel(agent, now, waiting)}
-    title={`${agentName(agent.agent_type)} — ${agent.description}`}
+    title={opensDetail && ontoggle
+      ? `Ouvrir la conversation de ${agentName(agent.agent_type)} — ${agent.description}`
+      : `${agentName(agent.agent_type)} — ${agent.description}`}
     onclick={() => ontoggle?.(agent.tool_use_id)}
   >
     <span class="line">

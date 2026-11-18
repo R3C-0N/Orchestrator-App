@@ -123,6 +123,8 @@
   let verbose = $state(false);
   /** Agents dépliés dans la colonne (fil de l'agent, bonus de J9). */
   let agentsOpen: string[] = $state([]);
+  /** Agent dont la conversation remplace la liste de la colonne (maquette J15). */
+  let agentDetail: string | null = $state(null);
   // Panneau des agents terminés : replié au départ, gardé tant que l'app tourne.
   let agentsDoneOpen = $state(false);
   let agentsWaitingOpen = $state(true);
@@ -1068,6 +1070,7 @@
     slashDismissed = null;
     pickerOpen = false;
     agentsOpen = [];
+    agentDetail = null;
     startError = null;
     startFailed = null;
     return s;
@@ -1231,7 +1234,8 @@
         {/if}
       {/if}
     </div>
-    <AgentColumn {store} width="430px" bind:open={agentsOpen} bind:doneOpen={agentsDoneOpen}
+    <AgentColumn {store} width="430px" detail bind:selected={agentDetail} bind:open={agentsOpen}
+      bind:doneOpen={agentsDoneOpen}
       bind:waitingOpen={agentsWaitingOpen}
       bind:runningOpen={agentsRunningOpen}
     />
@@ -1253,8 +1257,11 @@
       data-last-seq={store.lastSeq}>{store.status} · {store.rows.length} lignes</span
     >
     <span class="seg surface rev" title="Latence d'affichage d'un token (médiane)">p50 {p50} ms</span>
-    <span class="seg accent rev last" title="Latence d'affichage d'un token (95 %)">p95 {p95} ms</span>
-    <ThemeToggle />
+    <!-- Le bouton Clair/Sombre est posé sur le segment p95 (maquette J15). -->
+    <span class="seg accent rev last">
+      <span title="Latence d'affichage d'un token (95 %)">p95 {p95} ms</span>
+      <ThemeToggle />
+    </span>
   </footer>
 </main>
 
@@ -1350,6 +1357,8 @@
     clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 50%, calc(100% - 10px) 100%, 0 100%);
   }
   .seg.last {
+    gap: 10px;
+    padding-right: 3px;
     margin-left: -8px;
   }
   .mid {
