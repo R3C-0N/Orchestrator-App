@@ -1,5 +1,7 @@
 <script lang="ts">
-  // Bouton Clair/Sombre de la barre d'état (maquette « Orchestrator », J15).
+  // Bouton Clair/Sombre de la barre d'état (maquette « Orchestrator », J15),
+  // posé sur le segment en dégradé du p95 : fond sombre translucide, texte
+  // de la couleur du segment.
   // Il montre le thème vers lequel il bascule : en sombre, soleil et
   // « Clair » ; en clair, lune et « Sombre ». L'état et sa mémoire sont dans
   // `state/theme.svelte.ts`.
@@ -44,20 +46,20 @@
   .theme {
     display: flex;
     align-items: center;
-    padding: 0 6px;
   }
   button {
     display: flex;
     align-items: center;
     gap: 6px;
-    height: 20px;
+    height: 18px;
     padding: 0 8px;
-    border: 1px solid var(--rule);
+    border: 1px solid rgba(0, 0, 0, 0.22);
     border-radius: 4px;
-    background: var(--surface);
-    color: var(--fg);
+    background: rgba(0, 0, 0, 0.14);
+    color: var(--on-accent);
     font: inherit;
     font-size: 11px;
+    font-weight: 700;
     cursor: pointer;
   }
   svg {
