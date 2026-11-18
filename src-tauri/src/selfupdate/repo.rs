@@ -7,7 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::git::{self, git, git_ok, git_timeout, resolve};
+use super::git::{git, git_ok, git_timeout, resolve};
+use super::tools::{self, ToolEnv};
 use super::{RepoConfig, DEFAULT_ORIGIN};
 use crate::api::types::RepoStatus;
 
@@ -45,6 +46,8 @@ pub struct CloneOptions {
     pub required_tools: Vec<ToolCheck>,
     /// Délai maximal du clonage (et du `fetch` d'un commit manquant).
     pub clone_timeout: Duration,
+    /// Environnement de la résolution des outils (injectable en test).
+    pub env: ToolEnv,
 }
 
 impl Default for CloneOptions {
@@ -53,10 +56,11 @@ impl Default for CloneOptions {
             required_tools: vec![
                 ToolCheck::new("git", "git", &["--version"]),
                 ToolCheck::new("Node", "node", &["--version"]),
-                ToolCheck::new("npm", git::npm_program(), &["--version"]),
+                ToolCheck::new("npm", "npm", &["--version"]),
                 ToolCheck::new("cargo", "cargo", &["--version"]),
             ],
             clone_timeout: Duration::from_secs(600),
+            env: ToolEnv::real(),
         }
     }
 }
@@ -177,19 +181,20 @@ pub fn clone_failure_reason(url: &str, err: &str) -> String {
 /// Vérifie les outils puis clone ou contrôle le clone (voir
 /// [`super::ensure_clone`]).
 pub async fn ensure_clone_with(config: &RepoConfig, opts: &CloneOptions) -> RepoStatus {
-    for tool in &opts.required_tools {
-        let mut cmd = git::command(&tool.program);
-        cmd.args(&tool.args);
-        let ok = matches!(
-            git::run(cmd, Duration::from_secs(30), &tool.label).await,
-            Ok(o) if o.ok
-        );
-        if !ok {
-            return disabled(format!(
-                "{} introuvable : /ameliorer demande git, Node, npm et cargo",
-                tool.label
-            ));
-        }
+    let checks: Vec<(String, String)> = opts
+        .required_tools
+        .iter()
+        .map(|t| (t.label.clone(), t.program.clone()))
+        .collect();
+    let env = opts.env.clone();
+    let report = match tokio::task::spawn_blocking(move || tools::check_tools(&env, &checks)).await
+    {
+        Ok(r) => r,
+        Err(e) => return disabled(format!("vérification des outils interrompue : {e}")),
+    };
+    tools::set_active(report.active.clone());
+    if let Some(reason) = report.reason() {
+        return disabled(reason);
     }
     if let Err(reason) = check_url(&config.url) {
         return disabled(reason);

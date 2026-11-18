@@ -121,6 +121,10 @@ pub const IMPROVE_ENV_ALLOW: &[&str] = &[
     "ANTHROPIC_*",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_GIT_BASH_PATH",
+    "NVM_HOME",
+    "NVM_SYMLINK",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
@@ -156,6 +160,11 @@ pub fn improve_env(global_config: &Path) -> Vec<(String, String)> {
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
+    if let Some(path) = crate::selfupdate::tools::subprocess_path() {
+        // PATH enrichi (Node, cargo, registre) : le PATH hérité peut être
+        // périmé ; appliqué après la liste blanche.
+        env.push(("PATH".into(), path));
+    }
     env.push((
         "GIT_CONFIG_GLOBAL".into(),
         global_config.to_string_lossy().into_owned(),

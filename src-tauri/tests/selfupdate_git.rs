@@ -132,6 +132,7 @@ fn git_only() -> CloneOptions {
     CloneOptions {
         required_tools: vec![ToolCheck::new("git", "git", &["--version"])],
         clone_timeout: Duration::from_secs(60),
+        ..CloneOptions::default()
     }
 }
 
@@ -530,7 +531,7 @@ async fn clone_failures_disable_with_reason() {
     };
     match ensure_clone_with(&cfg, &opts).await {
         RepoStatus::Disabled { reason } => {
-            assert!(reason.starts_with("Node introuvable"), "{reason}")
+            assert!(reason.starts_with("Node : introuvable"), "{reason}")
         }
         other => panic!("{other:?}"),
     }

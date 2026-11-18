@@ -178,7 +178,11 @@ impl NpmToolchain {
         env: &[(&str, String)],
         what: &str,
     ) -> Result<String, String> {
-        let mut c = git::command(program);
+        let mut c = git::command(super::tools::program(program));
+        if let Some(path) = super::tools::subprocess_path() {
+            // Node et cargo en tête : `npm.cmd` appelle `node` par le PATH.
+            c.env("PATH", path);
+        }
         c.current_dir(dir)
             .args(args)
             .env("NO_COLOR", "1")

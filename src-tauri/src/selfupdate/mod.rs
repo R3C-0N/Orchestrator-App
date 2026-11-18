@@ -14,6 +14,7 @@ pub mod git;
 pub mod pipeline;
 pub mod push;
 pub mod repo;
+pub mod tools;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
