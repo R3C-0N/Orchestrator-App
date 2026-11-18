@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
@@ -71,5 +72,14 @@ export default defineConfig({
   },
   build: {
     target: "es2022",
+  },
+  // Tests unitaires (`npm test`). Le premier import d'un composant Svelte
+  // dans un arbre neuf (worktree de tests de `/ameliorer`, sans cache Vite)
+  // compile à froid : mesuré à 4,8-4,9 s sur main machine au repos, au ras
+  // des 5 s par défaut, et 14,6 s avec les 12 cœurs occupés (cargo en
+  // parallèle). Borne relevée, pas supprimée : un vrai blocage échoue encore.
+  test: {
+    testTimeout: 60_000,
+    hookTimeout: 60_000,
   },
 });
