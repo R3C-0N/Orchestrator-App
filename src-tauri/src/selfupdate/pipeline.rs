@@ -33,9 +33,16 @@ const PROMPT_FALLBACK: &str = include_str!("../../../tools/self-improve/prompt.m
 
 /// Harnais entièrement protégé : aucune modification, ni ajout, ni
 /// suppression par une amélioration (refus du cycle).
-pub const PROTECTED_TREES: &[&str] = &["tools/self-improve/", "src-tauri/src/selfupdate/"];
+/// `src-tauri/.cargo/` et `src-tauri/build.rs` en font partie : des
+/// `rustflags` ou un script de build pourraient empêcher les tests restaurés
+/// de s'exécuter.
+pub const PROTECTED_TREES: &[&str] = &[
+    "tools/self-improve/",
+    "src-tauri/src/selfupdate/",
+    "src-tauri/.cargo/",
+];
 /// Fichiers protégés.
-pub const PROTECTED_FILES: &[&str] = &["tools/contract-fingerprint.mjs"];
+pub const PROTECTED_FILES: &[&str] = &["tools/contract-fingerprint.mjs", "src-tauri/build.rs"];
 /// Tests existants protégés (modification ou suppression refusée) ; un
 /// nouveau fichier de test y est permis et s'exécute en plus.
 pub const PROTECTED_EXISTING: &[&str] = &["e2e/", "src-tauri/tests/"];
@@ -46,19 +53,59 @@ pub const HARNESS_PATHS: &[&str] = &[
     "tools/contract-fingerprint.mjs",
     "src-tauri/src/selfupdate",
     "src-tauri/tests",
+    "src-tauri/.cargo",
+    "src-tauri/build.rs",
 ];
-/// Marqueurs qui désactivent ou isolent des tests JS/TS (vitest, Playwright) :
-/// refusés dans toute ligne ajoutée à un fichier de [`JS_EXTENSIONS`], que ce
-/// soit un test ou du code applicatif.
-pub const JS_SKIP_MARKERS: &[&str] = &[".skip(", ".only(", ".fixme(", "test.fail", "describe.skip"];
-/// Extensions des fichiers de code où [`JS_SKIP_MARKERS`] sont cherchés.
+/// Marqueurs de tests désactivés ou isolés, cherchés dans les lignes ajoutées
+/// des seuls fichiers de code (tests et code applicatif) : JS/TS pour
+/// [`JS_EXTENSIONS`], Rust pour les `.rs`, manifeste pour les `Cargo.toml`.
+/// La documentation et les autres fichiers ne sont jamais concernés (la spec
+/// et le prompt citent ces marqueurs).
+///
+/// JS/TS : méthodes refusées en `.nom(`, `.nom (`, `` .nom` ``, `.nom.each`
+/// (et autres chaînes de [`JS_CHAINS`]) ou `["nom"]` / `['nom']`.
+pub const JS_SKIP_METHODS: &[&str] = &["skip", "only", "fixme", "todo", "skipIf", "runIf", "fails"];
+/// Suites possibles d'une méthode de [`JS_SKIP_METHODS`] (`it.skip.each`).
+pub const JS_CHAINS: &[&str] = &[
+    "each",
+    "concurrent",
+    "sequential",
+    "shuffle",
+    "for",
+    "skip",
+    "only",
+    "todo",
+    "fails",
+    "skipIf",
+    "runIf",
+];
+/// Fonctions JS refusées en `nom(` (limite de mot : `exit(` passe).
+pub const JS_SKIP_FUNCTIONS: &[&str] = &["xit", "xtest", "xdescribe"];
+/// Sous-chaînes JS refusées telles quelles.
+pub const JS_SKIP_SUBSTRINGS: &[&str] = &["test.fail", "describe.skip"];
+/// Extensions des fichiers JS/TS concernés.
 pub const JS_EXTENSIONS: &[&str] = &[
     "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "svelte",
 ];
-/// Marqueur qui désactive un test Rust : refusé dans toute ligne ajoutée à un
-/// `.rs`. La documentation et les autres fichiers non-code ne sont jamais
-/// concernés (la spec et le prompt citent ces marqueurs).
-pub const RUST_SKIP_MARKERS: &[&str] = &["#[ignore]"];
+/// Rust (`.rs`), cherchés dans la ligne sans espaces ; s'y ajoute
+/// `cfg_attr(…, ignore)`.
+pub const RUST_SKIP_MARKERS: &[&str] = &[
+    "#[ignore",
+    "cfg(any())",
+    "cfg(FALSE)",
+    "cfg(false)",
+    "cfg(not(all()))",
+];
+/// `Cargo.toml`, cherchés dans la ligne sans espaces, en minuscules : ils
+/// retirent des cibles de test ou leur harnais.
+pub const CARGO_SKIP_MARKERS: &[&str] = &[
+    "autotests",
+    "autobins",
+    "autobenches",
+    "test=false",
+    "harness",
+    "doctest",
+];
 /// Verrou posé dans le dossier git commun du clone (`.git\improve-active`)
 /// pendant la session dédiée : resté après un arrêt brutal, il signale au
 /// démarrage suivant que `.git/config` est peut-être encore en lecture seule
@@ -524,28 +571,117 @@ pub fn restart_reasons(files: &[String]) -> Vec<String> {
     r
 }
 
-/// Marqueurs à chercher dans `file` selon son extension : ceux de JS/TS pour
-/// [`JS_EXTENSIONS`], `#[ignore]` pour les `.rs`, aucun ailleurs.
-fn markers_for(file: &str) -> &'static [&'static str] {
+/// Famille de marqueurs cherchée dans un fichier.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CodeKind {
+    None,
+    Js,
+    Rust,
+    Cargo,
+}
+
+/// Famille de marqueurs de `file` d'après son nom.
+fn code_kind(file: &str) -> CodeKind {
     let name = file.rsplit('/').next().unwrap_or(file);
+    if name == "Cargo.toml" {
+        return CodeKind::Cargo;
+    }
     let Some((_, ext)) = name.rsplit_once('.') else {
-        return &[];
+        return CodeKind::None;
     };
     let ext = ext.to_ascii_lowercase();
     if ext == "rs" {
-        RUST_SKIP_MARKERS
+        CodeKind::Rust
     } else if JS_EXTENSIONS.contains(&ext.as_str()) {
-        JS_SKIP_MARKERS
+        CodeKind::Js
     } else {
-        &[]
+        CodeKind::None
+    }
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Premier marqueur JS/TS de `line` (voir [`JS_SKIP_METHODS`]).
+fn js_marker(line: &str) -> Option<String> {
+    if let Some(m) = JS_SKIP_SUBSTRINGS.iter().find(|m| line.contains(*m)) {
+        return Some(m.to_string());
+    }
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    for name in JS_SKIP_METHODS {
+        let dotted = format!(".{name}");
+        for (i, _) in line.match_indices(&dotted) {
+            let rest = line[i + dotted.len()..].trim_start();
+            if rest.starts_with('(') || rest.starts_with('`') {
+                return Some(format!(".{name}("));
+            }
+            if let Some(after) = rest.strip_prefix('.') {
+                let next: String = after.chars().take_while(|c| is_ident(*c)).collect();
+                if JS_CHAINS.contains(&next.as_str()) {
+                    return Some(format!(".{name}.{next}"));
+                }
+            }
+        }
+        for q in ['"', '\'', '`'] {
+            if compact.contains(&format!("[{q}{name}{q}]")) {
+                return Some(format!("[{q}{name}{q}]"));
+            }
+        }
+    }
+    for name in JS_SKIP_FUNCTIONS {
+        for (i, _) in line.match_indices(name) {
+            let before = line[..i].chars().next_back();
+            if before.is_some_and(|c| is_ident(c) || c == '.') {
+                continue;
+            }
+            if line[i + name.len()..].trim_start().starts_with('(') {
+                return Some(format!("{name}("));
+            }
+        }
+    }
+    None
+}
+
+/// Premier marqueur Rust de `line` (ligne sans espaces).
+fn rust_marker(line: &str) -> Option<String> {
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Some(m) = RUST_SKIP_MARKERS.iter().find(|m| compact.contains(*m)) {
+        return Some(m.to_string());
+    }
+    let attr = compact.find("cfg_attr(")?;
+    compact[attr..]
+        .contains(",ignore")
+        .then(|| "cfg_attr(…, ignore)".to_string())
+}
+
+/// Premier marqueur de `Cargo.toml` de `line` (sans espaces, en minuscules).
+fn cargo_marker(line: &str) -> Option<String> {
+    let compact: String = line
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    CARGO_SKIP_MARKERS
+        .iter()
+        .find(|m| compact.contains(*m))
+        .map(|m| m.to_string())
+}
+
+fn marker_in(kind: CodeKind, line: &str) -> Option<String> {
+    match kind {
+        CodeKind::None => None,
+        CodeKind::Js => js_marker(line),
+        CodeKind::Rust => rust_marker(line),
+        CodeKind::Cargo => cargo_marker(line),
     }
 }
 
 /// Lignes ajoutées (diff `-U0`) d'un fichier de code contenant un marqueur
-/// qui désactive ou isole des tests ([`markers_for`]).
+/// qui désactive ou isole des tests ([`code_kind`]).
 pub fn skip_markers(diff: &str) -> Vec<String> {
     let mut file = String::new();
-    let mut markers: &[&str] = &[];
+    let mut kind = CodeKind::None;
     // En-tête d'un fichier (de `diff --git` au premier `@@`) : seule zone où
     // `+++ ` nomme le fichier ; ailleurs c'est une ligne ajoutée qui commence
     // par `++ ` et ne doit pas changer le fichier courant.
@@ -555,19 +691,21 @@ pub fn skip_markers(diff: &str) -> Vec<String> {
         if line.starts_with("diff --git ") {
             header = true;
             file.clear();
-            markers = &[];
+            kind = CodeKind::None;
         } else if line.starts_with("@@") {
             header = false;
         } else if let Some(f) = line.strip_prefix("+++ ").filter(|_| header) {
+            // Chemin avec une espace : git ajoute une tabulation finale.
+            let f = f.trim_end_matches('\t');
             // Chemin cité par git (caractères spéciaux) : `"b/…"`.
             let f = f
                 .strip_prefix('"')
                 .and_then(|f| f.strip_suffix('"'))
                 .unwrap_or(f);
             file = f.strip_prefix("b/").unwrap_or(f).to_string();
-            markers = markers_for(&file);
+            kind = code_kind(&file);
         } else if let Some(added) = line.strip_prefix('+').filter(|_| !header) {
-            if let Some(m) = markers.iter().find(|m| added.contains(*m)) {
+            if let Some(m) = marker_in(kind, added) {
                 found.push(format!("{file} : « {m} »"));
             }
         }
@@ -1642,9 +1780,102 @@ mod tests {
         let quoted = "diff --git \"a/caf\\303\\251.ts\" \"b/caf\\303\\251.ts\"\n\
                       +++ \"b/caf\\303\\251.ts\"\n@@ -0,0 +1 @@\n+it.only(1)\n";
         assert_eq!(skip_markers(quoted).len(), 1);
+        // Chemin avec une espace : git termine la ligne `+++` par une tabulation.
+        let spaced = "diff --git a/e2e/unit/my test.test.ts b/e2e/unit/my test.test.ts\n\
+                      --- /dev/null\n+++ b/e2e/unit/my test.test.ts\t\n@@ -0,0 +1 @@\n+it.only(1)\n";
+        assert_eq!(
+            skip_markers(spaced),
+            ["e2e/unit/my test.test.ts : « .only( »"]
+        );
         // Une ligne ajoutée qui commence par `++ ` ne change pas de fichier.
         let sneaky = one_file("src/a.ts", "++ x.md") + "+it.only(1)\n";
         assert_eq!(skip_markers(&sneaky), ["src/a.ts : « .only( »"]);
+    }
+
+    #[test]
+    fn js_markers_variants() {
+        let hit = |l: &str| js_marker(l);
+        for l in [
+            "it.skipIf(ci)(\"x\", () => {});",
+            "test.runIf(false)(\"x\", () => {});",
+            "it.todo(\"x\");",
+            "it.fails(\"x\", () => {});",
+            "it.skip (\"x\", () => {});",
+            "it.only.each([1])(\"x\", () => {});",
+            "it[\"skip\"](\"x\", () => {});",
+            "it['only'](\"x\", () => {});",
+            "it[ 'skip' ](\"x\", () => {});",
+            "xit(\"x\", () => {});",
+            "  xtest (\"x\", () => {});",
+            "xdescribe(\"x\", () => {});",
+            "test.failing(\"x\", () => {});",
+            "describe.skip\n",
+        ] {
+            assert!(hit(l).is_some(), "{l}");
+        }
+        for l in [
+            "process.exit(1);",
+            "maxit(2);",
+            "obj.xit(1);",
+            "const skipped = list.skipped;",
+            "item.todo.title",
+            "x.skipItems(2)",
+            "const only = 1;",
+            "a[\"skipper\"]",
+        ] {
+            assert_eq!(hit(l), None, "{l}");
+        }
+        assert_eq!(hit("it.skipIf(x)(1)").as_deref(), Some(".skipIf("));
+        assert_eq!(hit("xit(1)").as_deref(), Some("xit("));
+    }
+
+    #[test]
+    fn rust_and_cargo_markers() {
+        let n = |path: &str, added: &str| skip_markers(&one_file(path, added)).len();
+        for l in [
+            "#[ignore = \"lent\"]",
+            "# [ ignore ]",
+            "#[cfg(any())]",
+            "#[cfg( any( ) )]",
+            "#[cfg(FALSE)]",
+            "#[cfg(false)]",
+            "#[cfg(not(all()))]",
+            "#[cfg_attr(windows, ignore)]",
+            "#[cfg_attr(test, ignore = \"x\")]",
+        ] {
+            assert_eq!(n("src-tauri/src/a.rs", l), 1, "{l}");
+        }
+        assert_eq!(n("src-tauri/src/a.rs", "#[cfg(test)]"), 0);
+        assert_eq!(
+            n("src-tauri/src/a.rs", "#[cfg_attr(test, derive(Debug))]"),
+            0
+        );
+        for l in [
+            "autotests = false",
+            "autobins=false",
+            "autobenches = false",
+            "test = false",
+            "test=false",
+            "harness = false",
+            "doctest = false",
+        ] {
+            assert_eq!(n("src-tauri/Cargo.toml", l), 1, "{l}");
+        }
+        assert_eq!(n("src-tauri/Cargo.toml", "serde = \"1\""), 0);
+        assert_eq!(n("src-tauri/Cargo.lock", "harness"), 0);
+    }
+
+    #[test]
+    fn cargo_config_and_build_script_are_protected() {
+        for p in ["src-tauri/.cargo/config.toml", "src-tauri/build.rs"] {
+            assert!(touches_harness(p, 'M'), "{p}");
+            assert!(touches_harness(p, 'A'), "{p}");
+        }
+        assert!(touches_harness("src-tauri/.cargo/autre.toml", 'A'));
+        assert!(!touches_harness("src-tauri/Cargo.toml", 'M'));
+        for p in ["src-tauri/.cargo", "src-tauri/build.rs"] {
+            assert!(HARNESS_PATHS.contains(&p), "{p}");
+        }
     }
 
     #[test]

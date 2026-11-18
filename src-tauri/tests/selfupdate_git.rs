@@ -818,7 +818,7 @@ async fn protected_harness_and_skip_markers_are_refused() {
                 vec![("src-tauri/tests/t.rs", "#[ignore]\n#[test]\nfn t() {}\n")],
                 "ignore",
             )]),
-            "« #[ignore] »",
+            "src-tauri/tests/t.rs : « #[ignore »",
         ),
         (
             // Code applicatif, pas seulement les fichiers de test.
@@ -830,6 +830,35 @@ async fn protected_harness_and_skip_markers_are_refused() {
                 "skip svelte",
             )]),
             "src/Vue.svelte : « .skip( »",
+        ),
+        (
+            // Chemin avec une espace (tabulation finale dans le diff).
+            success_host(vec![commit_src(
+                vec![("e2e/unit/mon test.test.ts", "xit(\"x\", () => {});\n")],
+                "espace",
+            )]),
+            "e2e/unit/mon test.test.ts : « xit( »",
+        ),
+        (
+            success_host(vec![commit_src(
+                vec![("src-tauri/Cargo.toml", "[package]\nautotests = false\n")],
+                "autotests",
+            )]),
+            "src-tauri/Cargo.toml : « autotests »",
+        ),
+        (
+            success_host(vec![commit_src(
+                vec![("src-tauri/.cargo/config.toml", "[build]\n")],
+                "cargo config",
+            )]),
+            "src-tauri/.cargo/config.toml (harnais",
+        ),
+        (
+            success_host(vec![commit_src(
+                vec![("src-tauri/build.rs", "fn main() {}\n")],
+                "build",
+            )]),
+            "src-tauri/build.rs (harnais",
         ),
         (
             success_host(vec![commit_src(
