@@ -821,6 +821,17 @@ async fn protected_harness_and_skip_markers_are_refused() {
             "« #[ignore] »",
         ),
         (
+            // Code applicatif, pas seulement les fichiers de test.
+            success_host(vec![commit_src(
+                vec![(
+                    "src/Vue.svelte",
+                    "<script>it.skip(\"x\", () => {});</script>\n",
+                )],
+                "skip svelte",
+            )]),
+            "src/Vue.svelte : « .skip( »",
+        ),
+        (
             success_host(vec![commit_src(
                 vec![("src/.gitattributes", "*.bin binary\n")],
                 "attributs",
@@ -839,6 +850,31 @@ async fn protected_harness_and_skip_markers_are_refused() {
         assert_refused(&out, needle);
         assert_eq!(main_of(&cfg), c1);
     }
+}
+
+/// La documentation (la spec cite les marqueurs) n'est jamais refusée pour
+/// un marqueur de test désactivé : seuls les fichiers de code le sont.
+#[tokio::test]
+async fn skip_markers_in_docs_are_accepted() {
+    let root = TempRoot::new("skipdoc");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    let host = Arc::new(success_host(vec![commit_src(
+        vec![
+            (
+                "docs/regle.md",
+                "Refusés : `.skip(`, `.only(`, `.fixme(`, `test.fail`, `describe.skip`, `#[ignore]`.\n",
+            ),
+            ("src/note.txt", "it.only(\n"),
+        ],
+        "documente la règle",
+    )]));
+    let p = pipeline(&root, cfg.clone(), host, Arc::new(FakeToolchain::new()));
+    let (out, log) = run(&p, "documenter").await;
+    let ImproveOutcome::Merged { commit } = out else {
+        panic!("{out:?} / {:?}", log.last())
+    };
+    assert_eq!(main_of(&cfg), commit);
+    assert_ne!(commit, c1);
 }
 
 #[tokio::test]

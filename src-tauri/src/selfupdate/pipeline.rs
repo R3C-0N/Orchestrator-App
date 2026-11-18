@@ -47,16 +47,18 @@ pub const HARNESS_PATHS: &[&str] = &[
     "src-tauri/src/selfupdate",
     "src-tauri/tests",
 ];
-/// Marqueurs qui désactivent ou isolent des tests : refusés dans toute ligne
-/// ajoutée par la branche.
-pub const SKIP_MARKERS: &[&str] = &[
-    ".skip(",
-    ".only(",
-    ".fixme(",
-    "test.fail",
-    "describe.skip",
-    "#[ignore]",
+/// Marqueurs qui désactivent ou isolent des tests JS/TS (vitest, Playwright) :
+/// refusés dans toute ligne ajoutée à un fichier de [`JS_EXTENSIONS`], que ce
+/// soit un test ou du code applicatif.
+pub const JS_SKIP_MARKERS: &[&str] = &[".skip(", ".only(", ".fixme(", "test.fail", "describe.skip"];
+/// Extensions des fichiers de code où [`JS_SKIP_MARKERS`] sont cherchés.
+pub const JS_EXTENSIONS: &[&str] = &[
+    "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "svelte",
 ];
+/// Marqueur qui désactive un test Rust : refusé dans toute ligne ajoutée à un
+/// `.rs`. La documentation et les autres fichiers non-code ne sont jamais
+/// concernés (la spec et le prompt citent ces marqueurs).
+pub const RUST_SKIP_MARKERS: &[&str] = &["#[ignore]"];
 /// Verrou posé dans le dossier git commun du clone (`.git\improve-active`)
 /// pendant la session dédiée : resté après un arrêt brutal, il signale au
 /// démarrage suivant que `.git/config` est peut-être encore en lecture seule
@@ -522,15 +524,50 @@ pub fn restart_reasons(files: &[String]) -> Vec<String> {
     r
 }
 
-/// Lignes ajoutées (diff `-U0`) contenant un marqueur de [`SKIP_MARKERS`].
+/// Marqueurs à chercher dans `file` selon son extension : ceux de JS/TS pour
+/// [`JS_EXTENSIONS`], `#[ignore]` pour les `.rs`, aucun ailleurs.
+fn markers_for(file: &str) -> &'static [&'static str] {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return &[];
+    };
+    let ext = ext.to_ascii_lowercase();
+    if ext == "rs" {
+        RUST_SKIP_MARKERS
+    } else if JS_EXTENSIONS.contains(&ext.as_str()) {
+        JS_SKIP_MARKERS
+    } else {
+        &[]
+    }
+}
+
+/// Lignes ajoutées (diff `-U0`) d'un fichier de code contenant un marqueur
+/// qui désactive ou isole des tests ([`markers_for`]).
 pub fn skip_markers(diff: &str) -> Vec<String> {
-    let mut file = "";
+    let mut file = String::new();
+    let mut markers: &[&str] = &[];
+    // En-tête d'un fichier (de `diff --git` au premier `@@`) : seule zone où
+    // `+++ ` nomme le fichier ; ailleurs c'est une ligne ajoutée qui commence
+    // par `++ ` et ne doit pas changer le fichier courant.
+    let mut header = false;
     let mut found = Vec::new();
     for line in diff.lines() {
-        if let Some(f) = line.strip_prefix("+++ ") {
-            file = f.strip_prefix("b/").unwrap_or(f);
-        } else if let Some(added) = line.strip_prefix('+') {
-            if let Some(m) = SKIP_MARKERS.iter().find(|m| added.contains(*m)) {
+        if line.starts_with("diff --git ") {
+            header = true;
+            file.clear();
+            markers = &[];
+        } else if line.starts_with("@@") {
+            header = false;
+        } else if let Some(f) = line.strip_prefix("+++ ").filter(|_| header) {
+            // Chemin cité par git (caractères spéciaux) : `"b/…"`.
+            let f = f
+                .strip_prefix('"')
+                .and_then(|f| f.strip_suffix('"'))
+                .unwrap_or(f);
+            file = f.strip_prefix("b/").unwrap_or(f).to_string();
+            markers = markers_for(&file);
+        } else if let Some(added) = line.strip_prefix('+').filter(|_| !header) {
+            if let Some(m) = markers.iter().find(|m| added.contains(*m)) {
                 found.push(format!("{file} : « {m} »"));
             }
         }
@@ -1563,9 +1600,51 @@ mod tests {
                     +it.only(\"ajouté\", () => {});\n\
                     +#[ignore]\n";
         let found = skip_markers(diff);
-        assert_eq!(found.len(), 2, "{found:?}");
-        assert!(found[0].starts_with("e2e/unit/x.test.ts"));
-        assert!(skip_markers("+++ b/a.ts\n+const ok = 1;\n").is_empty());
+        // `#[ignore]` n'est cherché que dans les `.rs`.
+        assert_eq!(found, ["e2e/unit/x.test.ts : « .only( »"]);
+        assert!(skip_markers(&one_file("a.ts", "const ok = 1;")).is_empty());
+    }
+
+    /// Diff `-U0` d'un fichier `path` qui ajoute la ligne `added`.
+    fn one_file(path: &str, added: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n+{added}\n"
+        )
+    }
+
+    #[test]
+    fn skip_markers_only_in_code_files() {
+        let n = |path: &str, added: &str| skip_markers(&one_file(path, added)).len();
+        // Documentation et fichiers non-code : jamais concernés.
+        assert_eq!(n("docs/spec.md", "ajoute `.skip(` ou `#[ignore]`"), 0);
+        assert_eq!(
+            n("tools/self-improve/prompt.md", "test.fail, describe.skip"),
+            0
+        );
+        assert_eq!(n("src/data.json", "\"it.only(\""), 0);
+        assert_eq!(n("Makefile", "x.skip(1)"), 0);
+        // Code JS/TS/Svelte, test ou code applicatif.
+        for p in [
+            "e2e/a.spec.ts",
+            "src/App.svelte",
+            "src/x.tsx",
+            "src/x.mjs",
+            "src/X.TS",
+        ] {
+            assert_eq!(n(p, "it.skip(\"x\", () => {});"), 1, "{p}");
+        }
+        assert_eq!(n("src/lib/x.ts", "test.only(\"x\", () => {});"), 1);
+        // Rust : `#[ignore]` seulement.
+        assert_eq!(n("src-tauri/src/a.rs", "#[ignore]"), 1);
+        assert_eq!(n("src-tauri/src/a.rs", "v.iter().skip(1)"), 0);
+        assert_eq!(n("src/a.ts", "#[ignore]"), 0);
+        // Chemin cité par git.
+        let quoted = "diff --git \"a/caf\\303\\251.ts\" \"b/caf\\303\\251.ts\"\n\
+                      +++ \"b/caf\\303\\251.ts\"\n@@ -0,0 +1 @@\n+it.only(1)\n";
+        assert_eq!(skip_markers(quoted).len(), 1);
+        // Une ligne ajoutée qui commence par `++ ` ne change pas de fichier.
+        let sneaky = one_file("src/a.ts", "++ x.md") + "+it.only(1)\n";
+        assert_eq!(skip_markers(&sneaky), ["src/a.ts : « .only( »"]);
     }
 
     #[test]

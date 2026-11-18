@@ -28,7 +28,7 @@ Tout fichier hors de ces dossiers (`package.json`, `package-lock.json`, `README.
 
 Une modification de `src-tauri/`, de `tauri.conf.json` ou du contrat entre l'interface et le cœur (`src/lib/core/bindings/`, `src-tauri/capabilities/default.json`, `src-tauri/build.rs`) n'est pas activée tout de suite : elle demande de recompiler l'exe. Préfère une solution dans l'interface (`src/`) quand c'est possible.
 
-Le harnais de test est protégé : ne modifie ni ne supprime aucun test existant (`e2e/`, `src-tauri/tests/`), ni `tools/self-improve/`, `tools/contract-fingerprint.mjs` ou `src-tauri/src/selfupdate/`. Tu peux **ajouter** de nouveaux fichiers de test, qui s'exécuteront avec les autres. N'ajoute jamais `.skip(`, `.only(`, `.fixme(`, `test.fail`, `describe.skip` ou `#[ignore]` : l'amélioration serait refusée. Les tests sont relancés par le cœur sur une copie où le harnais d'origine est restauré.
+Le harnais de test est protégé : ne modifie ni ne supprime aucun test existant (`e2e/`, `src-tauri/tests/`), ni `tools/self-improve/`, `tools/contract-fingerprint.mjs` ou `src-tauri/src/selfupdate/`. Tu peux **ajouter** de nouveaux fichiers de test, qui s'exécuteront avec les autres. N'ajoute jamais `.skip(`, `.only(`, `.fixme(`, `test.fail` ou `describe.skip` dans un fichier de code JS/TS/Svelte, ni `#[ignore]` dans un `.rs` : l'amélioration serait refusée (la documentation, qui cite ces marqueurs, n'est pas concernée). Les tests sont relancés par le cœur sur une copie où le harnais d'origine est restauré.
 
 Ne crée ni lien symbolique, ni sous-module, ni `.gitattributes`. Ne modifie pas la configuration git (`git config`, `git remote`, hooks).
 
