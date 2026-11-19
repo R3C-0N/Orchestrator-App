@@ -6,7 +6,9 @@ use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use orchestrator_lib::sessions::list::{list_projects, list_sessions, MAX_SESSIONS};
+use orchestrator_lib::sessions::list::{
+    is_improve_project, list_projects, list_projects_except, list_sessions, MAX_SESSIONS,
+};
 use orchestrator_lib::sessions::paths::encode_project_dir;
 
 fn fixtures() -> PathBuf {
@@ -306,4 +308,58 @@ fn local_projects_and_sessions_timing() {
         "list_sessions : pire cas {} ms pour {} sessions",
         worst.0, worst.1
     );
+}
+
+/// J16 : les transcripts des sessions d'amélioration (`cwd` sous
+/// `%LOCALAPPDATA%\orchestrator\work`) ne sont pas des projets de
+/// l'utilisateur : exclus de la liste, `cwd` lisible ou non.
+#[test]
+fn improve_worktrees_are_not_listed_as_projects() {
+    let root = temp_root("improve");
+    let work = Path::new(r"C:\Users\u\AppData\Local\orchestrator\work");
+    let mk = |cwd: &str, with_cwd: bool| {
+        let dir = root.join(encode_project_dir(cwd));
+        fs::create_dir_all(&dir).unwrap();
+        let line = if with_cwd {
+            line_user(cwd, "bonjour")
+        } else {
+            serde_json::json!({"type": "summary", "summary": "x"}).to_string()
+        };
+        fs::write(dir.join(format!("{}.jsonl", uuid_n(1))), line + "\n").unwrap();
+    };
+    mk(
+        r"C:\Users\u\AppData\Local\orchestrator\work\auto\20261119-0900-demo",
+        true,
+    );
+    mk(r"c:\users\u\appdata\local\orchestrator\WORK\auto\x", true);
+    mk(
+        r"C:\Users\u\AppData\Local\orchestrator\work\.tests\auto-y",
+        false,
+    );
+    mk(r"C:\Users\u\AppData\Local\orchestrator\workshop", true);
+    mk(r"H:\Code\projet", true);
+    let all = list_projects_except(&root, None);
+    assert_eq!(all.len(), 5);
+    let kept: Vec<Option<String>> = list_projects_except(&root, Some(work))
+        .into_iter()
+        .map(|p| p.path)
+        .collect();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert!(kept.contains(&Some(r"H:\Code\projet".into())));
+    assert!(
+        kept.contains(&Some(
+            r"C:\Users\u\AppData\Local\orchestrator\workshop".into()
+        )),
+        "un dossier voisin qui commence pareil reste"
+    );
+    assert!(is_improve_project(
+        Some(r"C:/Users/u/AppData/Local/orchestrator/work/"),
+        "",
+        work
+    ));
+    assert!(!is_improve_project(
+        Some(r"C:\Users\u\AppData\Local\orchestrator"),
+        "",
+        work
+    ));
 }

@@ -1069,6 +1069,51 @@ impl AppState {
         let s = self.get(session)?;
         s.interrupt(cancel_queued).await
     }
+
+    /// Corps de la commande `set_model` : refusée pour une session
+    /// d'amélioration (modèle fixé par `config.json`).
+    pub async fn set_model(&self, session: &SessionKey, model: &str) -> Result<String, CoreError> {
+        validate_model(model)?;
+        self.refuse_improve(session, "le changement de modèle")?;
+        let s = self.get(session)?;
+        s.set_model(model).await
+    }
+
+    /// Corps de la commande `answer_question` : refusée pour une session
+    /// d'amélioration (`AskUserQuestion` lui est refusé).
+    pub fn answer_question(
+        &self,
+        session: &SessionKey,
+        request_id: &str,
+        answers: &Answers,
+        response: Option<&str>,
+    ) -> Result<(), CoreError> {
+        self.refuse_improve(session, "la réponse à une question")?;
+        self.get(session)?
+            .answer_question(request_id, answers, response)
+    }
+
+    /// Corps de la commande `skip_question` : refusée pour une session
+    /// d'amélioration.
+    pub fn skip_question(
+        &self,
+        session: &SessionKey,
+        request_id: &str,
+        reason: SkipReason,
+    ) -> Result<(), CoreError> {
+        self.refuse_improve(session, "la réponse à une question")?;
+        self.get(session)?.skip_question(request_id, reason)
+    }
+
+    /// Corps de la commande `stop_session` : refusée pour une session
+    /// d'amélioration (son processus de tour appartient au cycle :
+    /// `improve_cancel`, `improve_dismiss`).
+    pub async fn stop_session(&self, session: &SessionKey) -> Result<ExitInfo, CoreError> {
+        self.refuse_improve(session, "l'arrêt")?;
+        self.close_session(session)
+            .await
+            .ok_or(CoreError::NotRunning)
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1077,10 +1122,7 @@ pub async fn set_model(
     session: SessionKey,
     model: String,
 ) -> Result<String, CoreError> {
-    validate_model(&model)?;
-    state.refuse_improve(&session, "le changement de modèle")?;
-    let s = state.get(&session)?;
-    s.set_model(&model).await
+    state.set_model(&session, &model).await
 }
 
 /// Même règle que l'argument `--model` du lancement
@@ -1103,10 +1145,7 @@ pub fn answer_question(
     answers: Answers,
     response: Option<String>,
 ) -> Result<(), CoreError> {
-    state.refuse_improve(&session, "la réponse à une question")?;
-    state
-        .get(&session)?
-        .answer_question(&request_id, &answers, response.as_deref())
+    state.answer_question(&session, &request_id, &answers, response.as_deref())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1116,8 +1155,7 @@ pub fn skip_question(
     request_id: String,
     reason: SkipReason,
 ) -> Result<(), CoreError> {
-    state.refuse_improve(&session, "la réponse à une question")?;
-    state.get(&session)?.skip_question(&request_id, reason)
+    state.skip_question(&session, &request_id, reason)
 }
 
 fn projects_root() -> Result<PathBuf, CoreError> {
@@ -1182,10 +1220,7 @@ pub async fn stop_session(
     state: State<'_, AppState>,
     session: SessionKey,
 ) -> Result<ExitInfo, CoreError> {
-    state
-        .close_session(&session)
-        .await
-        .ok_or(CoreError::NotRunning)
+    state.stop_session(&session).await
 }
 
 /// J14 (spec décision 15) : une interface (re)chargée se rattache aux

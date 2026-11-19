@@ -156,9 +156,52 @@ pub fn is_network_path(p: &str) -> bool {
     p.starts_with(r"\\") || p.starts_with("//")
 }
 
+/// Dossier des worktrees de l'auto-amélioration
+/// (`%LOCALAPPDATA%\orchestrator\work`, J14 décision 16) : les transcripts
+/// des sessions d'amélioration (une par cycle, J16) y ont leur `cwd`.
+pub fn improve_work_root() -> Option<PathBuf> {
+    crate::selfupdate::data_dir().map(|d| d.join("work"))
+}
+
+/// Chemin normalisé pour comparer sans casse ni séparateur final.
+fn norm(p: &str) -> String {
+    p.replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+/// Le projet (`cwd` lu dans ses transcripts, sinon son nom encodé) est sous
+/// `work` : session d'amélioration lancée par l'app, pas un projet de
+/// l'utilisateur. Sans `cwd` lisible, le nom encodé tranche (préfixe du nom
+/// encodé de `work` suivi d'un séparateur).
+pub fn is_improve_project(path: Option<&str>, encoded: &str, work: &Path) -> bool {
+    let w = norm(&work.to_string_lossy());
+    if w.is_empty() {
+        return false;
+    }
+    match path {
+        Some(p) => {
+            let p = norm(p);
+            p == w || p.starts_with(&format!("{w}\\"))
+        }
+        None => {
+            let e = encode_project_dir(&w).to_ascii_lowercase();
+            encoded.to_ascii_lowercase().starts_with(&format!("{e}-"))
+        }
+    }
+}
+
 /// Projets récents de `root` (`~/.claude/projects`), du plus récent au plus
 /// ancien. Un dossier sans transcript est ignoré. `root` absent : liste vide.
+/// Les sessions d'amélioration (`cwd` sous [`improve_work_root`]) sont
+/// exclues (J16).
 pub fn list_projects(root: &Path) -> Vec<ProjectSummary> {
+    list_projects_except(root, improve_work_root().as_deref())
+}
+
+/// [`list_projects`], en excluant les projets dont le `cwd` est sous `work`
+/// (`None` : aucun exclu).
+pub fn list_projects_except(root: &Path, work: Option<&Path>) -> Vec<ProjectSummary> {
     let Ok(rd) = fs::read_dir(root) else {
         return vec![];
     };
@@ -174,6 +217,9 @@ pub fn list_projects(root: &Path) -> Vec<ProjectSummary> {
                 .iter()
                 .take(CWD_TRIES)
                 .find_map(|t| cwd_from_head(&t.path, &encoded));
+            if work.is_some_and(|w| is_improve_project(path.as_deref(), &encoded, w)) {
+                return None;
+            }
             // Un chemin réseau (`\\serveur\…`, `\\?\UNC\…`) peut bloquer
             // longtemps : il n'est pas testé, il reste sélectionnable et
             // `exists_checked` vaut faux.

@@ -1360,3 +1360,128 @@ async fn improve_turn_death_cancel_and_app_close() {
     assert!(end.is_err(), "tour non fini : {end:?}");
     assert_eq!(conv.launches(), 3);
 }
+
+fn grandchild_pid(events: &[CoreEvent]) -> Option<u32> {
+    events.iter().find_map(|e| match &e.body {
+        EventBody::Stderr { line } => line
+            .strip_prefix("GRANDCHILD_PID ")
+            .and_then(|p| p.trim().parse().ok()),
+        _ => None,
+    })
+}
+
+/// Relecture de e77c128 : le petit-enfant d'un processus de tour meurt
+/// avec lui, à la fin du tour (`run_improve_turn` rendu) comme après un
+/// `kill` (Job Object), dans le journal partagé de la conversation.
+#[tokio::test]
+async fn improve_turn_grandchild_dies_with_the_turn() {
+    let state = AppState::new(std::env::temp_dir());
+    let key = cycle_key();
+    let conv = state.improve_conversation(&key, &std::env::temp_dir());
+    // Fin du tour (processus mort en plein tour, petit-enfant qui tient
+    // stdout) : rien ne survit au retour.
+    let end = state
+        .run_improve_turn(
+            &key,
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "x",
+            false,
+            isolated(&["--fake-mode", "orphan-stdout"]),
+            fast(),
+            Duration::from_secs(20),
+        )
+        .await;
+    assert!(end.is_err(), "{end:?}");
+    let g1 = grandchild_pid(&conv.outlet.events()).expect("GRANDCHILD_PID");
+    println!("petit-enfant du tour : {g1}");
+    assert!(!alive(g1), "petit-enfant mort à la fin du tour");
+    assert!(!alive(conv.last_pid()));
+
+    // `kill` d'un processus lancé sur le journal de la conversation.
+    let before = conv.outlet.events().len();
+    let s = Session::start_on(
+        conv.outlet.clone(),
+        &fake_exe(),
+        &std::env::temp_dir(),
+        isolated(&["--fake-mode", "orphan-stdout"]),
+        SessionRole::Improve,
+        fast(),
+    )
+    .await
+    .unwrap();
+    let t0 = Instant::now();
+    let g2 = loop {
+        if let Some(g) = grandchild_pid(&conv.outlet.events()[before..]) {
+            break g;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(5), "pas de petit-enfant");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(alive(g2), "petit-enfant vivant avant le kill");
+    s.kill();
+    assert!(s.wait_exit(Duration::from_secs(5)).await.is_some());
+    let t0 = Instant::now();
+    while alive(g2) {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "petit-enfant après kill"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!alive(s.pid));
+}
+
+/// Relecture de e77c128 : `stop_session`, `set_model`, `answer_question`
+/// et `skip_question` refusés pour une clé d'amélioration, entre deux
+/// tours comme pendant un tour (le processus du tour n'est pas touché).
+#[tokio::test]
+async fn improve_key_refuses_session_commands() {
+    use orchestrator_lib::api::types::{Answers, SkipReason};
+    let state = Arc::new(AppState::new(std::env::temp_dir()));
+    let key = cycle_key();
+    let conv = state.improve_conversation(&key, &std::env::temp_dir());
+    let refused = |r: Result<(), CoreError>, what: &str| {
+        assert!(
+            matches!(r, Err(CoreError::InvalidArgument(_))),
+            "{what} : {r:?}"
+        );
+    };
+    let check_all = |state: Arc<AppState>, key: SessionKey| async move {
+        refused(state.stop_session(&key).await.map(drop), "stop_session");
+        refused(state.set_model(&key, "haiku").await.map(drop), "set_model");
+        refused(
+            state.answer_question(&key, "q1", &Answers::new(), None),
+            "answer_question",
+        );
+        refused(
+            state.skip_question(&key, "q1", SkipReason::Dismissed),
+            "skip_question",
+        );
+        refused(state.send_message(&key, "x"), "send_message");
+        refused(state.interrupt(&key, false).await.map(drop), "interrupt");
+    };
+    check_all(state.clone(), key.clone()).await;
+
+    let (st, k) = (state.clone(), key.clone());
+    let turn = tokio::spawn(async move {
+        st.run_improve_turn(
+            &k,
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "long",
+            false,
+            isolated(&["--fake-interrupt-no-result"]),
+            fast_interrupt(),
+            Duration::from_secs(30),
+        )
+        .await
+    });
+    let pid = wait_turn_started(&conv).await;
+    check_all(state.clone(), key.clone()).await;
+    assert!(alive(pid), "stop_session refusé : tour intact");
+    assert!(conv.current().is_some());
+    state.interrupt_improve_turn(&key).await.unwrap();
+    assert_eq!(turn.await.unwrap(), Ok(TurnEnd::Interrupted));
+    assert!(!alive(pid));
+}

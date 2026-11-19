@@ -70,6 +70,14 @@ pub fn transcript_path(project_dir: &Path, session_id: &str) -> PathBuf {
     project_dir.join(format!("{session_id}.jsonl"))
 }
 
+/// Le transcript de la session `session_id` lancée dans `cwd` existe sous
+/// `root` (J16 : reprise d'un tour de la session d'amélioration). Un id qui
+/// n'est pas un UUID : faux.
+pub fn transcript_exists(root: &Path, cwd: &str, session_id: &str) -> bool {
+    is_session_id(session_id)
+        && find_project_dir(root, cwd).is_some_and(|d| transcript_path(&d, session_id).is_file())
+}
+
 /// Dossier des sous-agents d'une session : `<session_id>/subagents/`.
 pub fn subagents_dir(project_dir: &Path, session_id: &str) -> PathBuf {
     project_dir.join(session_id).join("subagents")
@@ -110,5 +118,26 @@ mod tests {
         assert!(!is_session_id(" 11111111-2222-4333-8444-555555555555"));
         assert!(!is_session_id("11111111-2222-4333-8444-55555555555g"));
         assert!(!is_session_id(""));
+    }
+
+    /// J16 : reprise possible seulement si le transcript existe.
+    #[test]
+    fn transcript_exists_for_resume() {
+        let root = std::env::temp_dir().join(format!("orch-j16-tr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cwd = r"C:\x\orchestrator\work\auto\demo";
+        let id = "11111111-2222-4333-8444-555555555555";
+        assert!(!transcript_exists(&root, cwd, id), "racine absente");
+        let dir = root.join(encode_project_dir(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            !transcript_exists(&root, cwd, id),
+            "dossier sans transcript"
+        );
+        std::fs::write(transcript_path(&dir, id), "{}\n").unwrap();
+        assert!(transcript_exists(&root, cwd, id));
+        assert!(transcript_exists(&root, &cwd.to_lowercase(), id), "casse");
+        assert!(!transcript_exists(&root, cwd, "..\\x"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

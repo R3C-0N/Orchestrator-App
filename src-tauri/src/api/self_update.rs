@@ -31,7 +31,7 @@ use super::types::{
     CoreError, ImproveStatus, ImproveStep, PushStatus, RepoStatus, SessionKey, UiInfo, UiSource,
     IMPROVE_EVENT,
 };
-use crate::process::locate::locate_claude;
+use crate::process::locate::{display_path, locate_claude};
 use crate::process::spawn::LaunchOptions;
 use crate::process::supervisor::SessionConfig;
 use crate::selfupdate::pipeline::{self, NpmToolchain, Toolchain};
@@ -352,6 +352,11 @@ pub struct Improver {
 /// trouvés. `detail` : `{"branches": ["auto/…", …]}`.
 pub const IMPROVE_UNMERGED: &str = "improve.unmerged_worktrees";
 
+/// Code de la `notice` (niveau `warn`) émise quand un tour en reprise ne
+/// trouve pas le transcript de la session (premier tour mort avant de
+/// l'écrire) : le tour repart par `--session-id`, consigne redonnée.
+pub const IMPROVE_RESUME_FALLBACK: &str = "improve.resume_fallback";
+
 /// Remet `running` à faux à la fin de la tâche du cycle, même en panique.
 struct Running(Arc<AtomicBool>);
 
@@ -478,14 +483,33 @@ impl<R: Runtime> AppHost<R> {
     }
 
     /// Clé de la conversation du cycle en cours : celle posée par
-    /// `improve_start`, sinon l'`id` du cycle affiché.
+    /// `improve_start` (avant le lancement du cycle) ou par `run_turn`.
+    /// Jamais déduite de `SelfUpdate::current`, qui peut encore désigner un
+    /// cycle précédent (retour arrière qui n'a rien publié).
     fn current_key(&self) -> Option<SessionKey> {
-        self.session.lock().unwrap().clone().or_else(|| {
-            let su = self.app.state::<SelfUpdate>();
-            let id = su.current.lock().unwrap().as_ref().map(|s| s.id.clone());
-            id.map(SessionKey)
-        })
+        self.session.lock().unwrap().clone()
     }
+}
+
+/// Reprise d'un tour (J16) : `--resume <id>` seulement si le transcript de
+/// la session existe sous `projects` (`~/.claude/projects`) pour `cwd` ; un
+/// premier tour mort avant d'écrire son transcript ferait échouer
+/// `--resume`. Sans dossier des projets connu : reprise tentée.
+pub fn can_resume(projects: Option<&Path>, cwd: &Path, id: &str) -> bool {
+    match projects {
+        Some(root) => crate::sessions::paths::transcript_exists(root, &display_path(cwd), id),
+        None => true,
+    }
+}
+
+/// Message d'un tour en reprise impossible (transcript absent) : la session
+/// repart de zéro avec la même clé (`--session-id`) ; la consigne complète
+/// du premier tour est redonnée avant `message`.
+pub fn fresh_turn_message(first_prompt: &str, message: &str) -> String {
+    format!(
+        "{first_prompt}\n\n---\n\n(La session précédente s'est arrêtée avant d'enregistrer \
+         son historique : la consigne ci-dessus est redonnée. Message suivant :)\n\n{message}"
+    )
 }
 
 impl<R: Runtime> PipelineHost for AppHost<R> {
@@ -502,8 +526,12 @@ impl<R: Runtime> PipelineHost for AppHost<R> {
     /// Jalon J16 : un processus `claude.exe` par tour, dans la conversation
     /// du cycle (journal à clé stable `request.id`) : `--session-id
     /// <request.id>` au premier tour, `--resume <request.id>` ensuite, mêmes
-    /// options d'isolement ([`improve_launch_options`]). Rend la main après
-    /// l'arrêt effectif du processus (`AppState::run_improve_turn`).
+    /// options d'isolement ([`improve_launch_options`]). Reprise demandée
+    /// mais transcript absent : nouveau départ par `--session-id`, consigne
+    /// redonnée, `notice` `improve.resume_fallback`. Jamais
+    /// `NotImplemented`. Rend la main après l'arrêt effectif du processus
+    /// (`AppState::run_improve_turn`) ; `Ok(TurnEnd::Interrupted)` après
+    /// `interrupt_turn`.
     fn run_turn<'a>(
         &'a self,
         request: &'a ImproveRequest,
@@ -518,7 +546,7 @@ impl<R: Runtime> PipelineHost for AppHost<R> {
                 locate_claude().map_err(|tried| CoreError::ClaudeNotFound(tried.join(" ; ")))?;
             let global = empty_global_config()
                 .map_err(|e| CoreError::Io(format!("configuration git de la session : {e}")))?;
-            state.improve_conversation(&key, cwd);
+            let conv = state.improve_conversation(&key, cwd);
             let changed = self.session.lock().unwrap().replace(key.clone()) != Some(key.clone());
             if changed {
                 // L'onglet voit la conversation dès maintenant.
@@ -534,12 +562,35 @@ impl<R: Runtime> PipelineHost for AppHost<R> {
                     publish(&self.app, st);
                 }
             }
+            let projects = crate::sessions::paths::projects_root();
+            let mut message = std::borrow::Cow::Borrowed(message);
+            let exists = can_resume(projects.as_deref(), cwd, &request.id);
+            let resume = if !resume && projects.is_some() && exists {
+                // Premier tour redemandé alors que la session a déjà un
+                // transcript : `--session-id` serait refusé par le CLI.
+                tracing::warn!(id = %request.id, "transcript présent : tour relancé par --resume");
+                true
+            } else if resume && !exists {
+                tracing::warn!(id = %request.id, "transcript absent : tour relancé par --session-id");
+                conv.notice(
+                    NoticeLevel::Warn,
+                    IMPROVE_RESUME_FALLBACK,
+                    "historique de la session introuvable : nouvelle session, consigne redonnée",
+                );
+                message = std::borrow::Cow::Owned(fresh_turn_message(
+                    &pipeline::build_prompt(cwd, request),
+                    &message,
+                ));
+                false
+            } else {
+                resume
+            };
             state
                 .run_improve_turn(
                     &key,
                     &exe,
                     cwd,
-                    message,
+                    &message,
                     resume,
                     improve_launch_options(self.model.clone(), &global),
                     SessionConfig::default(),
@@ -560,12 +611,13 @@ impl<R: Runtime> PipelineHost for AppHost<R> {
     }
 
     fn note(&self, level: NoticeLevel, code: &str, message: &str) {
-        tracing::info!(?level, code, "amélioration : {message}");
-        if let Some(key) = self.current_key() {
-            self.app
-                .state::<AppState>()
-                .improve_note(&key, level, code, message);
-        }
+        note_into(
+            &self.app.state::<AppState>(),
+            &self.session,
+            level,
+            code,
+            message,
+        );
     }
 
     fn switch_ui<'a>(
@@ -891,23 +943,18 @@ pub async fn improve_start(
     let req = improver.pipeline.request(&request)?;
     let guard = improver.try_begin()?;
     // J16 : la conversation du cycle existe dès le départ (clé stable =
-    // `id` du cycle) : l'onglet s'ouvre sur elle, les lignes d'état
-    // (`note`) y vont avant le premier tour.
+    // `id` du cycle), avant le lancement de la tâche du cycle : l'onglet
+    // s'ouvre sur elle, les lignes d'état (`note`) y vont avant le premier
+    // tour.
     let key = SessionKey(req.id.clone());
-    let conv = state.improve_conversation(&key, &improver.pipeline.worktree_path(&req.branch));
-    *improver.session.lock().unwrap() = Some(key.clone());
-    if let Some(branches) = improver.startup_notice.lock().unwrap().take() {
-        conv.notice_with(
-            NoticeLevel::Warn,
-            IMPROVE_UNMERGED,
-            &format!(
-                "amélioration(s) précédente(s) non fusionnée(s), gardée(s) pour inspection \
-                 (pas de reprise) : {}",
-                branches.join(", ")
-            ),
-            Some(serde_json::json!({ "branches": branches })),
-        );
-    }
+    let notice = improver.startup_notice.lock().unwrap().take();
+    begin_conversation(
+        &state,
+        &improver.session,
+        &key,
+        &improver.pipeline.worktree_path(&req.branch),
+        notice,
+    );
     let status = ImproveStatus {
         id: req.id.clone(),
         branch: req.branch.clone(),
@@ -969,20 +1016,75 @@ pub async fn improve_interrupt(improver: State<'_, Improver>, id: String) -> Res
 /// `improve_cancel`) ; sans effet si la conversation est déjà libérée.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn improve_dismiss(
-    su: State<'_, SelfUpdate>,
     improver: State<'_, Improver>,
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), CoreError> {
-    let current = su.current.lock().unwrap().as_ref().map(|s| s.id.clone());
-    if improver.is_running() && current.as_deref() == Some(id.as_str()) {
+    let active = improver.session.lock().unwrap().clone();
+    dismiss_allowed(improver.is_running(), active.as_ref(), &id)?;
+    let freed = state.dismiss_improve(&SessionKey(id.clone())).await;
+    tracing::info!(id, freed, "conversation d'amélioration libérée");
+    Ok(())
+}
+
+/// `improve_dismiss` permis ? Comparaison à la conversation du cycle actif
+/// (`Improver::session`, posée par `improve_start` avant toute
+/// conversation), pas à `SelfUpdate::current` (qui peut manquer ou désigner
+/// un autre cycle). Un cycle qui tourne sans conversation connue (retour
+/// arrière, ou instant entre le début du cycle et la pose de la clé) :
+/// refus par prudence.
+pub fn dismiss_allowed(
+    running: bool,
+    active: Option<&SessionKey>,
+    id: &str,
+) -> Result<(), CoreError> {
+    if running && active.is_none_or(|k| k.0 == id) {
         return Err(CoreError::InvalidArgument(
             "amélioration en cours : l'annuler avant de fermer son onglet".into(),
         ));
     }
-    let freed = state.dismiss_improve(&SessionKey(id.clone())).await;
-    tracing::info!(id, freed, "conversation d'amélioration libérée");
     Ok(())
+}
+
+/// Ouvre la conversation du cycle `key` et en fait la conversation active
+/// (`slot` : `Improver::session`, remis à `None` par `try_begin`) ; avis du
+/// démarrage (`branches` non fusionnées) en tête.
+pub fn begin_conversation(
+    state: &AppState,
+    slot: &Mutex<Option<SessionKey>>,
+    key: &SessionKey,
+    cwd: &Path,
+    branches: Option<Vec<String>>,
+) {
+    let conv = state.improve_conversation(key, cwd);
+    *slot.lock().unwrap() = Some(key.clone());
+    if let Some(branches) = branches {
+        conv.notice_with(
+            NoticeLevel::Warn,
+            IMPROVE_UNMERGED,
+            &format!(
+                "amélioration(s) précédente(s) non fusionnée(s), gardée(s) pour inspection \
+                 (pas de reprise) : {}",
+                branches.join(", ")
+            ),
+            Some(serde_json::json!({ "branches": branches })),
+        );
+    }
+}
+
+/// `PipelineHost::note` : ligne d'état dans la conversation active
+/// (`slot`), seulement ; aucune conversation active (retour arrière) :
+/// journal de l'app seul. Jamais dans le fil d'un cycle précédent.
+pub fn note_into(
+    state: &AppState,
+    slot: &Mutex<Option<SessionKey>>,
+    level: NoticeLevel,
+    code: &str,
+    message: &str,
+) -> bool {
+    tracing::info!(?level, code, "amélioration : {message}");
+    let key = slot.lock().unwrap().clone();
+    key.is_some_and(|k| state.improve_note(&k, level, code, message))
 }
 
 /// Revient à la version précédente de l'interface, puis, si une version
@@ -1203,6 +1305,113 @@ mod tests {
         assert_eq!(fresh.store().read_pointer().active, None);
         assert!(leave_incompatible_ui(&fresh, "3333333333333333").is_empty());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// J16 (demande de A) : une note émise avant le premier tour
+    /// (`improve.preparing`) arrive dans le fil du cycle en cours, dont la
+    /// conversation est ouverte par `improve_start` avant le lancement du
+    /// cycle ; jamais dans celui d'un cycle précédent, même entre la fin de
+    /// l'un et le début de l'autre, ni pendant un retour arrière.
+    #[tokio::test]
+    async fn notes_go_to_the_active_cycle_only() {
+        let state = AppState::new(std::env::temp_dir());
+        let slot: Mutex<Option<SessionKey>> = Mutex::new(None);
+        let tmp = std::env::temp_dir();
+        let codes = |k: &SessionKey| -> Vec<String> {
+            state
+                .improve_get(k)
+                .unwrap()
+                .outlet
+                .events()
+                .into_iter()
+                .filter_map(|e| match e.body {
+                    super::super::events::EventBody::Notice { code, .. } => Some(code),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Cycle 1 : conversation ouverte, puis note de préparation.
+        let k1 = SessionKey("11111111-2222-4333-8444-555555555551".into());
+        begin_conversation(&state, &slot, &k1, &tmp, Some(vec!["auto/vieux".into()]));
+        assert!(note_into(
+            &state,
+            &slot,
+            NoticeLevel::Info,
+            "improve.preparing",
+            "1"
+        ));
+        assert_eq!(codes(&k1), vec![IMPROVE_UNMERGED, "improve.preparing"]);
+        // Nouveau cycle (`try_begin` remet la clé à `None`) : rien ne part
+        // vers le cycle 1 (retour arrière : journal de l'app seul).
+        *slot.lock().unwrap() = None;
+        assert!(!note_into(
+            &state,
+            &slot,
+            NoticeLevel::Info,
+            "improve.preparing",
+            "x"
+        ));
+        let k2 = SessionKey("11111111-2222-4333-8444-555555555552".into());
+        begin_conversation(&state, &slot, &k2, &tmp, None);
+        assert!(note_into(
+            &state,
+            &slot,
+            NoticeLevel::Info,
+            "improve.preparing",
+            "2"
+        ));
+        assert_eq!(codes(&k2), vec!["improve.preparing"]);
+        assert_eq!(codes(&k1).len(), 2, "cycle 1 inchangé");
+        // Conversation libérée : la note ne recrée rien.
+        assert!(state.dismiss_improve(&k2).await);
+        assert!(!note_into(
+            &state,
+            &slot,
+            NoticeLevel::Info,
+            "improve.preparing",
+            "3"
+        ));
+        assert!(state.improve_get(&k2).is_none());
+    }
+
+    /// `improve_dismiss` comparé au cycle actif (`Improver::session`).
+    #[test]
+    fn dismiss_refused_for_the_running_cycle_only() {
+        let a = SessionKey("a".into());
+        assert!(dismiss_allowed(false, None, "a").is_ok());
+        assert!(dismiss_allowed(false, Some(&a), "a").is_ok(), "cycle fini");
+        assert!(dismiss_allowed(true, Some(&a), "a").is_err());
+        assert!(
+            dismiss_allowed(true, Some(&a), "b").is_ok(),
+            "ancien onglet"
+        );
+        assert!(
+            dismiss_allowed(true, None, "a").is_err(),
+            "cycle sans clé : prudence"
+        );
+    }
+
+    /// Point 5 : reprise sans transcript → nouveau départ, consigne redonnée.
+    #[test]
+    fn resume_falls_back_without_transcript() {
+        let root = std::env::temp_dir().join(format!("orch-j16-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cwd = std::path::Path::new(r"C:\x\orchestrator\work\auto\demo");
+        let id = "11111111-2222-4333-8444-555555555555";
+        assert!(
+            can_resume(None, cwd, id),
+            "racine inconnue : reprise tentée"
+        );
+        assert!(!can_resume(Some(&root), cwd, id));
+        let dir = root.join(crate::sessions::paths::encode_project_dir(
+            r"C:\x\orchestrator\work\auto\demo",
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.jsonl")), "{}\n").unwrap();
+        assert!(can_resume(Some(&root), cwd, id));
+        let m = fresh_turn_message("CONSIGNE", "corrige");
+        assert!(m.starts_with("CONSIGNE") && m.ends_with("corrige"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
