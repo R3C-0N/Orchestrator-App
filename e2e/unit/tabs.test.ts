@@ -1,7 +1,7 @@
 // Onglets de conversation (`src/lib/state/tabs.ts`) : libellé, infobulle et
 // onglet affiché après une fermeture ; J16 : onglet d'amélioration en cours.
 import { describe, expect, it } from "vitest";
-import { afterClose, baseName, NEW_TAB_LABEL, runningImproveTab, tabLabel, tabTitle } from "../../src/lib/state/tabs";
+import { afterClose, baseName, NEW_TAB_LABEL, runningImproveTab, snapshotTab, tabLabel, tabTitle } from "../../src/lib/state/tabs";
 
 describe("baseName", () => {
   it("chemins Windows et POSIX, séparateur final", () => {
@@ -65,5 +65,28 @@ describe("runningImproveTab (J16)", () => {
     expect(runningImproveTab([{ id: 1, kind: "conversation", improve: null }])).toBeNull();
     expect(runningImproveTab([{ id: 2, kind: "improve", improve: { step: "merged" } }])).toBeNull();
     expect(runningImproveTab([{ id: 2, kind: "improve", improve: { step: "cancelled" } }])).toBeNull();
+  });
+});
+
+describe("snapshotTab (J16)", () => {
+  const tabs = [
+    { id: 0, kind: "conversation" as const },
+    { id: 1, kind: "conversation" as const },
+    { id: 2, kind: "improve" as const },
+  ];
+
+  it("conversation active : elle-même", () => {
+    expect(snapshotTab(tabs, 1, 0)?.id).toBe(1);
+  });
+
+  it("onglet d'amélioration actif : la dernière conversation affichée, sinon la première", () => {
+    expect(snapshotTab(tabs, 2, 1)?.id).toBe(1);
+    expect(snapshotTab(tabs, 2, 0)?.id).toBe(0);
+    expect(snapshotTab(tabs, 2, 9)?.id).toBe(0);
+    expect(snapshotTab(tabs, 2, null)?.id).toBe(0);
+  });
+
+  it("aucune conversation : null", () => {
+    expect(snapshotTab([{ id: 2, kind: "improve" as const }], 2, 0)).toBeNull();
   });
 });

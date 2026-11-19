@@ -13,11 +13,14 @@ import {
   FINAL_STEPS,
   STEP_LABEL,
   bannerText,
+  canAbandon,
   canCancel,
   canInterrupt,
   canValidate,
   closeAction,
   closeConfirmText,
+  confirmKey,
+  dismissOnMount,
   improveBadge,
   improveTabLabel,
   improveTabTitle,
@@ -123,7 +126,27 @@ describe("fermeture de l'onglet", () => {
     expect(closeAction(at("testing"))).toBe("confirm");
     expect(closeAction(at("switching"))).toBe("refuse");
     for (const s of FINAL_STEPS) expect(closeAction(at(s))).toBe("dismiss");
-    expect(closeAction(null)).toBe("dismiss");
+    // État inconnu : confirmation, par prudence ; « Abandonner » reste possible.
+    expect(closeAction(null)).toBe("confirm");
+    expect(canAbandon(null)).toBe(true);
+    expect(canAbandon(at("switching"))).toBe(false);
+    expect(closeConfirmText(null)).toContain("gardée non fusionnée");
+  });
+
+  it("Échap pendant la confirmation vaut « Continuer », jamais une interruption", () => {
+    expect(confirmKey("Escape", true)).toBe("continue");
+    expect(confirmKey("Escape", false)).toBeNull();
+    expect(confirmKey("Enter", true)).toBeNull();
+  });
+
+  it("montage : improve_dismiss de l'onglet fermé, tout de suite ou à l'état final", () => {
+    expect(dismissOnMount(null, at("working"))).toBeNull();
+    // « Abandonner » puis rechargement avant `cancelled` : en attente.
+    expect(dismissOnMount("improve-1", at("working"))).toBe("wait");
+    expect(dismissOnMount("improve-1", null)).toBe("wait");
+    expect(dismissOnMount("improve-1", at("cancelled"))).toBe("dismiss");
+    // Un cycle plus récent existe : l'ancien est fini.
+    expect(dismissOnMount("improve-0", at("working"))).toBe("dismiss");
   });
 
   it("texte de la confirmation : la branche gardée non fusionnée", () => {

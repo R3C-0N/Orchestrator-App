@@ -76,3 +76,24 @@ export function runningImproveTab(
 ): number | null {
   return tabs.find((t) => t.kind === "improve" && (t.improve === null || !isFinal(t.improve.step)))?.id ?? null;
 }
+
+/**
+ * Onglet dont l'état est gardé à travers un rechargement (`UiSnapshot` :
+ * session principale, brouillon, historique ↑↓) : l'onglet actif si c'est
+ * une conversation ; sinon (onglet d'amélioration actif, J16) la dernière
+ * conversation affichée (`lastConversation`), à défaut la première
+ * conversation de la barre ; `null` s'il n'y en a aucune.
+ */
+export function snapshotTab<T extends { id: number; kind: TabKind }>(
+  tabs: readonly T[],
+  active: number,
+  lastConversation: number | null,
+): T | null {
+  const conv = tabs.filter((t) => t.kind === "conversation");
+  return (
+    conv.find((t) => t.id === active) ??
+    conv.find((t) => t.id === lastConversation) ??
+    conv[0] ??
+    null
+  );
+}

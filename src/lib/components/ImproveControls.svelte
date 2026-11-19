@@ -12,6 +12,7 @@
   import {
     CANCEL_TIMEOUT_MS,
     bannerText,
+    canAbandon,
     canCancel,
     canValidate,
     closeConfirmText,
@@ -65,7 +66,7 @@
   const validateOn = $derived(canValidate(status) && !validating);
   const cancelOn = $derived(canCancel(status) && !cancelling);
   // La bascule a commencé pendant la confirmation : abandon impossible.
-  const abandonOn = $derived(canCancel(status) && !abandoning);
+  const abandonOn = $derived(canAbandon(status) && !abandoning);
 
   function stopCancelTimer(): void {
     if (cancelTimer !== null) clearTimeout(cancelTimer);
@@ -170,7 +171,7 @@
   role="status"
   aria-live="polite"
 >
-  {#if confirming && status}
+  {#if confirming}
     <div class="row" data-testid="improve-close-confirm" role="alertdialog" aria-label="Fermer l'onglet d'amélioration">
       <span class="glyph warn">!</span>
       <span class="text warnc">{closeConfirmText(status)}</span>
@@ -179,7 +180,7 @@
           type="button"
           data-testid="improve-abandon"
           disabled={!abandonOn}
-          title={canCancel(status) ? "Annuler l'amélioration et fermer l'onglet" : "Bascule en cours : abandon impossible"}
+          title={canAbandon(status) ? "Annuler l'amélioration et fermer l'onglet" : "Bascule en cours : abandon impossible"}
           onclick={() => void abandon()}
           onkeydown={(e) => onkeydown(e, () => void abandon())}>{abandoning ? "abandon…" : "Abandonner"}</button
         >

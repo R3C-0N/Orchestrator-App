@@ -182,22 +182,58 @@ export function canInterrupt(s: ImproveStatus | null): boolean {
 }
 
 /**
- * Fermeture de l'onglet : `dismiss` (état final ou cycle inconnu : fermeture
- * directe, puis `improve_dismiss`), `confirm` (cycle en cours : confirmation
- * dans la page) ou `refuse` (bascule en cours).
+ * Fermeture de l'onglet : `dismiss` (état final : fermeture directe, puis
+ * `improve_dismiss`), `confirm` (cycle en cours, ou état inconnu par
+ * prudence : confirmation dans la page) ou `refuse` (bascule en cours).
  */
 export type CloseAction = "dismiss" | "confirm" | "refuse";
 
 export function closeAction(s: ImproveStatus | null): CloseAction {
-  if (!s || isFinal(s.step)) return "dismiss";
+  if (!s) return "confirm";
+  if (isFinal(s.step)) return "dismiss";
   if (s.step === "switching") return "refuse";
   return "confirm";
 }
 
-/** Texte de la confirmation de fermeture (jamais `confirm()`). */
-export function closeConfirmText(s: ImproveStatus): string {
-  return `Fermer abandonne l'amélioration ; la branche ${s.branch} est gardée non fusionnée.`;
+/** « Abandonner » de la confirmation : possible tant que le cycle peut être annulé, ou si son état est inconnu. */
+export function canAbandon(s: ImproveStatus | null): boolean {
+  return s === null || canCancel(s);
 }
+
+/** Texte de la confirmation de fermeture (jamais `confirm()`). */
+export function closeConfirmText(s: ImproveStatus | null): string {
+  return s
+    ? `Fermer abandonne l'amélioration ; la branche ${s.branch} est gardée non fusionnée.`
+    : "Fermer abandonne l'amélioration ; sa branche auto/… est gardée non fusionnée.";
+}
+
+/**
+ * Touche pendant la confirmation de fermeture : Échap vaut « Continuer »
+ * (jamais une interruption de la session) ; `null` : touche laissée au
+ * gestionnaire habituel.
+ */
+export function confirmKey(key: string, confirming: boolean): "continue" | null {
+  return confirming && key === "Escape" ? "continue" : null;
+}
+
+/**
+ * Montage : que faire de l'amélioration dont l'onglet a été fermé
+ * (`UiSnapshot.improveDismissed`) ? `dismiss` : son état connu est final,
+ * `improve_dismiss` tout de suite (la page a pu se recharger entre
+ * « Abandonner » et l'état `cancelled`) ; `wait` : `improve_dismiss` à son
+ * état final ; `null` : rien à faire.
+ */
+export function dismissOnMount(dismissed: string | null, known: ImproveStatus | null): "dismiss" | "wait" | null {
+  if (dismissed === null) return null;
+  // État encore inconnu : attendre l'événement.
+  if (!known) return "wait";
+  // Un cycle plus récent existe (un seul à la fois) : celui-ci est fini.
+  if (known.id !== dismissed) return "dismiss";
+  return isFinal(known.step) ? "dismiss" : "wait";
+}
+
+/** `/ameliorer` alors que le cycle abandonné n'a pas encore son état final. */
+export const CANCELLING_TEXT = "Amélioration en cours d'annulation : réessayer à son état final";
 
 export const CLOSE_REFUSED_TEXT = "Fermeture impossible pendant la bascule vers la nouvelle interface.";
 

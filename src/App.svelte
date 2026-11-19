@@ -81,10 +81,13 @@
     type UiSnapshot,
   } from "./lib/state/sessions.svelte";
   import { VERSION_NOTICE_CODE, noticeVersion } from "./lib/state/versionNotice";
-  import { afterClose, runningImproveTab, tabLabel, tabTitle, type TabKind, type TabView } from "./lib/state/tabs";
+  import { afterClose, runningImproveTab, snapshotTab, tabLabel, tabTitle, type TabKind, type TabView } from "./lib/state/tabs";
   import {
+    CANCELLING_TEXT,
     CLOSE_REFUSED_TEXT,
     canInterrupt,
+    confirmKey,
+    dismissOnMount,
     closeAction,
     improveBadge,
     improveTabLabel,
@@ -476,6 +479,14 @@
   }
 
   function onWindowKey(e: KeyboardEvent) {
+    // J16 : confirmation de fermeture affichée : Échap vaut « Continuer »,
+    // jamais une interruption de la session.
+    if (tabKind === "improve" && confirmKey(e.key, closeConfirm) === "continue") {
+      e.preventDefault();
+      closeConfirm = false;
+      prompt?.focus();
+      return;
+    }
     const action = keys.handle(keyInput(e), {
       hasSelection: hasSelection(),
       // La carte de question remplace la saisie : ni palette ni sélecteur.
@@ -848,6 +859,11 @@
     const su = selfUpdate;
     // Cycle en cours sans onglet (rechargé pendant la préparation) : son onglet est ouvert.
     const live = improveLive ?? uiInfo?.improve ?? null;
+    if (live && !isFinal(live.step) && live.id === improveDismissed) {
+      // Onglet abandonné, état final pas encore reçu : il n'est pas rouvert.
+      showNotice(CANCELLING_TEXT);
+      return;
+    }
     if (su && live && !isFinal(live.step)) {
       draft = "";
       openImproveTab(live, true);
@@ -1033,10 +1049,18 @@
     const su = selfUpdate;
     if (tabKind !== "improve" || id === null || !su) return;
     const tab = activeTab;
-    await su.improveCancel(id);
+    const known = statusOf(id);
+    try {
+      await su.improveCancel(id);
+    } catch (err) {
+      // État connu : l'erreur reste affichée dans la barre. Inconnu : le cycle
+      // est peut-être déjà fini ; l'onglet est fermé quand même.
+      if (known) throw err;
+    }
     closeConfirm = false;
     const st = statusOf(id);
     closeImproveTab(tab, id, st !== null && isFinal(st.step));
+    if (!known) void su.improveDismiss(id).catch(() => {});
   }
 
   async function rollbackUi(): Promise<void> {
@@ -1061,15 +1085,24 @@
 
   /** État de l'interface à garder à travers un rechargement. */
   function snapshot(): UiSnapshot {
+    // J16 : onglet d'amélioration actif → l'état gardé reste celui de la
+    // conversation principale (dernière affichée), le drapeau à part.
+    const current = captureTab();
+    const t = snapshotTab(
+      tabs.map((x) => (x.id === current.id ? current : x)),
+      activeTab,
+      lastConversationTab,
+    );
+    const main = t ?? current;
     return {
-      session: mainKey(),
-      draft,
-      sent: sent.slice(-500),
-      agentsOpen: [...agentsOpen],
+      session: mockMode ? (main.mockReady ? "mock-1" : null) : main.session,
+      draft: main.draft,
+      sent: main.sent.slice(-500),
+      agentsOpen: [...main.agentsOpen],
       agentsDoneOpen,
       agentsWaitingOpen,
       agentsRunningOpen,
-      verbose,
+      verbose: main.verbose,
       improveDismissed,
       // J16 : la bascule recharge la page ; l'utilisateur reste sur l'onglet d'amélioration.
       ...(tabKind === "improve" ? { improveTab: true } : {}),
@@ -1272,13 +1305,14 @@
     // 4. J16 : conversation d'amélioration encore vivante (cycle en cours, ou
     //    fini mais onglet pas fermé) : son onglet est rouvert, actif s'il
     //    l'était (la bascule recharge la page pendant le cycle).
-    reopenImprove(r, live, saved);
+    reopenImprove(live, saved);
+    settleDismissed();
     booted = true;
     saveUi();
   }
 
   /** Rouvre l'onglet d'amélioration au montage (voir `improveToReopen`). */
-  function reopenImprove(r: SessionRouter, live: SessionResync[], saved: UiSnapshot | null): void {
+  function reopenImprove(live: SessionResync[], saved: UiSnapshot | null): void {
     try {
       const known = improveLive ?? uiInfo?.improve ?? null;
       const re = improveToReopen(live, known, improveDismissed);
@@ -1288,14 +1322,26 @@
       noteImprove(st);
       const activate = saved?.improveTab === true;
       openImproveTab(st, activate);
-      const s = st.session !== null ? r.get(st.session) : undefined;
-      if (activate && s && store === s && saved?.session === st.session) {
-        draft = saved.draft;
-        sent.length = 0;
-        sent.push(...saved.sent);
-      }
     } catch (err) {
       console.warn("onglet d'amélioration non rouvert", describeError(err));
+    }
+  }
+
+  /**
+   * Montage : l'onglet fermé avant le rechargement (« Abandonner » puis
+   * rechargement avant l'état final) libère sa conversation côté cœur :
+   * `improve_dismiss` tout de suite si son état connu est final, sinon à
+   * son état final (`dismissWhenFinal`).
+   */
+  function settleDismissed(): void {
+    const id = improveDismissed;
+    switch (dismissOnMount(id, statusOf(id) ?? improveLive ?? uiInfo?.improve ?? null)) {
+      case "dismiss":
+        void selfUpdate?.improveDismiss(id!).catch(() => {});
+        break;
+      case "wait":
+        dismissWhenFinal.add(id!);
+        break;
     }
   }
 
@@ -1439,6 +1485,8 @@
 
   let nextTabId = 1;
   let activeTab = $state(0);
+  /** Dernier onglet de conversation affiché (état gardé quand l'onglet d'amélioration est actif). */
+  let lastConversationTab: number | null = 0;
   /** Onglets dans l'ordre de la barre ; l'entrée de l'onglet actif n'est relue qu'en le quittant. */
   let tabs: Tab[] = $state.raw([blankTab(0, { store: firstStore })]);
 
@@ -1518,6 +1566,7 @@
     verbose = t.verbose;
     tabKind = t.kind;
     improveId = t.improveId;
+    if (t.kind === "conversation") lastConversationTab = t.id;
     closeConfirm = false;
     // Palette, sélecteur de modèle et Échap armé appartiennent à l'onglet quitté.
     ctrlK = null;
