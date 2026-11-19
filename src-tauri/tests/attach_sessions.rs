@@ -220,6 +220,64 @@ async fn detached_session_writes_only_to_its_journal() {
     assert_eq!(*got_c.lock().unwrap(), vec![4]);
 }
 
+/// J16 : la conversation d'un cycle d'amélioration est rendue par
+/// `attach_all` sans aucun processus (avant le premier tour, entre deux
+/// tours), une seule fois par rattachement, avec ses lignes d'état
+/// `improve.*` ; un rechargement la détache sans la fermer ;
+/// `dismiss_improve` la retire.
+#[tokio::test(flavor = "multi_thread")]
+async fn improve_conversation_without_process_is_attached_until_dismissed() {
+    use orchestrator_lib::api::commands::AppState;
+    use orchestrator_lib::api::events::NoticeLevel;
+
+    let state = AppState::new(std::env::temp_dir());
+    let key = SessionKey("8a7c1f3e-2b4d-4e6f-9a0b-1c2d3e4f5a6b".into());
+    let conv = state.improve_conversation(&key, &std::env::temp_dir());
+    assert_eq!(conv.outlet.key(), &key);
+    assert!(state.improve_note(&key, NoticeLevel::Info, "improve.step", "préparation"));
+    assert!(!state.improve_note(
+        &SessionKey("autre".into()),
+        NoticeLevel::Info,
+        "improve.step",
+        "x"
+    ));
+    let (a, got_a) = recorder();
+    let resync: Vec<SessionResync> = state.attach_all(state.attachment(a));
+    assert_eq!(resync.len(), 1);
+    let r = &resync[0];
+    assert_eq!(
+        (r.session.clone(), r.role, r.pid, r.running),
+        (key.clone(), SessionRole::Improve, 0, false)
+    );
+    assert!(r.resumed_from.is_none() && r.history.is_none());
+    assert_eq!(r.events.len(), 1);
+    assert!(matches!(
+        &r.events[0].body,
+        EventBody::Notice { code, .. } if code == "improve.step"
+    ));
+    // La suite part vers la page rattachée.
+    conv.notice(NoticeLevel::Warn, "improve.check_failed", "tests en échec");
+    wait_until("livré", Duration::from_secs(2), || {
+        got_a.lock().unwrap().as_slice() == [1]
+    })
+    .await;
+
+    // Rechargement : détachée, jamais fermée ; rendue en entier ensuite.
+    state.close_orphans().await;
+    assert!(!conv.outlet.is_attached());
+    conv.notice(NoticeLevel::Info, "improve.step", "tour 2");
+    let (b, _) = recorder();
+    let again = state.attach_all(state.attachment(b));
+    assert_eq!(again.len(), 1);
+    let s: Vec<u64> = again[0].events.iter().map(|e| e.seq).collect();
+    assert_contiguous(&s, 0, "conversation");
+    assert_eq!(s.len(), 3);
+
+    assert!(state.dismiss_improve(&key).await);
+    let (c, _) = recorder();
+    assert!(state.attach_all(state.attachment(c)).is_empty());
+}
+
 /// Mesure (risque du plan J14) : taille du journal sur la fixture longue
 /// `t15` (1 000 tours, `stream_event` gardés dans 1 tour sur 10), et
 /// projection avec tous les deltas. Seuil de compactage : 50 Mo sur 4 h.

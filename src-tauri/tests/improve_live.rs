@@ -184,3 +184,162 @@ async fn improve_session_cannot_push_or_configure_git() {
     assert!(!all.contains("jeton-de-test-herite"));
     assert!(!all.contains("valeur-privee-de-test"));
 }
+
+/// Jalon J16 (risque 6 du plan) : deux tours de la session d'amélioration,
+/// un processus par tour, dans la même conversation : `--session-id <id>`
+/// puis `--resume <id>` avec les options d'isolement (outils refusés en
+/// variadique avant `--session-id`, environnement en liste blanche). Le
+/// second tour se souvient du premier ; l'environnement reste filtré aux
+/// deux tours ; les processus sont arrêtés à chaque fin de tour. En haiku,
+/// avec transcript (nécessaire à `--resume`) :
+/// `cargo test --test improve_live improve_two_turns_resume -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "lance le vrai claude.exe (deux tours en haiku)"]
+async fn improve_two_turns_resume_live() {
+    use orchestrator_lib::api::commands::IMPROVE_TURN_END;
+    use orchestrator_lib::api::types::SessionKey;
+    use orchestrator_lib::selfupdate::TurnEnd;
+
+    let root =
+        TempDir(std::env::temp_dir().join(format!("orch-improve-resume-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&root.0);
+    std::fs::create_dir_all(&root.0).unwrap();
+    let work = root.0.join("work");
+    let global = root.0.join("vide.gitconfig");
+    std::fs::write(&global, b"").unwrap();
+    git(
+        &root.0,
+        &["init", "-q", "-b", "main", work.to_str().unwrap()],
+    );
+    git(&work, &["config", "--local", "user.name", "t"]);
+    git(&work, &["config", "--local", "user.email", "t@t"]);
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let config_before = std::fs::read(work.join(".git/config")).unwrap();
+    std::env::set_var("GH_TOKEN", "jeton-de-test-herite");
+
+    let state = AppState::new(work.clone());
+    let key = SessionKey(uuid::Uuid::new_v4().to_string());
+    let exe = locate_claude().expect("claude.exe");
+    let opts = || improve_launch_options(Some("haiku".into()), &global);
+    let env_cmd = "echo \"tok=[$GH_TOKEN] nosys=$GIT_CONFIG_NOSYSTEM\"";
+    let t0 = std::time::Instant::now();
+    let end1 = state
+        .run_improve_turn(
+            &key,
+            &exe,
+            &work,
+            &format!(
+                "Remember this code word for later: PAMPLEMOUSSE-42. Now run exactly this \
+                 bash command, one Bash tool call: {env_cmd}\nThen reply with its output only."
+            ),
+            false,
+            opts(),
+            SessionConfig::default(),
+            Duration::from_secs(300),
+        )
+        .await;
+    let t1 = t0.elapsed();
+    let conv = state.improve_get(&key).expect("conversation");
+    let pid1 = conv.last_pid();
+    let t2 = std::time::Instant::now();
+    let end2 = state
+        .run_improve_turn(
+            &key,
+            &exe,
+            &work,
+            &format!(
+                "What was the code word I gave you earlier? Then run exactly this bash \
+                 command, one Bash tool call: {env_cmd}\nReply with the code word, then the \
+                 command output."
+            ),
+            true,
+            opts(),
+            SessionConfig::default(),
+            Duration::from_secs(300),
+        )
+        .await;
+    let t2 = t2.elapsed();
+    let events = conv.outlet.events();
+    let pid2 = conv.last_pid();
+    state.stop_all().await;
+    std::env::remove_var("GH_TOKEN");
+    println!("tour 1 : {end1:?} en {t1:?} ; tour 2 : {end2:?} en {t2:?}");
+    assert_eq!(end1, Ok(TurnEnd::Done));
+    assert_eq!(end2, Ok(TurnEnd::Done));
+    assert_eq!(conv.launches(), 2);
+    assert!(conv.current().is_none(), "processus arrêté");
+    for pid in [pid1, pid2] {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\"")),
+            "processus {pid} laissé"
+        );
+    }
+
+    // Lancements : `--session-id` puis `--resume`, même isolement.
+    let starts: Vec<Vec<String>> = events
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::Starting { args, .. } => Some(args.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 2);
+    println!(
+        "lancement 1 : {:?}\nlancement 2 : {:?}",
+        starts[0], starts[1]
+    );
+    let pos = |a: &[String], f: &str| a.iter().position(|x| x == f);
+    let i = pos(&starts[0], "--session-id").expect("--session-id");
+    assert_eq!(starts[0][i + 1], key.0);
+    let j = pos(&starts[1], "--resume").expect("--resume");
+    assert_eq!(starts[1][j + 1], key.0);
+    assert!(pos(&starts[1], "--session-id").is_none());
+    let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, (0..events.len() as u64).collect::<Vec<_>>());
+
+    // Le second tour se souvient du premier ; environnement filtré.
+    let mut texts: Vec<(usize, String)> = Vec::new();
+    let mut outputs: Vec<(usize, String)> = Vec::new();
+    let mut turn = 0;
+    for e in &events {
+        match &e.body {
+            EventBody::BlockDone {
+                block: BlockDoneKind::Text { text },
+                ..
+            } => texts.push((turn, text.clone())),
+            EventBody::ToolResult { content, .. } => outputs.push((turn, format!("{content:?}"))),
+            EventBody::TurnResult { .. } => turn += 1,
+            _ => {}
+        }
+    }
+    println!("textes : {texts:?}\nsorties : {outputs:?}");
+    assert!(
+        texts
+            .iter()
+            .any(|(t, x)| *t == 1 && x.contains("PAMPLEMOUSSE-42")),
+        "le tour 2 ne se souvient pas du tour 1"
+    );
+    for t in 0..2 {
+        assert!(
+            outputs
+                .iter()
+                .any(|(n, o)| *n == t && o.contains("tok=[] nosys=1")),
+            "environnement du tour {}",
+            t + 1
+        );
+    }
+    assert!(!format!("{outputs:?}").contains("jeton-de-test-herite"));
+    let ends = events
+        .iter()
+        .filter(|e| matches!(&e.body, EventBody::Notice { code, .. } if code == IMPROVE_TURN_END))
+        .count();
+    assert_eq!(ends, 2, "fins de tour annoncées");
+    assert_eq!(
+        std::fs::read(work.join(".git/config")).unwrap(),
+        config_before
+    );
+}

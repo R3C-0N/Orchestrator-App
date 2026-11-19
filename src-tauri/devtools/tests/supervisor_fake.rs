@@ -9,11 +9,12 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use orchestrator_lib::api::commands::AppState;
+use orchestrator_lib::api::commands::{AppState, ImproveConversation, IMPROVE_TURN_END};
 use orchestrator_lib::api::events::{CoreEvent, EventBody, NoticeLevel, SessionState};
 use orchestrator_lib::api::types::{CoreError, SessionKey, SessionRole};
 use orchestrator_lib::process::spawn::LaunchOptions;
 use orchestrator_lib::process::supervisor::{Session, SessionConfig, TurnWait};
+use orchestrator_lib::selfupdate::TurnEnd;
 use orchestrator_lib::state::batcher::Sink;
 
 fn fake_exe() -> PathBuf {
@@ -981,4 +982,381 @@ async fn only_one_main_session_is_kept() {
     };
     assert_eq!(roles, vec![SessionRole::Main, SessionRole::Improve]);
     state.stop_all().await;
+}
+
+// --- J16 : conversation d'un cycle d'amélioration, un processus par tour ---
+
+fn cycle_key() -> SessionKey {
+    SessionKey(uuid::Uuid::new_v4().to_string())
+}
+
+/// Options d'isolement de test (comme `improve_launch_options` : outils
+/// refusés, liste blanche d'environnement, variables ajoutées).
+fn isolated(extra: &[&str]) -> LaunchOptions {
+    let mut o = opts(&["--disallowedTools", "Bash(git push:*)", "AskUserQuestion"]);
+    o.extra_args.extend(extra.iter().map(|s| s.to_string()));
+    o.env = vec![("GIT_TERMINAL_PROMPT".into(), "0".into())];
+    o.env_allow = Some(
+        ["PATH", "SystemRoot", "TEMP", "TMP", "USERPROFILE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    o
+}
+
+fn fast_interrupt() -> SessionConfig {
+    SessionConfig {
+        interrupt_result_timeout: Duration::from_millis(400),
+        ..fast()
+    }
+}
+
+type NoticeAt = (u64, String, Option<serde_json::Value>);
+
+fn notice_codes(events: &[CoreEvent]) -> Vec<NoticeAt> {
+    events
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::Notice { code, detail, .. } => Some((e.seq, code.clone(), detail.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn turn_ends(events: &[CoreEvent]) -> Vec<String> {
+    notice_codes(events)
+        .into_iter()
+        .filter(|(_, c, _)| c == IMPROVE_TURN_END)
+        .map(|(_, _, d)| d.expect("detail")["end"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn starting_args(events: &[CoreEvent]) -> Vec<Vec<String>> {
+    events
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::Starting { args, .. } => Some(args.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Chaque `exited` du fil est précédé, depuis le `starting` de son
+/// processus, d'une `notice` `improve.turn_end` (arrêt voulu, attendu).
+fn every_exit_is_announced(events: &[CoreEvent]) {
+    let mut announced = false;
+    for e in events {
+        match &e.body {
+            EventBody::Starting { .. } => announced = false,
+            EventBody::Notice { code, .. } if code == IMPROVE_TURN_END => announced = true,
+            EventBody::Exited { .. } => assert!(announced, "exited non annoncé (seq {})", e.seq),
+            _ => {}
+        }
+    }
+}
+
+async fn wait_turn_started(conv: &ImproveConversation) -> u32 {
+    let t0 = Instant::now();
+    while conv.current().is_none() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "tour non lancé");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    conv.last_pid()
+}
+
+/// Critère (2) du plan J16, côté hôte : deux tours dans le même fil (`seq`
+/// continus), deux lancements, le second avec `--resume <id>`, mêmes
+/// options d'isolement ; processus arrêté entre les tours ; la conversation
+/// est rendue par `attach_all` entre deux tours (après un rechargement) ;
+/// `send_message`/`interrupt` vers la clé refusés ; `improve_dismiss`
+/// libère ; aucun processus laissé.
+#[tokio::test]
+async fn improve_cycle_two_turns_one_thread() {
+    let state = AppState::new(std::env::temp_dir());
+    let page = Events::default();
+    state.attach_all(state.attachment(page.sink()));
+    let key = cycle_key();
+    let conv = state.improve_conversation(&key, &std::env::temp_dir());
+    conv.notice(NoticeLevel::Info, "improve.step", "préparation du worktree");
+    assert!(state.is_improve(&key));
+    // Refus avant tout processus.
+    assert!(matches!(
+        state.send_message(&key, "x"),
+        Err(CoreError::InvalidArgument(_))
+    ));
+
+    let t0 = Instant::now();
+    let end = state
+        .run_improve_turn(
+            &key,
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "la demande",
+            false,
+            isolated(&[]),
+            fast(),
+            Duration::from_secs(20),
+        )
+        .await;
+    println!("tour 1 : {end:?} en {:?}", t0.elapsed());
+    assert_eq!(end, Ok(TurnEnd::Done));
+    let pid1 = conv.last_pid();
+    assert!(!alive(pid1), "processus du tour 1 arrêté avant le retour");
+    assert!(conv.current().is_none());
+    assert!(
+        state.sessions.lock().unwrap().is_empty(),
+        "plus de processus dans la table"
+    );
+
+    // Entre deux tours : rechargement de la page, puis rattachement.
+    state.close_orphans().await;
+    assert!(!conv.outlet.is_attached(), "détachée par le rechargement");
+    let page2 = Events::default();
+    let resync = state.attach_all(state.attachment(page2.sink()));
+    assert_eq!(resync.len(), 1, "conversation rendue entre deux tours");
+    let r = &resync[0];
+    assert_eq!(
+        (r.session.clone(), r.role, r.pid, r.running),
+        (key.clone(), SessionRole::Improve, pid1, false)
+    );
+    assert_eq!(turn_results(&r.events), 1);
+    let between = r.events.len() as u64;
+    // Toujours refusés entre deux tours (pas de « NotRunning » trompeur).
+    assert!(matches!(
+        state.send_message(&key, "x"),
+        Err(CoreError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        state.interrupt(&key, false).await,
+        Err(CoreError::InvalidArgument(_))
+    ));
+
+    // Tour 2 : nouveau processus, `--resume <id>`.
+    let end = state
+        .run_improve_turn(
+            &key,
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "précise : en bleu",
+            true,
+            isolated(&[]),
+            fast(),
+            Duration::from_secs(20),
+        )
+        .await;
+    assert_eq!(end, Ok(TurnEnd::Done));
+    let pid2 = conv.last_pid();
+    assert_ne!(pid1, pid2);
+    assert!(!alive(pid2));
+    assert_eq!(conv.launches(), 2);
+
+    let events = conv.outlet.events();
+    assert_eq!(
+        seqs(&events),
+        (0..events.len() as u64).collect::<Vec<_>>(),
+        "un seul fil, seq continus"
+    );
+    assert_eq!(turn_results(&events), 2);
+    assert!(events.iter().all(|e| e.session == key), "clé stable");
+    // Le nouveau canal reçoit la suite, à partir de la fin de l'instantané.
+    page2
+        .wait_for("exited du tour 2", Duration::from_secs(5), is_exited)
+        .await;
+    let got = seqs(&page2.all());
+    assert_eq!(got.first(), Some(&between));
+    assert_eq!(
+        got,
+        (between..between + got.len() as u64).collect::<Vec<_>>()
+    );
+
+    // Lancements : `--session-id <id>` puis `--resume <id>`, isolement
+    // identique.
+    let args = starting_args(&events);
+    assert_eq!(args.len(), 2, "deux lancements");
+    let strip = |a: &[String], flag: &str| -> Vec<String> {
+        let i = a.iter().position(|x| x == flag).expect(flag);
+        assert_eq!(a[i + 1], key.0, "{flag} <id du cycle>");
+        let mut v = a.to_vec();
+        v.drain(i..i + 2);
+        v
+    };
+    assert!(!args[1].iter().any(|x| x == "--session-id"));
+    assert!(!args[0].iter().any(|x| x == "--resume"));
+    assert_eq!(
+        strip(&args[0], "--session-id"),
+        strip(&args[1], "--resume"),
+        "mêmes options d'isolement"
+    );
+    println!("tour 1 : {:?}\ntour 2 : {:?}", args[0], args[1]);
+
+    // Fins de tour attendues : annoncées, sans alerte.
+    let notices = notice_codes(&events);
+    assert_eq!(turn_ends(&events), vec!["done", "done"]);
+    assert_eq!(notices[0].1, "improve.step", "note avant le premier tour");
+    assert!(notices.iter().all(|(_, c, _)| c != "exit_nonzero"));
+    every_exit_is_announced(&events);
+
+    // `improve_dismiss` : journal libéré, plus rendu.
+    assert!(state.dismiss_improve(&key).await);
+    assert!(!state.dismiss_improve(&key).await, "déjà libérée");
+    assert!(state.improve_get(&key).is_none());
+    assert!(!state.is_improve(&key));
+    state.close_orphans().await;
+    assert!(state
+        .attach_all(state.attachment(Events::default().sink()))
+        .is_empty());
+    assert!(!alive(pid1) && !alive(pid2), "aucun processus laissé");
+}
+
+/// Interruption (Échap) d'un tour qui ne finit pas : `TurnEnd::Interrupted`,
+/// processus tué après le délai, `exited` annoncé. Le tour long survit au
+/// délai de fermeture différée (protégé), et le journal reste après la fin
+/// du tour, sans page rattachée.
+#[tokio::test]
+async fn improve_turn_interrupt_and_reaper() {
+    let mut state = AppState::new(std::env::temp_dir());
+    state.detach_grace = Duration::from_millis(300);
+    let state = Arc::new(state);
+    let key = cycle_key();
+    let conv = state.improve_conversation(&key, &std::env::temp_dir());
+    assert!(
+        matches!(
+            state.interrupt_improve_turn(&key).await,
+            Err(CoreError::NotRunning)
+        ),
+        "pas de tour en cours"
+    );
+    let (st, k) = (state.clone(), key.clone());
+    let turn = tokio::spawn(async move {
+        st.run_improve_turn(
+            &k,
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "long",
+            false,
+            isolated(&["--fake-interrupt-no-result"]),
+            fast_interrupt(),
+            Duration::from_secs(30),
+        )
+        .await
+    });
+    let pid = wait_turn_started(&conv).await;
+    // Plus de trois délais de fermeture différée : protégé pendant le tour.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(alive(pid), "tour protégé de la fermeture différée");
+    assert!(state.sessions.lock().unwrap().contains_key(&key));
+    // Une seconde demande de tour pendant celui-ci est refusée.
+    let second = state
+        .run_improve_turn(
+            &key,
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "x",
+            true,
+            isolated(&[]),
+            fast(),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        matches!(second, Err(CoreError::InvalidArgument(_))),
+        "{second:?}"
+    );
+
+    let t1 = Instant::now();
+    state.interrupt_improve_turn(&key).await.unwrap();
+    let end = turn.await.unwrap();
+    println!("interruption : {end:?} en {:?}", t1.elapsed());
+    assert_eq!(end, Ok(TurnEnd::Interrupted));
+    assert!(t1.elapsed() < Duration::from_secs(8));
+    assert!(!alive(pid));
+    let events = conv.outlet.events();
+    every_exit_is_announced(&events);
+    assert_eq!(turn_ends(&events), vec!["interrupted"]);
+
+    // Le journal reste au-delà du délai, sans page rattachée.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let resync = state.attach_all(state.attachment(Events::default().sink()));
+    assert_eq!(resync.len(), 1);
+    assert_eq!(resync[0].events.len(), events.len());
+    assert!(state.dismiss_improve(&key).await);
+}
+
+/// Session morte en plein tour : erreur (pas de fin de tour annoncée,
+/// alerte `exit_nonzero` gardée) ; futur du tour abandonné (annulation) :
+/// `improve.turn_end` (`cancelled`), arrêt effectif attendu par
+/// `stop_improve_turn` ; `stop_all` (fermeture de l'app) tue le processus.
+#[tokio::test]
+async fn improve_turn_death_cancel_and_app_close() {
+    let state = Arc::new(AppState::new(std::env::temp_dir()));
+    let key = cycle_key();
+    let conv = state.improve_conversation(&key, &std::env::temp_dir());
+
+    let end = state
+        .run_improve_turn(
+            &key,
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "x",
+            false,
+            isolated(&["--fake-mode", "die-mid-turn"]),
+            fast(),
+            Duration::from_secs(10),
+        )
+        .await;
+    println!("mort en plein tour : {end:?}");
+    assert!(matches!(end, Err(CoreError::Io(_))), "{end:?}");
+    let events = conv.outlet.events();
+    assert!(notice_codes(&events)
+        .iter()
+        .any(|(_, c, _)| c == "exit_nonzero"));
+    assert!(turn_ends(&events).is_empty());
+    assert!(!alive(conv.last_pid()));
+
+    // Annulation : le futur est abandonné en plein tour.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(1500),
+        state.run_improve_turn(
+            &key,
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "long",
+            true,
+            isolated(&["--fake-interrupt-no-result", "--fake-ignore-stdin-eof"]),
+            fast(),
+            Duration::from_secs(30),
+        ),
+    )
+    .await;
+    assert!(cancelled.is_err(), "futur abandonné");
+    let pid = conv.last_pid();
+    let t0 = Instant::now();
+    state.stop_improve_turn(&key).await;
+    println!("annulation : arrêt effectif en {:?}", t0.elapsed());
+    assert!(!alive(pid));
+    assert!(conv.current().is_none());
+    assert_eq!(turn_ends(&conv.outlet.events()), vec!["cancelled"]);
+
+    // Fermeture de l'app pendant un tour.
+    let (st, k) = (state.clone(), key.clone());
+    let turn = tokio::spawn(async move {
+        st.run_improve_turn(
+            &k,
+            &fake_exe(),
+            &std::env::temp_dir(),
+            "long",
+            true,
+            isolated(&["--fake-interrupt-no-result"]),
+            fast(),
+            Duration::from_secs(30),
+        )
+        .await
+    });
+    let pid = wait_turn_started(&conv).await;
+    state.stop_all().await;
+    assert!(!alive(pid), "tué avec l'app");
+    let end = turn.await.unwrap();
+    assert!(end.is_err(), "tour non fini : {end:?}");
+    assert_eq!(conv.launches(), 3);
 }

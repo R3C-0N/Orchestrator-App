@@ -62,9 +62,35 @@ pub fn env_allowed(name: &str, allow: &[String]) -> bool {
 /// caractère de contrôle.
 pub fn validate_launch_options(opts: &LaunchOptions) -> Result<(), String> {
     if let Some(r) = &opts.resume {
-        let canonical = r.len() == 36 && r.as_bytes()[8] == b'-';
-        if !canonical || uuid::Uuid::try_parse(r).is_err() {
+        if !canonical_uuid(r) {
             return Err(format!("resume doit être un UUID de session : {r:?}"));
+        }
+    }
+    // Jalon J16 : `--session-id <uuid>` (premier tour de la session
+    // d'amélioration) passe par `extra_args` ; même règle que `resume`, une
+    // seule fois, et pas avec `resume` (le CLI exigerait `--fork-session`).
+    let ids: Vec<usize> = opts
+        .extra_args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == "--session-id" || a.starts_with("--session-id="))
+        .map(|(i, _)| i)
+        .collect();
+    if ids.len() > 1 {
+        return Err("--session-id donné plusieurs fois".into());
+    }
+    if let Some(&i) = ids.first() {
+        let a = &opts.extra_args[i];
+        let v = match a.strip_prefix("--session-id=") {
+            Some(v) => Some(v),
+            None => opts.extra_args.get(i + 1).map(String::as_str),
+        };
+        match v {
+            Some(v) if canonical_uuid(v) => {}
+            v => return Err(format!("--session-id doit être un UUID de session : {v:?}")),
+        }
+        if opts.resume.is_some() {
+            return Err("--session-id et resume sont exclusifs".into());
         }
     }
     if let Some(m) = &opts.model {
@@ -76,6 +102,11 @@ pub fn validate_launch_options(opts: &LaunchOptions) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// UUID canonique `8-4-4-4-12` (identifiant de session du CLI).
+fn canonical_uuid(s: &str) -> bool {
+    s.len() == 36 && s.as_bytes()[8] == b'-' && uuid::Uuid::try_parse(s).is_ok()
 }
 
 pub fn build_args(opts: &LaunchOptions) -> Vec<String> {
@@ -361,6 +392,33 @@ mod tests {
                 validate_launch_options(&opts(None, Some(bad))).is_err(),
                 "model {bad:?} doit être refusé"
             );
+        }
+    }
+
+    /// J16 : `--session-id <uuid>` (premier tour de la session
+    /// d'amélioration) dans `extra_args`, `resume` aux tours suivants.
+    #[test]
+    fn validate_session_id_in_extra_args() {
+        let id = "77cbd82d-c401-4ae6-a84e-8439cd39aecd";
+        let with = |resume: Option<&str>, extra: &[&str]| LaunchOptions {
+            resume: resume.map(str::to_string),
+            extra_args: extra.iter().map(|s| s.to_string()).collect(),
+            ..LaunchOptions::default()
+        };
+        let ok = with(None, &["--disallowedTools", "X", "--session-id", id]);
+        assert!(validate_launch_options(&ok).is_ok());
+        assert!(build_args(&ok).ends_with(&["--session-id".into(), id.into()]));
+        assert!(validate_launch_options(&with(None, &[&format!("--session-id={id}")])).is_ok());
+        assert!(validate_launch_options(&with(Some(id), &[])).is_ok());
+        for bad in [
+            with(None, &["--session-id"]),
+            with(None, &["--session-id", "--resume"]),
+            with(None, &["--session-id", "abc"]),
+            with(None, &["--session-id=abc"]),
+            with(None, &["--session-id", id, "--session-id", id]),
+            with(Some(id), &["--session-id", id]),
+        ] {
+            assert!(validate_launch_options(&bad).is_err(), "{bad:?}");
         }
     }
 }

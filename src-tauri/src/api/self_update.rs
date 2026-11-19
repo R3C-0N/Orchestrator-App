@@ -3,15 +3,18 @@
 //! `commands.rs` (sessions).
 //!
 //! - [`setup`] (appelé par `lib.rs`) : configuration du clone, état
-//!   `Cloning`, `ensure_clone` en tâche de fond, puis `cleanup_merged` ;
-//!   cycle [`Pipeline`] partagé (un seul à la fois) géré par Tauri
-//!   ([`Improver`]).
-//! - [`AppHost`] : le [`PipelineHost`] réel. Session dédiée par
-//!   `AppState::start_improve` (outils git dangereux refusés, git sans
-//!   réseau ni hooks), protégée de la fermeture différée tant que le cycle
-//!   la tient, arrêtée à la fin ou à l'abandon du futur ; bascule
-//!   d'interface par `UiHost` (empreinte du contrat vérifiée avant
-//!   d'activer, signal « prêt » attendu, nettoyage).
+//!   `Cloning`, `ensure_clone` en tâche de fond (worktrees jetables des
+//!   tests nettoyés, worktrees `auto/…` non fusionnés signalés), puis
+//!   `cleanup_merged` ; cycle [`Pipeline`] partagé (un seul à la fois) géré
+//!   par Tauri ([`Improver`]).
+//! - [`AppHost`] : le [`PipelineHost`] réel. Jalon J16 : une conversation
+//!   par cycle (`AppState::improve_conversation`, clé = `id` du cycle), un
+//!   processus `claude.exe` par tour (`AppState::run_improve_turn` :
+//!   `--session-id` puis `--resume`, outils git dangereux refusés, git sans
+//!   réseau ni hooks, environnement en liste blanche), arrêté à la fin de
+//!   chaque tour ou à l'abandon du futur ; lignes d'état `notice`
+//!   `improve.*` (`note`) ; bascule d'interface par `UiHost` (empreinte du
+//!   contrat vérifiée avant d'activer, signal « prêt » attendu, nettoyage).
 //! - [`LockingToolchain`] : la toolchain npm réelle, avec le verrou de build
 //!   `UiHost::build_lock` tenu pendant le `vite build`.
 
@@ -23,16 +26,18 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use super::commands::AppState;
+use super::events::NoticeLevel;
 use super::types::{
     CoreError, ImproveStatus, ImproveStep, PushStatus, RepoStatus, SessionKey, UiInfo, UiSource,
     IMPROVE_EVENT,
 };
+use crate::process::locate::locate_claude;
 use crate::process::spawn::LaunchOptions;
-use crate::process::supervisor::{Session, TurnWait};
+use crate::process::supervisor::SessionConfig;
 use crate::selfupdate::pipeline::{self, NpmToolchain, Toolchain};
 use crate::selfupdate::{
     BoxFut, ImproveOutcome, ImproveRequest, Pipeline, PipelineHost, RepoConfig, SelfUpdate,
-    StatusSink, MAX_AUTO_ATTEMPTS,
+    StatusSink, TurnEnd, MAX_AUTO_ATTEMPTS,
 };
 use crate::ui::{UiHost, READY_TIMEOUT};
 
@@ -332,9 +337,20 @@ pub struct Improver {
     pub pipeline: Arc<Pipeline>,
     /// Un cycle (amélioration ou retour arrière) est lancé ou en cours.
     running: Arc<AtomicBool>,
-    /// Session dédiée du cycle en cours (reportée dans `ImproveStatus`).
+    /// Conversation du cycle en cours (clé stable = `id` du cycle, reportée
+    /// dans `ImproveStatus::session`).
     session: Arc<Mutex<Option<SessionKey>>>,
+    /// Avis du démarrage (worktrees `auto/…` non fusionnés laissés par une
+    /// session précédente, app fermée pendant un cycle par exemple) : émis
+    /// en tête de la conversation du prochain cycle (`notice`
+    /// [`IMPROVE_UNMERGED`]).
+    startup_notice: Arc<Mutex<Option<Vec<String>>>>,
 }
+
+/// Code de la `notice` (niveau `warn`) qui ouvre la conversation du premier
+/// cycle après un démarrage où des worktrees `auto/…` non fusionnés ont été
+/// trouvés. `detail` : `{"branches": ["auto/…", …]}`.
+pub const IMPROVE_UNMERGED: &str = "improve.unmerged_worktrees";
 
 /// Remet `running` à faux à la fin de la tâche du cycle, même en panique.
 struct Running(Arc<AtomicBool>);
@@ -427,37 +443,17 @@ impl<R: Runtime> Toolchain for LockingToolchain<R> {
     }
 }
 
-/// Arrête la session dédiée quand le cycle la lâche (fin normale ou futur
-/// abandonné par l'annulation).
-struct StopOnDrop<R: Runtime> {
-    app: AppHandle<R>,
-    key: SessionKey,
-}
-
-impl<R: Runtime> Drop for StopOnDrop<R> {
-    fn drop(&mut self) {
-        let app = self.app.clone();
-        let key = self.key.clone();
-        tauri::async_runtime::spawn(async move {
-            if app.state::<AppState>().close_session(&key).await.is_some() {
-                tracing::info!(session = %key.0, "session d'amélioration arrêtée");
-            }
-        });
-    }
-}
-
 /// [`PipelineHost`] de l'app.
 pub struct AppHost<R: Runtime> {
     pub app: AppHandle<R>,
     pub model: Option<String>,
+    /// Conversation du cycle en cours (clé stable : l'`id` du cycle), posée
+    /// par `improve_start` ; partagée avec [`Improver`].
     session: Arc<Mutex<Option<SessionKey>>>,
-    /// Session dédiée du cycle en cours, pour attendre son arrêt effectif
-    /// (`session_stopped`).
-    running: Mutex<Option<Arc<Session>>>,
 }
 
 /// Attente maximale de l'arrêt effectif de la session dédiée.
-pub const IMPROVE_STOP_WAIT: Duration = Duration::from_secs(30);
+pub const IMPROVE_STOP_WAIT: Duration = super::commands::IMPROVE_STOP_WAIT;
 
 impl<R: Runtime> AppHost<R> {
     /// Attend le signal « prêt » de `hash` après `activate` : vrai s'il est
@@ -480,62 +476,96 @@ impl<R: Runtime> AppHost<R> {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+
+    /// Clé de la conversation du cycle en cours : celle posée par
+    /// `improve_start`, sinon l'`id` du cycle affiché.
+    fn current_key(&self) -> Option<SessionKey> {
+        self.session.lock().unwrap().clone().or_else(|| {
+            let su = self.app.state::<SelfUpdate>();
+            let id = su.current.lock().unwrap().as_ref().map(|s| s.id.clone());
+            id.map(SessionKey)
+        })
+    }
 }
 
 impl<R: Runtime> PipelineHost for AppHost<R> {
+    /// Premier tour (J14), par [`PipelineHost::run_turn`].
     fn run_session<'a>(
         &'a self,
-        _request: &'a ImproveRequest,
+        request: &'a ImproveRequest,
         cwd: &'a Path,
         prompt: &'a str,
     ) -> BoxFut<'a, Result<(), CoreError>> {
+        Box::pin(async move { self.run_turn(request, cwd, prompt, false).await.map(drop) })
+    }
+
+    /// Jalon J16 : un processus `claude.exe` par tour, dans la conversation
+    /// du cycle (journal à clé stable `request.id`) : `--session-id
+    /// <request.id>` au premier tour, `--resume <request.id>` ensuite, mêmes
+    /// options d'isolement ([`improve_launch_options`]). Rend la main après
+    /// l'arrêt effectif du processus (`AppState::run_improve_turn`).
+    fn run_turn<'a>(
+        &'a self,
+        request: &'a ImproveRequest,
+        cwd: &'a Path,
+        message: &'a str,
+        resume: bool,
+    ) -> BoxFut<'a, Result<TurnEnd, CoreError>> {
         Box::pin(async move {
             let state = self.app.state::<AppState>();
+            let key = SessionKey(request.id.clone());
+            let exe =
+                locate_claude().map_err(|tried| CoreError::ClaudeNotFound(tried.join(" ; ")))?;
             let global = empty_global_config()
                 .map_err(|e| CoreError::Io(format!("configuration git de la session : {e}")))?;
-            let s = state
-                .start_improve(
+            state.improve_conversation(&key, cwd);
+            let changed = self.session.lock().unwrap().replace(key.clone()) != Some(key.clone());
+            if changed {
+                // L'onglet voit la conversation dès maintenant.
+                let cur = self
+                    .app
+                    .state::<SelfUpdate>()
+                    .current
+                    .lock()
+                    .unwrap()
+                    .clone();
+                if let Some(mut st) = cur.filter(|s| s.id == request.id) {
+                    st.session = Some(key.clone());
+                    publish(&self.app, st);
+                }
+            }
+            state
+                .run_improve_turn(
+                    &key,
+                    &exe,
                     cwd,
-                    prompt,
+                    message,
+                    resume,
                     improve_launch_options(self.model.clone(), &global),
+                    SessionConfig::default(),
+                    IMPROVE_SESSION_TIMEOUT,
                 )
-                .await?;
-            // Les gardes tombent dans l'ordre inverse de leur déclaration :
-            // `_stop` d'abord (arrêt demandé dans une tâche), puis `_protect`
-            // (protection levée). L'arrêt est asynchrone : la session peut
-            // rester quelques instants sans protection, sans risque (la
-            // fermeture différée n'agit qu'après `DETACH_GRACE`).
-            let _protect = state.protect(&s.key);
-            let _stop = StopOnDrop {
-                app: self.app.clone(),
-                key: s.key.clone(),
-            };
-            *self.session.lock().unwrap() = Some(s.key.clone());
-            *self.running.lock().unwrap() = Some(s.clone());
-            // Le bandeau voit la session dès maintenant.
-            let cur = self
-                .app
-                .state::<SelfUpdate>()
-                .current
-                .lock()
-                .unwrap()
-                .clone();
-            if let Some(mut st) = cur {
-                st.session = Some(s.key.clone());
-                publish(&self.app, st);
-            }
-            match s.wait_turn_end(0, IMPROVE_SESSION_TIMEOUT).await {
-                TurnWait::Done(_) => Ok(()),
-                TurnWait::Exited => Err(CoreError::Io(format!(
-                    "la session dédiée s'est arrêtée avant la fin de son tour (code {:?})",
-                    s.exit_code().flatten()
-                ))),
-                TurnWait::Timeout => Err(CoreError::Timeout(format!(
-                    "session dédiée ({} min)",
-                    IMPROVE_SESSION_TIMEOUT.as_secs() / 60
-                ))),
-            }
+                .await
         })
+    }
+
+    fn interrupt_turn(&self) -> BoxFut<'_, Result<(), CoreError>> {
+        Box::pin(async move {
+            let key = self.current_key().ok_or(CoreError::NotRunning)?;
+            self.app
+                .state::<AppState>()
+                .interrupt_improve_turn(&key)
+                .await
+        })
+    }
+
+    fn note(&self, level: NoticeLevel, code: &str, message: &str) {
+        tracing::info!(?level, code, "amélioration : {message}");
+        if let Some(key) = self.current_key() {
+            self.app
+                .state::<AppState>()
+                .improve_note(&key, level, code, message);
+        }
     }
 
     fn switch_ui<'a>(
@@ -577,30 +607,13 @@ impl<R: Runtime> PipelineHost for AppHost<R> {
         })
     }
 
+    /// Arrêt effectif du processus du tour en cours (futur de `run_turn`
+    /// abandonné : annulation) ; sans effet après un tour terminé, déjà
+    /// arrêté par `run_turn`.
     fn session_stopped(&self) -> BoxFut<'_, ()> {
         Box::pin(async move {
-            let Some(s) = self.running.lock().unwrap().take() else {
-                return;
-            };
-            // Arrêt demandé ici aussi (sans attendre la tâche de `StopOnDrop`) :
-            // `stop` ferme stdin, attend, puis ferme le Job (arbre tué).
-            if self
-                .app
-                .state::<AppState>()
-                .close_session(&s.key)
-                .await
-                .is_none()
-                && tokio::time::timeout(IMPROVE_STOP_WAIT, s.exited())
-                    .await
-                    .is_err()
-            {
-                tracing::error!(
-                    session = %s.key.0,
-                    "session d'amélioration toujours vivante après {} s : processus tué",
-                    IMPROVE_STOP_WAIT.as_secs()
-                );
-                s.kill();
-                let _ = tokio::time::timeout(IMPROVE_STOP_WAIT, s.exited()).await;
+            if let Some(key) = self.current_key() {
+                self.app.state::<AppState>().stop_improve_turn(&key).await;
             }
         })
     }
@@ -617,6 +630,101 @@ fn install_dir() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
+/// Démarrage (J16) : supprime les worktrees jetables des tests
+/// (`<work>\.tests\*`) laissés par un arrêt de l'app pendant un cycle,
+/// enregistrés ou non dans git. Aucun cycle ne tourne (appelé avant que le
+/// clone soit déclaré prêt). La jonction `node_modules` est retirée d'abord
+/// (jamais suivie). Renvoie le nombre de dossiers supprimés.
+pub async fn clear_test_worktrees(clone: &Path, tests_root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(tests_root) else {
+        return 0;
+    };
+    let mut n = 0;
+    for e in entries.flatten() {
+        let p = e.path();
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let nm = p.join("node_modules");
+        if is_junction(&nm) {
+            if std::fs::remove_dir(&nm).is_err() {
+                let _ = std::fs::remove_file(&nm);
+            }
+            if std::fs::symlink_metadata(&nm).is_ok() {
+                tracing::warn!("jonction {} non retirée : dossier gardé", nm.display());
+                continue;
+            }
+        }
+        let p_s = p.to_string_lossy().into_owned();
+        let _ = crate::selfupdate::git::git(clone, &["worktree", "remove", "--force", &p_s]).await;
+        if p.exists() {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+        if p.exists() {
+            tracing::warn!("worktree de tests {} non supprimé", p.display());
+        } else {
+            tracing::info!("worktree de tests resté supprimé : {}", p.display());
+            n += 1;
+        }
+    }
+    let _ = crate::selfupdate::git::git(clone, &["worktree", "prune"]).await;
+    n
+}
+
+/// `p` est une jonction (point de montage Windows) ou un lien.
+fn is_junction(p: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        std::fs::symlink_metadata(p)
+            .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+    }
+}
+
+/// Démarrage (J16, décision « pas de reprise ») : branches des worktrees
+/// `auto/…` du clone placés sous `work_root` et non fusionnées dans `main`
+/// (cycle échoué, annulé, ou app fermée pendant un cycle). Gardés pour
+/// inspection ; signalés par un avis.
+pub async fn unmerged_worktrees(clone: &Path, work_root: &Path) -> Vec<String> {
+    let Ok(list) = crate::selfupdate::git::git(clone, &["worktree", "list", "--porcelain"]).await
+    else {
+        return Vec::new();
+    };
+    let work = work_root.canonicalize().ok();
+    let mut out = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    for line in list.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(p));
+            continue;
+        }
+        let Some(b) = line.strip_prefix("branch refs/heads/") else {
+            continue;
+        };
+        let under = path
+            .as_ref()
+            .and_then(|p| p.canonicalize().ok())
+            .zip(work.as_ref())
+            .is_some_and(|(p, w)| p.starts_with(w));
+        if !b.starts_with(crate::selfupdate::BRANCH_PREFIX) || !under {
+            continue;
+        }
+        let merged =
+            crate::selfupdate::git::git_ok(clone, &["merge-base", "--is-ancestor", b, "main"])
+                .await
+                .unwrap_or(false);
+        if !merged {
+            out.push(b.to_string());
+        }
+    }
+    out
+}
+
 /// Démarrage (`Builder::setup`) : cycle géré par Tauri, clone en tâche de
 /// fond, puis nettoyage des worktrees fusionnés et, pour le propriétaire
 /// (réglage `push` de `config.json`), vérification du droit d'écriture
@@ -631,7 +739,6 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
         app: app.clone(),
         model: configured_model(),
         session: session.clone(),
-        running: Mutex::new(None),
     });
     let ui_root = app.state::<UiHost>().root().to_path_buf();
     let data = crate::selfupdate::data_dir().unwrap_or_else(std::env::temp_dir);
@@ -643,10 +750,12 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
             }))
             .with_dirs(data.join("work"), ui_root),
     );
+    let startup_notice: Arc<Mutex<Option<Vec<String>>>> = Arc::default();
     app.manage(Improver {
         pipeline: pipeline.clone(),
         running: Arc::default(),
         session,
+        startup_notice: startup_notice.clone(),
     });
 
     let su = app.state::<SelfUpdate>();
@@ -666,6 +775,26 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
             s => tracing::info!("clone de l'app : {s:?}"),
         }
         let ready = matches!(status, RepoStatus::Ready { .. });
+        if ready {
+            // J16 : avant que `/ameliorer` soit permis (aucun cycle ne
+            // tourne). Worktrees de tests laissés par un arrêt pendant un
+            // cycle : supprimés. Worktrees `auto/…` non fusionnés (pas de
+            // reprise) : signalés au journal et en tête de la conversation
+            // du prochain cycle.
+            let work = pipeline.work_root.clone();
+            let n = clear_test_worktrees(&config.dir, &work.join(pipeline::TESTS_DIR)).await;
+            if n > 0 {
+                tracing::info!("{n} worktree(s) de tests resté(s) supprimé(s)");
+            }
+            let left = unmerged_worktrees(&config.dir, &work).await;
+            if !left.is_empty() {
+                tracing::warn!(
+                    "amélioration(s) non fusionnée(s) gardée(s) pour inspection : {}",
+                    left.join(", ")
+                );
+                *startup_notice.lock().unwrap() = Some(left);
+            }
+        }
         *app.state::<SelfUpdate>().repo.lock().unwrap() = status;
         if ready {
             let n = pipeline.cleanup_merged().await;
@@ -743,6 +872,7 @@ pub async fn improve_start(
     app: AppHandle,
     su: State<'_, SelfUpdate>,
     improver: State<'_, Improver>,
+    state: State<'_, AppState>,
     request: String,
 ) -> Result<ImproveStatus, CoreError> {
     match &*su.repo.lock().unwrap() {
@@ -760,12 +890,30 @@ pub async fn improve_start(
     }
     let req = improver.pipeline.request(&request)?;
     let guard = improver.try_begin()?;
+    // J16 : la conversation du cycle existe dès le départ (clé stable =
+    // `id` du cycle) : l'onglet s'ouvre sur elle, les lignes d'état
+    // (`note`) y vont avant le premier tour.
+    let key = SessionKey(req.id.clone());
+    let conv = state.improve_conversation(&key, &improver.pipeline.worktree_path(&req.branch));
+    *improver.session.lock().unwrap() = Some(key.clone());
+    if let Some(branches) = improver.startup_notice.lock().unwrap().take() {
+        conv.notice_with(
+            NoticeLevel::Warn,
+            IMPROVE_UNMERGED,
+            &format!(
+                "amélioration(s) précédente(s) non fusionnée(s), gardée(s) pour inspection \
+                 (pas de reprise) : {}",
+                branches.join(", ")
+            ),
+            Some(serde_json::json!({ "branches": branches })),
+        );
+    }
     let status = ImproveStatus {
         id: req.id.clone(),
         branch: req.branch.clone(),
         request: req.text.clone(),
         step: ImproveStep::Preparing,
-        session: None,
+        session: Some(key),
         commit: None,
         detail: None,
         push: None,
@@ -789,7 +937,8 @@ pub async fn improve_cancel(improver: State<'_, Improver>, id: String) -> Result
 }
 
 /// Jalon J16 : message de l'utilisateur à la session de l'amélioration `id`
-/// (onglet d'amélioration). Provisoire (étape 0) : `NotImplemented`.
+/// (onglet d'amélioration), par `Pipeline::send` (mis en file pendant un
+/// tour, nouveau tour sinon).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn improve_send(
     improver: State<'_, Improver>,
@@ -800,25 +949,39 @@ pub async fn improve_send(
 }
 
 /// Jalon J16 : « Valider » : contrôles et tests relancés pour l'amélioration
-/// `id` en attente de l'utilisateur. Provisoire (étape 0) : `NotImplemented`.
+/// `id` en attente de l'utilisateur (`Pipeline::validate`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn improve_validate(improver: State<'_, Improver>, id: String) -> Result<(), CoreError> {
     improver.pipeline.validate(&id).await
 }
 
 /// Jalon J16 : interrompt le tour en cours de la session de l'amélioration
-/// `id` (Échap). Provisoire (étape 0) : `NotImplemented`.
+/// `id` (Échap), par `Pipeline::interrupt` (puis
+/// `PipelineHost::interrupt_turn`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn improve_interrupt(improver: State<'_, Improver>, id: String) -> Result<(), CoreError> {
     improver.pipeline.interrupt(&id).await
 }
 
 /// Jalon J16 : l'onglet de l'amélioration `id`, terminée, est fermé : le
-/// cœur libère le journal de sa conversation. Provisoire (étape 0) : rien à
-/// libérer, réponse neutre.
+/// cœur libère le journal de sa conversation (plus rendu par
+/// `attach_sessions`). Refusé tant que ce cycle tourne (annuler d'abord :
+/// `improve_cancel`) ; sans effet si la conversation est déjà libérée.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn improve_dismiss(id: String) -> Result<(), CoreError> {
-    tracing::debug!(id, "improve_dismiss (provisoire)");
+pub async fn improve_dismiss(
+    su: State<'_, SelfUpdate>,
+    improver: State<'_, Improver>,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), CoreError> {
+    let current = su.current.lock().unwrap().as_ref().map(|s| s.id.clone());
+    if improver.is_running() && current.as_deref() == Some(id.as_str()) {
+        return Err(CoreError::InvalidArgument(
+            "amélioration en cours : l'annuler avant de fermer son onglet".into(),
+        ));
+    }
+    let freed = state.dismiss_improve(&SessionKey(id.clone())).await;
+    tracing::info!(id, freed, "conversation d'amélioration libérée");
     Ok(())
 }
 

@@ -246,6 +246,11 @@ impl Outlet {
         }
     }
 
+    /// Clé de session portée par les événements du journal.
+    pub fn key(&self) -> &SessionKey {
+        &self.session
+    }
+
     /// Rappel appelé quand un envoi refusé détache la session.
     pub fn set_on_detach(&self, f: DetachHook) {
         *self.on_detach.lock().unwrap() = Some(f);
@@ -693,6 +698,30 @@ impl Session {
             return Err(CoreError::BadCwd(display_path(cwd)));
         }
         validate_launch_options(&opts).map_err(CoreError::InvalidArgument)?;
+        let outlet = Outlet::spawn(key, attachment);
+        Self::start_on(outlet, exe, cwd, opts, role, config).await
+    }
+
+    /// Jalon J16 : lance un processus qui émet dans un journal **existant**
+    /// (`outlet`, clé de session comprise). Conversation d'un cycle
+    /// d'amélioration : un processus par tour, tous dans le même journal ;
+    /// les `seq` continuent d'un processus à l'autre et la destination (page
+    /// rattachée ou non) est celle du journal. Le compte des tours
+    /// ([`Outlet::turns`]) est celui du journal : lire `turns()` avant
+    /// d'envoyer le message, puis [`Session::wait_turn_end`].
+    pub async fn start_on(
+        outlet: Arc<Outlet>,
+        exe: &Path,
+        cwd: &Path,
+        opts: LaunchOptions,
+        role: SessionRole,
+        config: SessionConfig,
+    ) -> Result<Arc<Session>, CoreError> {
+        let key = outlet.key().clone();
+        if !cwd.is_dir() {
+            return Err(CoreError::BadCwd(display_path(cwd)));
+        }
+        validate_launch_options(&opts).map_err(CoreError::InvalidArgument)?;
         let args = build_args(&opts);
         let mut spawned = spawn_claude_env(exe, cwd, &args, &opts.env, opts.env_allow.as_deref())
             .map_err(|e| {
@@ -716,7 +745,7 @@ impl Session {
         });
 
         let resumed_from = opts.resume.clone();
-        let emitter = Emitter(Outlet::spawn(key.clone(), attachment));
+        let emitter = Emitter(outlet);
         emitter.emit(
             EventBody::Starting {
                 pid: spawned.pid,

@@ -5,14 +5,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde_json::json;
 use tauri::ipc::Channel;
 use tauri::State;
 
-use super::events::CoreEvent;
+use super::events::{CoreEvent, EventBody, NoticeLevel};
 use super::types::{
     Answers, CoreError, Diagnostics, ExitInfo, HistoryLoaded, InterruptAck, LaunchInfo,
     ProjectSummary, SessionKey, SessionResync, SessionRole, SessionStarted, SessionSummary,
@@ -20,12 +21,204 @@ use super::types::{
 };
 use crate::process::locate::{display_path, locate_claude, EXPECTED_CLAUDE_VERSION};
 use crate::process::spawn::LaunchOptions;
-use crate::process::supervisor::{Attachment, Session, SessionConfig};
+use crate::process::supervisor::{now_ms, Attachment, Outlet, Session, SessionConfig, TurnWait};
+use crate::selfupdate::TurnEnd;
 use crate::state::batcher::Sink;
 
 /// Délai après lequel une session détachée (interface rechargée ou fermée)
 /// et pas rattachée est fermée (J14, décision 15 ; esprit de J6).
 pub const DETACH_GRACE: Duration = Duration::from_secs(60);
+
+/// Jalon J16 : code de la `notice` émise dans la conversation d'un cycle
+/// juste avant l'arrêt voulu du processus d'un tour. L'`exited` (et le
+/// `status` `exited`) qui suit est attendu : l'interface ne le montre pas
+/// comme une erreur. `detail` : `{"turn": n, "end": "done" | "interrupted"
+/// | "timeout" | "cancelled", "pid": p}`.
+pub const IMPROVE_TURN_END: &str = "improve.turn_end";
+
+/// Interruption acceptée sans fin de tour dans ce délai (deux fois
+/// `SessionConfig::interrupt_result_timeout` : 10 s par défaut) : le
+/// processus du tour est tué, le tour finit par [`TurnEnd::Interrupted`].
+pub const IMPROVE_INTERRUPT_KILL: Duration = Duration::from_secs(10);
+
+/// Attente maximale de l'arrêt effectif du processus d'un tour (après
+/// `Session::stop`, qui ferme stdin puis termine le Job).
+pub const IMPROVE_STOP_WAIT: Duration = Duration::from_secs(30);
+
+/// Jalon J16 : conversation d'un cycle d'amélioration. Un journal
+/// ([`Outlet`]) à clé stable (l'`id` du cycle), où émettent tous les
+/// processus successifs de la session dédiée (un par tour) : `seq` continus,
+/// un seul fil. Rendue par `attach_sessions` tant qu'elle existe, même
+/// entre deux tours (aucun processus), jusqu'à `improve_dismiss`.
+pub struct ImproveConversation {
+    pub key: SessionKey,
+    pub outlet: Arc<Outlet>,
+    /// Création (ms) : ordre dans `attach_sessions`.
+    pub started_at: u64,
+    cwd: Mutex<PathBuf>,
+    /// Processus du tour en cours.
+    current: Mutex<Option<Arc<Session>>>,
+    /// Pid du dernier processus lancé (0 avant le premier).
+    last_pid: AtomicU32,
+    /// Processus lancés (un par tour).
+    launches: AtomicU32,
+    /// Tours terminés dans le journal au début du tour en cours.
+    turn_base: AtomicU64,
+    /// Le tour en cours a été interrompu (`interrupt_improve_turn`).
+    interrupted: AtomicBool,
+    /// Délai avant de tuer un tour interrompu qui ne finit pas.
+    kill_after: Mutex<Duration>,
+}
+
+impl ImproveConversation {
+    /// Processus du tour en cours, s'il tourne.
+    pub fn current(&self) -> Option<Arc<Session>> {
+        self.current
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|s| s.is_running())
+    }
+
+    /// Processus lancés depuis la création.
+    pub fn launches(&self) -> u32 {
+        self.launches.load(Ordering::SeqCst)
+    }
+
+    /// Pid du dernier processus lancé (0 avant le premier).
+    pub fn last_pid(&self) -> u32 {
+        self.last_pid.load(Ordering::SeqCst)
+    }
+
+    fn resync(&self, sink: Sink, page_gen: u64) -> SessionResync {
+        let events = self.outlet.attach(sink, page_gen);
+        SessionResync {
+            session: self.key.clone(),
+            role: SessionRole::Improve,
+            cwd: display_path(&self.cwd.lock().unwrap()),
+            pid: self.last_pid(),
+            resumed_from: None,
+            history: None,
+            events,
+            running: self.current().is_some(),
+        }
+    }
+
+    /// Ligne d'état `notice` dans le fil.
+    pub fn notice(&self, level: NoticeLevel, code: &str, message: &str) {
+        self.notice_with(level, code, message, None);
+    }
+
+    /// `notice` avec `detail`.
+    pub fn notice_with(
+        &self,
+        level: NoticeLevel,
+        code: &str,
+        message: &str,
+        detail: Option<serde_json::Value>,
+    ) {
+        self.outlet.emit(
+            EventBody::Notice {
+                level,
+                code: code.into(),
+                message: message.into(),
+                detail,
+            },
+            now_ms(),
+        );
+    }
+
+    /// `improve.turn_end` juste avant l'arrêt voulu du processus `s`.
+    fn turn_end_notice(&self, s: &Session, end: &str) {
+        let (level, message) = match end {
+            "done" => (NoticeLevel::Info, "tour terminé : session en pause"),
+            "interrupted" => (NoticeLevel::Info, "tour interrompu : session en pause"),
+            "timeout" => (NoticeLevel::Warn, "tour trop long : session arrêtée"),
+            _ => (NoticeLevel::Info, "session arrêtée"),
+        };
+        self.notice_with(
+            level,
+            IMPROVE_TURN_END,
+            message,
+            Some(json!({ "turn": self.outlet.turns(), "end": end, "pid": s.pid })),
+        );
+    }
+}
+
+/// Arrête le processus d'un tour si le futur de `run_improve_turn` est
+/// abandonné (annulation du cycle) : `notice` `improve.turn_end` (`end` :
+/// `cancelled`) puis arrêt dans une tâche ; l'arrêt effectif est attendu par
+/// [`AppState::stop_improve_turn`].
+struct TurnGuard {
+    conv: Arc<ImproveConversation>,
+    session: Arc<Session>,
+    sessions: SessionMap,
+    last: Arc<Mutex<Option<Arc<Session>>>>,
+    armed: bool,
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.session.is_running() {
+            self.conv.turn_end_notice(&self.session, "cancelled");
+        }
+        let (conv, s, sessions, last) = (
+            self.conv.clone(),
+            self.session.clone(),
+            self.sessions.clone(),
+            self.last.clone(),
+        );
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn(async move {
+                    stop_turn_process(&conv, &s, &sessions, &last).await;
+                });
+            }
+            Err(_) => s.kill(),
+        }
+    }
+}
+
+/// Arrête le processus `s` d'un tour et attend son arrêt effectif (Job
+/// terminé) ; le retire de la table et de la conversation.
+async fn stop_turn_process(
+    conv: &ImproveConversation,
+    s: &Arc<Session>,
+    sessions: &SessionMap,
+    last: &Mutex<Option<Arc<Session>>>,
+) {
+    s.stop().await;
+    if s.is_running() {
+        tracing::error!(
+            session = %s.key.0,
+            pid = s.pid,
+            "processus du tour d'amélioration toujours vivant après l'arrêt : tué"
+        );
+        s.kill();
+        if tokio::time::timeout(IMPROVE_STOP_WAIT, s.exited())
+            .await
+            .is_err()
+        {
+            tracing::error!(session = %s.key.0, pid = s.pid, "processus du tour toujours vivant");
+        }
+    }
+    {
+        let mut map = sessions.lock().unwrap();
+        if map.get(&s.key).is_some_and(|x| Arc::ptr_eq(x, s)) {
+            map.remove(&s.key);
+        }
+    }
+    {
+        let mut cur = conv.current.lock().unwrap();
+        if cur.as_ref().is_some_and(|x| Arc::ptr_eq(x, s)) {
+            *cur = None;
+        }
+    }
+    *last.lock().unwrap() = Some(s.clone());
+}
 
 type SessionMap = Arc<Mutex<HashMap<SessionKey, Arc<Session>>>>;
 /// Sessions que la fermeture différée ne touche pas (session d'amélioration
@@ -55,6 +248,9 @@ pub struct AppState {
     /// sessions principales) : deux démarrages entrelacés ne se ferment pas
     /// l'un l'autre.
     pub main_start: tokio::sync::Mutex<()>,
+    /// Jalon J16 : conversations des cycles d'amélioration, par clé stable
+    /// (l'`id` du cycle), jusqu'à `improve_dismiss`.
+    improve: Mutex<HashMap<SessionKey, Arc<ImproveConversation>>>,
 }
 
 /// Attente du repos d'une session principale remplacée avant de la fermer.
@@ -100,6 +296,7 @@ impl AppState {
             ui: Mutex::new(None),
             protected: Arc::default(),
             main_start: tokio::sync::Mutex::new(()),
+            improve: Mutex::new(HashMap::new()),
         }
     }
 
@@ -162,6 +359,12 @@ impl AppState {
             }
         }
         let n = self.reaper().detach_before(gen);
+        // Conversations d'amélioration, même entre deux tours (aucun
+        // processus dans la table) : détachées aussi, jamais fermées par le
+        // délai (elles vivent jusqu'à `improve_dismiss`).
+        for c in self.improve_conversations() {
+            c.outlet.detach_before(gen);
+        }
         if n > 0 {
             tracing::info!(
                 sessions = n,
@@ -213,14 +416,266 @@ impl AppState {
             return Vec::new();
         }
         *self.ui.lock().unwrap() = Some(page.clone());
-        let mut all: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
-        all.sort_by_key(|s| s.started_at);
+        // J16 : une conversation d'amélioration est rendue une fois, par son
+        // journal, qu'un processus de tour tourne (même clé dans la table)
+        // ou non.
+        enum Entry {
+            Session(Arc<Session>),
+            Improve(Arc<ImproveConversation>),
+        }
+        let convs = self.improve_conversations();
+        let mut all: Vec<(u64, Entry)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| !convs.iter().any(|c| c.key == s.key))
+            .map(|s| (s.started_at, Entry::Session(s.clone())))
+            .collect();
+        all.extend(convs.into_iter().map(|c| (c.started_at, Entry::Improve(c))));
+        all.sort_by_key(|(t, _)| *t);
         let out = all
             .iter()
-            .map(|s| s.resync(page.sink.clone(), page.page_gen))
+            .map(|(_, x)| match x {
+                Entry::Session(s) => s.resync(page.sink.clone(), page.page_gen),
+                Entry::Improve(c) => c.resync(page.sink.clone(), page.page_gen),
+            })
             .collect();
         self.forget_dead();
         out
+    }
+
+    fn improve_conversations(&self) -> Vec<Arc<ImproveConversation>> {
+        self.improve.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Jalon J16 : conversation du cycle `key`, créée au besoin (journal
+    /// rattaché à la page courante, s'il y en a une). `cwd` : worktree du
+    /// cycle (rendu par `attach_sessions`).
+    pub fn improve_conversation(&self, key: &SessionKey, cwd: &Path) -> Arc<ImproveConversation> {
+        let mut map = self.improve.lock().unwrap();
+        if let Some(c) = map.get(key) {
+            *c.cwd.lock().unwrap() = cwd.to_path_buf();
+            return c.clone();
+        }
+        let outlet = Outlet::spawn(key.clone(), self.ui.lock().unwrap().clone());
+        // Destination refusée (fenêtre fermée) : les processus de tour
+        // éventuels suivent la règle commune (ils sont protégés pendant le
+        // tour) ; le journal, lui, reste jusqu'à `improve_dismiss`.
+        let reaper = self.reaper();
+        outlet.set_on_detach(Arc::new(move || reaper.schedule()));
+        let c = Arc::new(ImproveConversation {
+            key: key.clone(),
+            outlet,
+            started_at: now_ms(),
+            cwd: Mutex::new(cwd.to_path_buf()),
+            current: Mutex::new(None),
+            last_pid: AtomicU32::new(0),
+            launches: AtomicU32::new(0),
+            turn_base: AtomicU64::new(0),
+            interrupted: AtomicBool::new(false),
+            kill_after: Mutex::new(IMPROVE_INTERRUPT_KILL),
+        });
+        map.insert(key.clone(), c.clone());
+        c
+    }
+
+    /// Conversation du cycle `key`, si elle existe.
+    pub fn improve_get(&self, key: &SessionKey) -> Option<Arc<ImproveConversation>> {
+        self.improve.lock().unwrap().get(key).cloned()
+    }
+
+    /// Vrai si `key` désigne une session d'amélioration (conversation d'un
+    /// cycle, ou session de rôle `Improve` dans la table) : `send_message`,
+    /// `interrupt`, `answer_question`… la refusent (jalon J16).
+    pub fn is_improve(&self, key: &SessionKey) -> bool {
+        self.improve.lock().unwrap().contains_key(key)
+            || self
+                .sessions
+                .lock()
+                .unwrap()
+                .get(key)
+                .is_some_and(|s| s.role == SessionRole::Improve)
+    }
+
+    /// Refus des commandes de session ordinaires sur une session
+    /// d'amélioration.
+    fn refuse_improve(&self, key: &SessionKey, what: &str) -> Result<(), CoreError> {
+        if self.is_improve(key) {
+            return Err(CoreError::InvalidArgument(format!(
+                "session d'amélioration : {what} passe par l'onglet d'amélioration \
+                 (improve_send, improve_interrupt)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `notice` dans la conversation du cycle `key` ; faux si elle n'existe
+    /// pas.
+    pub fn improve_note(
+        &self,
+        key: &SessionKey,
+        level: NoticeLevel,
+        code: &str,
+        msg: &str,
+    ) -> bool {
+        match self.improve_get(key) {
+            Some(c) => {
+                c.notice(level, code, msg);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Jalon J16 : un tour de la session dédiée du cycle `key`, dans la
+    /// conversation du cycle. Lance un processus (`resume` faux :
+    /// `--session-id <key>` ; vrai : `--resume <key>`, mêmes options
+    /// `opts` par ailleurs), lui envoie `message`, attend la fin du tour,
+    /// émet `improve.turn_end`, puis **arrête** le processus (stdin fermé,
+    /// Job terminé) et attend son arrêt effectif avant de rendre la main.
+    /// Le processus est protégé de la fermeture différée pendant le tour.
+    /// Futur abandonné (annulation) : arrêt dans une tâche, attendu par
+    /// [`AppState::stop_improve_turn`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_improve_turn(
+        &self,
+        key: &SessionKey,
+        exe: &Path,
+        cwd: &Path,
+        message: &str,
+        resume: bool,
+        mut opts: LaunchOptions,
+        config: SessionConfig,
+        timeout: Duration,
+    ) -> Result<TurnEnd, CoreError> {
+        let conv = self.improve_conversation(key, cwd);
+        if conv.current().is_some() {
+            return Err(CoreError::InvalidArgument(
+                "un tour de la session d'amélioration est déjà en cours".into(),
+            ));
+        }
+        if resume {
+            opts.resume = Some(key.0.clone());
+        } else {
+            opts.extra_args.push("--session-id".into());
+            opts.extra_args.push(key.0.clone());
+        }
+        self.forget_dead();
+        conv.interrupted.store(false, Ordering::SeqCst);
+        let before = conv.outlet.turns();
+        conv.turn_base.store(before, Ordering::SeqCst);
+        *conv.kill_after.lock().unwrap() = config.interrupt_result_timeout * 2;
+        let s = Session::start_on(
+            conv.outlet.clone(),
+            exe,
+            cwd,
+            opts,
+            SessionRole::Improve,
+            config,
+        )
+        .await?;
+        conv.launches.fetch_add(1, Ordering::SeqCst);
+        conv.last_pid.store(s.pid, Ordering::SeqCst);
+        *conv.current.lock().unwrap() = Some(s.clone());
+        let _protect = self.protect(key);
+        self.sessions.lock().unwrap().insert(key.clone(), s.clone());
+        let mut guard = TurnGuard {
+            conv: conv.clone(),
+            session: s.clone(),
+            sessions: self.sessions.clone(),
+            last: self.last.clone(),
+            armed: true,
+        };
+        let res = match s.send_message(message) {
+            Err(e) => Err(e),
+            Ok(()) => match s.wait_turn_end(before, timeout).await {
+                TurnWait::Done(_) if conv.interrupted.load(Ordering::SeqCst) => {
+                    Ok(TurnEnd::Interrupted)
+                }
+                TurnWait::Done(_) => Ok(TurnEnd::Done),
+                TurnWait::Exited if conv.interrupted.load(Ordering::SeqCst) => {
+                    Ok(TurnEnd::Interrupted)
+                }
+                TurnWait::Exited => Err(CoreError::Io(format!(
+                    "la session dédiée s'est arrêtée avant la fin de son tour (code {:?})",
+                    s.exit_code().flatten()
+                ))),
+                TurnWait::Timeout => Err(CoreError::Timeout(format!(
+                    "session dédiée ({} min)",
+                    timeout.as_secs() / 60
+                ))),
+            },
+        };
+        guard.armed = false;
+        if s.is_running() {
+            let end = match &res {
+                Ok(TurnEnd::Done) => "done",
+                Ok(TurnEnd::Interrupted) => "interrupted",
+                Err(CoreError::Timeout(_)) => "timeout",
+                Err(_) => "stopped",
+            };
+            conv.turn_end_notice(&s, end);
+        }
+        stop_turn_process(&conv, &s, &self.sessions, &self.last).await;
+        res
+    }
+
+    /// Jalon J16 : interrompt le tour en cours du cycle `key` (Échap) ; le
+    /// tour finit par [`TurnEnd::Interrupted`]. Sans fin de tour
+    /// [`IMPROVE_INTERRUPT_KILL`] après l'acceptation, `improve.turn_end`
+    /// (`end` : `interrupted`) puis le processus est tué (même issue).
+    /// `NotRunning` s'il n'y a pas de tour en cours.
+    pub async fn interrupt_improve_turn(&self, key: &SessionKey) -> Result<(), CoreError> {
+        let conv = self.improve_get(key).ok_or(CoreError::NotRunning)?;
+        let s = conv.current().ok_or(CoreError::NotRunning)?;
+        conv.interrupted.store(true, Ordering::SeqCst);
+        if let Err(e) = s.interrupt(false).await {
+            if s.is_running() {
+                conv.interrupted.store(false, Ordering::SeqCst);
+            }
+            return Err(e);
+        }
+        let base = conv.turn_base.load(Ordering::SeqCst);
+        let wait = *conv.kill_after.lock().unwrap();
+        tokio::spawn(async move {
+            if s.wait_turn_end(base, wait).await == TurnWait::Timeout && s.is_running() {
+                tracing::warn!(
+                    session = %s.key.0,
+                    "interruption sans fin de tour après {wait:?} : processus du tour tué"
+                );
+                // L'`exited` qui suit est attendu.
+                conv.turn_end_notice(&s, "interrupted");
+                s.kill();
+            }
+        });
+        Ok(())
+    }
+
+    /// Attend l'arrêt effectif du processus du tour en cours du cycle `key`
+    /// (après l'abandon de `run_improve_turn`), en l'arrêtant au besoin.
+    pub async fn stop_improve_turn(&self, key: &SessionKey) {
+        let Some(conv) = self.improve_get(key) else {
+            return;
+        };
+        let cur = conv.current.lock().unwrap().clone();
+        if let Some(s) = cur {
+            stop_turn_process(&conv, &s, &self.sessions, &self.last).await;
+        }
+    }
+
+    /// Jalon J16 : libère la conversation du cycle `key` (onglet fermé) :
+    /// processus de tour éventuel arrêté, journal retiré. Faux si elle
+    /// n'existait pas.
+    pub async fn dismiss_improve(&self, key: &SessionKey) -> bool {
+        let Some(conv) = self.improve.lock().unwrap().remove(key) else {
+            return false;
+        };
+        let cur = conv.current.lock().unwrap().clone();
+        if let Some(s) = cur {
+            stop_turn_process(&conv, &s, &self.sessions, &self.last).await;
+        }
+        true
     }
 
     /// Lance une session et l'inscrit dans la table. `own` : destination
@@ -583,7 +1038,7 @@ pub fn send_message(
     session: SessionKey,
     text: String,
 ) -> Result<(), CoreError> {
-    state.get(&session)?.send_message(&text)
+    state.send_message(&session, &text)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -592,8 +1047,28 @@ pub async fn interrupt(
     session: SessionKey,
     cancel_queued: bool,
 ) -> Result<InterruptAck, CoreError> {
-    let s = state.get(&session)?;
-    s.interrupt(cancel_queued).await
+    state.interrupt(&session, cancel_queued).await
+}
+
+impl AppState {
+    /// Corps de la commande `send_message` : refusée pour une session
+    /// d'amélioration (jalon J16 : `improve_send`).
+    pub fn send_message(&self, session: &SessionKey, text: &str) -> Result<(), CoreError> {
+        self.refuse_improve(session, "l'envoi d'un message")?;
+        self.get(session)?.send_message(text)
+    }
+
+    /// Corps de la commande `interrupt` : refusée pour une session
+    /// d'amélioration (jalon J16 : `improve_interrupt`).
+    pub async fn interrupt(
+        &self,
+        session: &SessionKey,
+        cancel_queued: bool,
+    ) -> Result<InterruptAck, CoreError> {
+        self.refuse_improve(session, "l'interruption")?;
+        let s = self.get(session)?;
+        s.interrupt(cancel_queued).await
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -603,6 +1078,7 @@ pub async fn set_model(
     model: String,
 ) -> Result<String, CoreError> {
     validate_model(&model)?;
+    state.refuse_improve(&session, "le changement de modèle")?;
     let s = state.get(&session)?;
     s.set_model(&model).await
 }
@@ -627,6 +1103,7 @@ pub fn answer_question(
     answers: Answers,
     response: Option<String>,
 ) -> Result<(), CoreError> {
+    state.refuse_improve(&session, "la réponse à une question")?;
     state
         .get(&session)?
         .answer_question(&request_id, &answers, response.as_deref())
@@ -639,6 +1116,7 @@ pub fn skip_question(
     request_id: String,
     reason: SkipReason,
 ) -> Result<(), CoreError> {
+    state.refuse_improve(&session, "la réponse à une question")?;
     state.get(&session)?.skip_question(&request_id, reason)
 }
 
