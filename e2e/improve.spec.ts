@@ -313,6 +313,46 @@ test("fermeture pendant le cycle : confirmation dans la page, « Continuer » pu
   await expect(page.locator(TAB)).toHaveCount(1);
 });
 
+test("Échap pendant la confirmation de fermeture : « Continuer », jamais une interruption", async ({ page }) => {
+  const dialogs = await open(page, "", 1500);
+  await improve(page, "Echap confirmation");
+  await expect(page.locator(ITAB)).toHaveAttribute("data-step", "working", { timeout: 5_000 });
+  await page.locator(`${ITAB} [data-testid="tab-close"]`).click();
+  await expect(page.getByTestId("improve-close-confirm")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("improve-close-confirm")).toHaveCount(0);
+  await expect(page.locator(PROMPT)).toBeFocused();
+  const cmds = await suCalls(page);
+  expect(cmds).not.toContain("improve_interrupt");
+  expect(cmds).not.toContain("improve_cancel");
+  await expect(page.locator(ITAB)).toHaveCount(1);
+  expect(await status(page)).toMatchObject({ step: "working" });
+  expect(dialogs).toEqual([]);
+});
+
+test("/ameliorer après « Abandonner », avant l'état final : onglet non rouvert, « en cours d'annulation »", async ({
+  page,
+}) => {
+  // `cancel=3000` : l'état `cancelled` arrive 3 s après la réponse de `improve_cancel`.
+  await open(page, "&cancel=3000", 1500);
+  await improve(page, "Abandon lent");
+  await expect(page.locator(ITAB)).toHaveAttribute("data-step", "working", { timeout: 5_000 });
+  await page.locator(`${ITAB} [data-testid="tab-close"]`).click();
+  await page.getByTestId("improve-abandon").click();
+  await expect(page.locator(ITAB)).toHaveCount(0);
+  expect(await status(page)).toMatchObject({ step: "working" });
+  await page.locator(PROMPT).focus();
+  await page.keyboard.type("/ameliorer Encore");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("prompt-hint")).toContainText("Amélioration en cours d'annulation");
+  await expect(page.locator(ITAB)).toHaveCount(0);
+  expect((await suCalls(page)).filter((c) => c === "improve_start")).toHaveLength(1);
+  // État final : la conversation abandonnée est libérée.
+  await expect.poll(() => status(page).then((s) => s?.step), { timeout: 6_000 }).toBe("cancelled");
+  await expect.poll(() => suCalls(page)).toContain("improve_dismiss");
+  await expect(page.locator(ITAB)).toHaveCount(0);
+});
+
 test("fermeture refusée pendant la bascule", async ({ page }) => {
   const dialogs = await open(page, "", 1500);
   await improve(page, "Bascule");
@@ -345,6 +385,24 @@ test("rechargement en attente : même onglet, actif, même nombre de lignes", as
   expect(await improveRows(page)).toEqual(before);
   await expect(page.getByTestId("improve-validate")).toBeEnabled();
   await expect(page.locator(BANNER)).toHaveCount(0);
+});
+
+test("rechargement avec l'onglet d'amélioration actif : brouillon de la conversation principale conservé", async ({
+  page,
+}) => {
+  await open(page, "&improve=nocommit");
+  await improve(page, "Garder le brouillon");
+  await expect(page.locator(ITAB)).toHaveAttribute("data-step", "awaiting_user", { timeout: 10_000 });
+  const main = page.locator(`${TAB}:not([data-kind="improve"]) [role="tab"]`);
+  await main.click();
+  await page.locator(PROMPT).fill("brouillon principal");
+  await page.locator(`${ITAB} [role="tab"]`).click();
+  await expect(page.locator(`${ITAB} [role="tab"]`)).toHaveAttribute("aria-selected", "true");
+  await page.reload();
+  await page.waitForFunction(() => (window as unknown as { __orch?: Orch }).__orch?.store.status === "Idle");
+  await expect(page.locator(`${ITAB} [role="tab"]`)).toHaveAttribute("aria-selected", "true");
+  await page.locator(`${TAB}:not([data-kind="improve"]) [role="tab"]`).click();
+  await expect(page.locator(PROMPT)).toHaveValue("brouillon principal");
 });
 
 test("rechargement par la bascule : l'onglet d'amélioration reste actif et montre « fusionné »", async ({ page }) => {

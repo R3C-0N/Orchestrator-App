@@ -653,6 +653,8 @@ export type MockSelfUpdateOptions = {
   live?: SessionResync[];
   /** Nombre d'appels à `attachSessions` rejetés d'abord (`attachFail=<n>`). */
   attachFail?: number;
+  /** Délai (ms) entre `improve_cancel` et l'état `cancelled` (`cancel=<ms>`) ; 0 par défaut : immédiat. */
+  cancelDelayMs?: number;
 };
 
 /** Détail d'un échec définitif simulé (issue `failed`, après les tests ; rien n'est renvoyé à la session). */
@@ -787,7 +789,8 @@ export function mockLiveSessions(rows: number, historyRows = 0, seed = 15): Sess
  * cycle, voir `MockImproveOutcome`), `push=pushed|failed` (envoi de la branche
  * après la fusion, propriétaire), `repo=disabled|cloning`, `attach=<lignes>`
  * (sessions vivantes au montage), `attachFail=<n>` (les n premiers
- * rattachements échouent), `step=<ms>` (durée d'une étape et d'un tour).
+ * rattachements échouent), `step=<ms>` (durée d'une étape et d'un tour),
+ * `cancel=<ms>` (délai entre `improve_cancel` et l'état `cancelled`).
  */
 export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & { stepMs?: number } {
   const p = new URLSearchParams(search);
@@ -809,6 +812,8 @@ export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & {
   if (attach !== null) out.live = mockLiveSessions(Number(attach) || 40);
   const attachFail = Number(p.get("attachFail"));
   if (Number.isInteger(attachFail) && attachFail > 0) out.attachFail = attachFail;
+  const cancel = Number(p.get("cancel"));
+  if (Number.isFinite(cancel) && cancel > 0) out.cancelDelayMs = cancel;
   const step = p.get("step");
   if (step !== null && step !== "" && Number.isFinite(Number(step))) out.stepMs = Number(step);
   return out;
@@ -853,6 +858,8 @@ export type MockCycle = {
   end: "merged" | "restart_required" | "failed";
   /** Onglet fermé après un état final (`improve_dismiss`) : plus rendu par `attachSessions`. */
   dismissed: boolean;
+  /** Annulation demandée, état `cancelled` pas encore publié (`cancelDelayMs`). */
+  cancelling?: boolean;
 };
 
 /** Clé du `sessionStorage` où le cœur simulé garde son état à travers un rechargement. */
@@ -915,6 +922,7 @@ export class MockSelfUpdate {
   pushOutcome: MockPushOutcome | null;
   live: SessionResync[];
   attachFail: number;
+  cancelDelayMs: number;
   #timers: ReturnType<typeof setTimeout>[] = [];
   #n = 0;
   #cycle: MockCycle | null = null;
@@ -932,6 +940,7 @@ export class MockSelfUpdate {
     if (this.pushOutcome) this.info.push = { state: "enabled", url: "git@example.invalid:mock.git" };
     this.live = opts.live ?? [];
     this.attachFail = opts.attachFail ?? 0;
+    this.cancelDelayMs = opts.cancelDelayMs ?? 0;
     if (opts.repo) this.info.repo = opts.repo;
     this.#storage = mockStorage();
     this.#restore();
@@ -1042,6 +1051,7 @@ export class MockSelfUpdate {
     this.calls.push({ cmd: "improve_send", args: { id, text } });
     const c = this.#cycle;
     if (!c || c.id !== id) return Promise.reject({ kind: "invalid_argument", message: id });
+    if (c.cancelling) return Promise.reject({ kind: "rejected", message: "amélioration en cours d'annulation" });
     const msg = text.trim();
     if (!msg) return Promise.reject({ kind: "invalid_argument", message: "message vide" });
     switch (c.step) {
@@ -1069,6 +1079,7 @@ export class MockSelfUpdate {
     this.calls.push({ cmd: "improve_validate", args: { id } });
     const c = this.#cycle;
     if (!c || c.id !== id) return Promise.reject({ kind: "invalid_argument", message: id });
+    if (c.cancelling) return Promise.reject({ kind: "rejected", message: "amélioration en cours d'annulation" });
     if (c.step !== "awaiting_user")
       return Promise.reject({ kind: "rejected", message: `rien à valider à l'étape ${c.step}` });
     this.#checks();
@@ -1080,6 +1091,7 @@ export class MockSelfUpdate {
     this.calls.push({ cmd: "improve_interrupt", args: { id } });
     const c = this.#cycle;
     if (!c || c.id !== id) return Promise.reject({ kind: "invalid_argument", message: id });
+    if (c.cancelling) return Promise.reject({ kind: "rejected", message: "amélioration en cours d'annulation" });
     if (!c.inTurn) return Promise.reject({ kind: "rejected", message: "aucun tour en cours" });
     this.#clearTimers();
     this.#endTurn(true);
@@ -1113,9 +1125,22 @@ export class MockSelfUpdate {
         { kind: "exited", code: 1, during_turn: true, stderr_tail: [] },
       ]);
     }
+    const done = () => this.#cancelled();
+    if (c.cancelling) return Promise.resolve();
+    if (this.cancelDelayMs > 0) {
+      // Comme le cœur : la commande répond, l'état final suit l'arrêt effectif de la session.
+      c.cancelling = true;
+      this.#after(this.cancelDelayMs, done);
+    } else done();
+    return Promise.resolve();
+  }
+
+  /** État final d'une annulation. */
+  #cancelled(): void {
+    const c = this.#cycle!;
+    c.cancelling = false;
     this.#note("Warn", "improve.cancelled", `✗ Amélioration annulée : branche ${c.branch} gardée non fusionnée`);
     this.#set({ step: "cancelled", waiting: null });
-    return Promise.resolve();
   }
 
   uiRollback(): Promise<UiInfo> {
@@ -1161,7 +1186,8 @@ export class MockSelfUpdate {
       branch: c.branch,
       request: c.request,
       step: c.step,
-      session: c.step === "preparing" ? null : c.session,
+      // La conversation du cycle existe dès `improve_start` (clé = `id`, comme le cœur).
+      session: c.session,
       commit: c.commit,
       detail: c.detail,
       push: c.push,
@@ -1468,6 +1494,10 @@ export class MockSelfUpdate {
     this.#cycle = c;
     this.info.improve = this.#status();
     const S = this.#stepMs;
+    if (c.cancelling) {
+      this.#after(Math.max(this.cancelDelayMs, S), () => this.#cancelled());
+      return;
+    }
     switch (c.step) {
       case "preparing":
         this.#after(S, () => this.#startTurn("working", c.request));
