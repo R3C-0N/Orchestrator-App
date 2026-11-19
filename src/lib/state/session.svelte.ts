@@ -25,7 +25,7 @@ import type { QuestionItem } from "../core/bindings/QuestionItem";
 import type { ResultPart } from "../core/bindings/ResultPart";
 import type { SessionState } from "../core/bindings/SessionState";
 import type { UserOrigin } from "../core/bindings/UserOrigin";
-import { isImproveNotice } from "./improve";
+import { IMPROVE_TURN_END, IMPROVE_UNMERGED, improvePromptLine, isImproveNotice } from "./improve";
 
 /** `at` : horodatage `t` de l'événement source (ms epoch), pour le rendu (heure, durée). */
 export type UserRow = { kind: "user"; id: string; text: string; origin: UserOrigin; at: number };
@@ -220,6 +220,12 @@ export class SessionStore {
   #idn = 0;
   #thinkStart: number | null = null;
   #noticeId = 0;
+  /** Conversation d'amélioration : `improve.turn_end` reçu depuis le dernier `starting` (arrêt voulu). */
+  #turnEnded = false;
+  /** Conversation d'amélioration : premier message (prompt du pipeline) déjà replié. */
+  #promptSeen = false;
+  /** Prompt complet du premier tour d'une amélioration (le fil n'en montre qu'une ligne). */
+  improvePrompt: string | null = null;
 
   /** `improve` : conversation d'une amélioration (voir `StoreRole`). */
   readonly role: StoreRole;
@@ -332,6 +338,8 @@ export class SessionStore {
   #reduce(ev: CoreEvent): void {
     switch (ev.kind) {
       case "starting":
+        // Conversation d'amélioration : un processus par tour, dans le même fil.
+        this.#turnEnded = false;
         this.status = "Starting";
         this.meta.cwd = ev.cwd;
         break;
@@ -361,6 +369,14 @@ export class SessionStore {
         if (ev.origin === "Replay" && ev.thread === "main") break;
         // Nouveau tour : la durée de réflexion repart de zéro.
         if (ev.origin === "Typed" && ev.thread === "main") this.thinkingMs = 0;
+        // Premier message d'une amélioration : le prompt complet du pipeline,
+        // replié en une ligne (« Consigne d'amélioration · <demande> »).
+        if (this.role === "improve" && ev.thread === "main" && !this.#promptSeen && ev.origin !== "Interrupted") {
+          this.#promptSeen = true;
+          this.improvePrompt = ev.text;
+          this.#append({ kind: "user", id: this.#id("u", ev.seq), text: improvePromptLine(ev.text), origin: ev.origin, at: ev.t });
+          break;
+        }
         const row: Row =
           ev.origin === "Interrupted"
             ? { kind: "interrupted", id: this.#id("i", ev.seq), text: INTERRUPTED_TEXT }
@@ -549,8 +565,19 @@ export class SessionStore {
       case "notice": {
         // J16 : étapes du pipeline, lignes d'état grises dans l'ordre du fil
         // (conservées au rechargement) ; le message porte son glyphe (✻, ✗).
+        // Avertissements (worktrees non fusionnés, tour trop long…) : ligne
+        // colorée « ! <libellé> : <message> ».
         if (this.role === "improve" && isImproveNotice(ev.code)) {
-          this.#append({ kind: "plain", id: this.#id("p", ev.seq), text: ev.message });
+          if (ev.code === IMPROVE_TURN_END) this.#turnEnded = true;
+          if (ev.level === "Info") this.#append({ kind: "plain", id: this.#id("p", ev.seq), text: ev.message });
+          else
+            this.#append({
+              kind: "notice",
+              id: this.#id("n", ev.seq),
+              level: ev.level,
+              code: ev.code === IMPROVE_UNMERGED ? "branches non fusionnées" : "amélioration",
+              message: ev.message,
+            });
           break;
         }
         if (ev.level === "Info") {
@@ -564,18 +591,10 @@ export class SessionStore {
       case "exited":
         this.#closeLive();
         this.status = "Exited";
-        if (this.role === "improve") {
-          // Un processus par tour : sa sortie entre deux tours est attendue.
-          // Arrêt en plein tour : une ligne du fil, pas de bandeau (le cycle
-          // passe en attente de l'utilisateur, `session_stopped`).
-          if (ev.during_turn)
-            this.#append({
-              kind: "plain",
-              id: this.#id("p", ev.seq),
-              text: `session arrêtée pendant le tour (code ${ev.code ?? "?"})`,
-            });
-          break;
-        }
+        // Conversation d'amélioration : un processus par tour, arrêté exprès
+        // après `improve.turn_end` : sortie attendue, ni bandeau ni ligne.
+        // Sans `improve.turn_end` avant : vraie erreur (bandeau).
+        if (this.role === "improve" && this.#turnEnded) break;
         this.addBanner("Error", "exited", `claude.exe s'est arrêté (code ${ev.code ?? "?"})`, ev.seq);
         break;
     }

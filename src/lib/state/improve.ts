@@ -269,3 +269,19 @@ export function improveToReopen(
   const r = live.find((x) => x.role === "improve" && x.session === status.session);
   return r ? { session: r.session, status } : null;
 }
+
+/** `notice` émise juste avant l'arrêt voulu du processus d'un tour (`detail` : `{turn, end, pid}`). */
+export const IMPROVE_TURN_END = "improve.turn_end";
+/** `notice` `warn` en tête du premier cycle : worktrees `auto/…` non fusionnés (`detail` : `{branches}`). */
+export const IMPROVE_UNMERGED = "improve.unmerged_worktrees";
+
+/**
+ * Premier message du fil d'une amélioration : le prompt complet du pipeline
+ * (`tools/self-improve/prompt.md`), replié en une ligne
+ * « Consigne d'amélioration · <demande> ». La demande est la section
+ * « ## Demande de l'utilisateur » ; sans elle, tout le texte sur une ligne.
+ */
+export function improvePromptLine(prompt: string, max = 160): string {
+  const m = /##\s*Demande de l'utilisateur\s*\n([\s\S]*?)(?:\n##\s|$)/.exec(prompt);
+  return `Consigne d'amélioration · ${oneLine(m ? m[1] : prompt, max)}`;
+}

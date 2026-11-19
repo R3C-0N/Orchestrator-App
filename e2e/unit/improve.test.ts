@@ -24,6 +24,7 @@ import {
   improveBadge,
   improveTabLabel,
   improveTabTitle,
+  improvePromptLine,
   improveToReopen,
   isFinal,
   isImproveNotice,
@@ -214,39 +215,66 @@ describe("rechargement : réouverture de l'onglet", () => {
 });
 
 describe("magasin de la conversation d'amélioration", () => {
-  it("les notices improve.* sont des lignes du fil, dans l'ordre", () => {
+  it("les notices improve.* sont des lignes du fil, dans l'ordre ; warn en ligne colorée", () => {
     const s = improveStore();
     s.apply(
       events("improve-1", [
+        {
+          kind: "notice",
+          level: "Warn",
+          code: "improve.unmerged_worktrees",
+          message: "amélioration(s) précédente(s) non fusionnée(s) : auto/a, auto/b",
+          detail: { branches: ["auto/a", "auto/b"] },
+        },
         { kind: "notice", level: "Info", code: "improve.preparing", message: "✻ Préparation", detail: null },
-        { kind: "user_message", thread: "main", uuid: null, text: "demande", origin: "Typed" },
-        { kind: "notice", level: "Warn", code: "improve.check_failed", message: "✗ Contrôle en échec", detail: null },
+        { kind: "notice", level: "Info", code: "improve.check_failed", message: "✗ Contrôle en échec", detail: null },
       ]),
     );
     expect(isImproveNotice("improve.x")).toBe(true);
-    expect(s.rows.map((r) => r.kind)).toEqual(["plain", "user", "plain"]);
+    expect(s.rows.map((r) => r.kind)).toEqual(["notice", "plain", "plain"]);
+    expect(s.rows[0]).toMatchObject({ kind: "notice", level: "Warn", code: "branches non fusionnées" });
     expect(s.rows[2]).toMatchObject({ kind: "plain", text: "✗ Contrôle en échec" });
     expect(s.banners).toEqual([]);
   });
 
-  it("sortie attendue entre deux tours : ni bandeau ni ligne ; arrêt en plein tour : une ligne, pas de bandeau", () => {
+  it("premier message : le prompt du pipeline replié en une ligne ; les suivants tels quels", () => {
+    const prompt = ["# Amélioration", "", "## Demande de l'utilisateur", "", "Bouton", "plus discret", "", "## Ce que tu dois faire", "", "1. …"].join("\n");
+    expect(improvePromptLine(prompt)).toBe("Consigne d'amélioration · Bouton plus discret");
+    expect(improvePromptLine("demande simple")).toBe("Consigne d'amélioration · demande simple");
+    const s = improveStore();
+    s.apply(
+      events("improve-1", [
+        { kind: "user_message", thread: "main", uuid: null, text: prompt, origin: "Typed" },
+        { kind: "user_message", thread: "main", uuid: null, text: "précise", origin: "Typed" },
+      ]),
+    );
+    expect(s.rows.map((r) => (r.kind === "user" ? r.text : r.kind))).toEqual([
+      "Consigne d'amélioration · Bouton plus discret",
+      "précise",
+    ]);
+    expect(s.improvePrompt).toBe(prompt);
+  });
+
+  it("arrêt voulu (après improve.turn_end) : silencieux, le tour suivant repart ; sans turn_end : vraie erreur", () => {
     const s = improveStore();
     s.apply(
       events("improve-1", [
         { kind: "starting", pid: 1, cwd: "C:\\wt", args: [] },
         { kind: "status", state: "Idle" },
+        { kind: "notice", level: "Info", code: "improve.turn_end", message: "tour terminé : session en pause", detail: { turn: 1, end: "done", pid: 1 } },
+        { kind: "status", state: "Exited" },
         { kind: "exited", code: 0, during_turn: false, stderr_tail: [] },
         { kind: "starting", pid: 2, cwd: "C:\\wt", args: ["--resume", "improve-1"] },
         { kind: "status", state: "Streaming" },
       ]),
     );
     expect(s.banners).toEqual([]);
-    expect(s.rows).toEqual([]);
+    expect(s.rows.map((r) => r.kind)).toEqual(["plain"]);
     expect(s.status).toBe("Streaming");
     expect(s.gaps).toBe(0);
-    s.apply(events("improve-1", [{ kind: "exited", code: 1, during_turn: true, stderr_tail: [] }], 5));
-    expect(s.banners).toEqual([]);
-    expect(s.rows.at(-1)).toMatchObject({ kind: "plain", text: "session arrêtée pendant le tour (code 1)" });
+    // Le processus du tour 2 meurt sans `improve.turn_end` : bandeau d'erreur.
+    s.apply(events("improve-1", [{ kind: "exited", code: 1, during_turn: true, stderr_tail: [] }], 7));
+    expect(s.banners.map((b) => b.code)).toEqual(["exited"]);
   });
 
   it("magasin principal inchangé : bandeau exited, notice improve.* hors du fil", () => {
