@@ -18,7 +18,7 @@ const ITAB = '[data-testid="tab"][data-kind="improve"]';
 const STEPS = ["preparing", "working", "checking", "testing", "building", "waiting_idle", "switching", "merged"];
 
 type Call = { cmd: string; args: Record<string, unknown> };
-type Row = { kind: string; text?: string };
+type Row = { kind: string; text?: string; message?: string };
 type Store = { status: string; lastSeq: number; gaps: number; rows: Row[] };
 type Status = { id: string; step: string; attempt: number; turn: number; waiting: string | null; session: string | null };
 type Orch = {
@@ -94,12 +94,12 @@ const steps = (page: Page) => page.evaluate(() => (window as unknown as { __step
 const badges = (page: Page) => page.evaluate(() => (window as unknown as { __badges: string[] }).__badges);
 const status = (page: Page) =>
   page.evaluate(() => (window as unknown as { __orch: Orch }).__orch.selfUpdate()!.info.improve);
-/** Lignes du fil de l'onglet d'amélioration (magasin de la session du cycle). */
+/** Lignes du fil de l'onglet d'amélioration (texte, ou message d'une ligne d'avertissement `notice`). */
 const improveRows = (page: Page) =>
   page.evaluate(() => {
     const o = (window as unknown as { __orch: Orch }).__orch;
     const s = o.selfUpdate()!.info.improve?.session;
-    return s ? (o.router()!.get(s)?.rows ?? []).map((r) => ({ kind: r.kind, text: r.text ?? "" })) : [];
+    return s ? (o.router()!.get(s)?.rows ?? []).map((r) => ({ kind: r.kind, text: r.text ?? r.message ?? "" })) : [];
   });
 
 async function improve(page: Page, request: string) {
@@ -156,11 +156,14 @@ test("/ameliorer : un seul onglet, actif en moins de 300 ms, sans bandeau ; éta
   await expect(page.locator(TAB)).toHaveCount(2);
   // Le fil de l'onglet : la demande, le travail de la session, les lignes d'état.
   const rows = await improveRows(page);
-  expect(rows.find((r) => r.kind === "user")?.text).toBe("Bandeau plus discret");
+  // Premier message : le prompt complet du pipeline, replié en une ligne.
+  expect(rows.find((r) => r.kind === "user")?.text).toBe("Consigne d'amélioration · Bandeau plus discret");
   const texts = rows.map((r) => r.text).join("\n");
   for (const t of ["✻ Préparation de la branche auto/", "✓ Garde de sécurité (tour 1)", "✻ Contrôles…", "✻ Tests…", "✓ Fusionné mock100"])
     expect(texts).toContain(t);
   await expect(page.locator('[data-row-kind="plain"]').filter({ hasText: "✓ Fusionné mock100" })).toBeVisible();
+  // Arrêts voulus entre les tours (`improve.turn_end` avant `exited`) : aucun bandeau d'erreur.
+  await expect(page.locator(".banner.error")).toHaveCount(0);
   // Rien n'est parti vers claude.exe ; la conversation principale est intacte.
   const calls = await page.evaluate(() => (window as unknown as { __orch: Orch }).__orch.calls.map((c) => c.cmd));
   expect(calls).not.toContain("send_message");
@@ -256,13 +259,13 @@ test("message pendant un tour : livré au tour suivant, sans tests entre les deu
   expect(await steps(page)).toEqual(["preparing", "working", "checking"]);
   expect(await status(page)).toMatchObject({ turn: 2, attempt: 0 });
   const users = (await improveRows(page)).filter((r) => r.kind === "user").map((r) => r.text);
-  expect(users).toEqual(["Long tour", "Et garde le thème clair"]);
+  expect(users).toEqual(["Consigne d'amélioration · Long tour", "Et garde le thème clair"]);
 });
 
 test("message pendant les tests : tests abandonnés en moins de 1 s, nouveau tour", async ({ page }) => {
-  await open(page, "", 1500);
+  await open(page, "", 3000);
   await improve(page, "Tests longs");
-  await expect(page.locator(ITAB)).toHaveAttribute("data-step", "testing", { timeout: 10_000 });
+  await expect(page.locator(ITAB)).toHaveAttribute("data-step", "testing", { timeout: 15_000 });
   const t0 = Date.now();
   await say(page, "Change plutôt la couleur");
   await expect(page.locator(ITAB)).toHaveAttribute("data-step", "working", { timeout: 1_000 });
@@ -444,6 +447,27 @@ test("violation de la garde : échec, rien n'est renvoyé à la session", async 
   expect(rows.some((r) => r.text.includes("[Contrôle automatique"))).toBe(false);
   expect(rows.map((r) => r.text).join("\n")).toContain("✗ Échec");
   expect(await status(page)).toMatchObject({ step: "failed", turn: 1, waiting: null });
+});
+
+test("arrêt du processus sans improve.turn_end : bandeau d'erreur, cycle en attente", async ({ page }) => {
+  await open(page, "&improve=crash");
+  await improve(page, "Planter");
+  await expect(page.locator(ITAB)).toHaveAttribute("data-step", "awaiting_user", { timeout: 10_000 });
+  expect(await status(page)).toMatchObject({ waiting: "session_stopped", turn: 1 });
+  await expect(page.locator(".banner.error")).toContainText("claude.exe s'est arrêté");
+  expect((await improveRows(page)).map((r) => r.text).join("\n")).toContain("⏸ La session s'est arrêtée avant la fin de son tour");
+  // Un message relance un tour ; celui-ci finit normalement, sans nouveau bandeau.
+  await say(page, "Reprends");
+  await expect(page.locator(ITAB)).toHaveAttribute("data-step", "merged", { timeout: 10_000 });
+  await expect(page.locator(".banner.error")).toHaveCount(1);
+});
+
+test("worktrees non fusionnés au démarrage : avis en tête du premier cycle", async ({ page }) => {
+  await open(page, "&unmerged=2");
+  await improve(page, "Avec avis");
+  await expect(page.locator(ITAB)).toHaveAttribute("data-step", "merged", { timeout: 10_000 });
+  const texts = (await improveRows(page)).map((r) => r.text).join("\n");
+  expect(texts).toContain("auto/20261116-0900-essai-1, auto/20261116-0900-essai-2");
 });
 
 test("retour arrière par la palette (/revenir-version)", async ({ page }) => {

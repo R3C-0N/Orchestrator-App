@@ -602,7 +602,10 @@ export const MOCK_IMPROVE_STEPS: ImproveStep[] = [
  * - `no_commit` : le premier tour pose une question sans commiter, puis
  *   `awaiting_user` (`no_new_commit`) ;
  * - `violation` : la garde échoue après le premier tour, `failed` sans
- *   retour à la session.
+ *   retour à la session ;
+ * - `session_stopped` : le processus du premier tour s'arrête seul, sans
+ *   `improve.turn_end` avant `exited` (vraie erreur : bandeau), puis
+ *   `awaiting_user` (`session_stopped`).
  */
 export type MockImproveOutcome =
   | "merged"
@@ -611,7 +614,8 @@ export type MockImproveOutcome =
   | "fix"
   | "exhausted"
   | "no_commit"
-  | "violation";
+  | "violation"
+  | "session_stopped";
 
 /**
  * Étapes simulées pour chaque issue, sans intervention de l'utilisateur
@@ -634,6 +638,8 @@ export function mockImproveSteps(outcome: MockImproveOutcome): ImproveStep[] {
       return ["preparing", "working", "awaiting_user"];
     case "violation":
       return ["preparing", "working", "failed"];
+    case "session_stopped":
+      return ["preparing", "working", "awaiting_user"];
   }
 }
 
@@ -655,6 +661,8 @@ export type MockSelfUpdateOptions = {
   attachFail?: number;
   /** Délai (ms) entre `improve_cancel` et l'état `cancelled` (`cancel=<ms>`) ; 0 par défaut : immédiat. */
   cancelDelayMs?: number;
+  /** Worktrees `auto/…` non fusionnés trouvés au démarrage (`unmerged=<n>`) : notice en tête du premier cycle. */
+  unmerged?: string[];
 };
 
 /** Détail d'un échec définitif simulé (issue `failed`, après les tests ; rien n'est renvoyé à la session). */
@@ -668,6 +676,25 @@ export const MOCK_NO_COMMIT_FAIL = "aucun commit sur la branche";
 
 /** Violation de la garde simulée (issue `violation`) : visible par l'utilisateur, jamais renvoyée à la session. */
 export const MOCK_VIOLATION = "garde : .git/config modifié pendant le tour";
+
+/**
+ * Premier message d'un cycle : le prompt complet du pipeline
+ * (`tools/self-improve/prompt.md`), avec la demande dans sa section
+ * « ## Demande de l'utilisateur » (l'onglet le replie en une ligne).
+ */
+export function mockImprovePrompt(request: string): string {
+  return [
+    "# Amélioration de l'app (prompt simulé)",
+    "",
+    "Tu travailles dans un worktree de l'app. Modifie, puis commite ; les contrôles et les tests sont faits par l'app.",
+    "",
+    "## Demande de l'utilisateur",
+    request,
+    "",
+    "## Règles",
+    "- Ne pousse jamais.",
+  ].join("\n");
+}
 
 /** Plafond des tours de correction automatique (`MAX_AUTO_ATTEMPTS` côté Rust, J16). */
 export const MOCK_MAX_ATTEMPTS = 3;
@@ -790,7 +817,8 @@ export function mockLiveSessions(rows: number, historyRows = 0, seed = 15): Sess
  * après la fusion, propriétaire), `repo=disabled|cloning`, `attach=<lignes>`
  * (sessions vivantes au montage), `attachFail=<n>` (les n premiers
  * rattachements échouent), `step=<ms>` (durée d'une étape et d'un tour),
- * `cancel=<ms>` (délai entre `improve_cancel` et l'état `cancelled`).
+ * `cancel=<ms>` (délai entre `improve_cancel` et l'état `cancelled`),
+ * `unmerged=<n>` (worktrees `auto/…` non fusionnés signalés au premier cycle).
  */
 export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & { stepMs?: number } {
   const p = new URLSearchParams(search);
@@ -802,6 +830,10 @@ export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & {
   else if (imp === "exhausted" || imp === "attempts_exhausted") out.outcome = "exhausted";
   else if (imp === "nocommit" || imp === "no_commit" || imp === "no_new_commit") out.outcome = "no_commit";
   else if (imp === "violation" || imp === "guard") out.outcome = "violation";
+  else if (imp === "crash" || imp === "session_stopped") out.outcome = "session_stopped";
+  const unmerged = Number(p.get("unmerged"));
+  if (Number.isInteger(unmerged) && unmerged > 0)
+    out.unmerged = Array.from({ length: unmerged }, (_, i) => `auto/20261116-0900-essai-${i + 1}`);
   const push = p.get("push");
   if (push === "pushed" || push === "ok") out.push = "pushed";
   else if (push === "failed" || push === "fail") out.push = "failed";
@@ -860,6 +892,8 @@ export type MockCycle = {
   dismissed: boolean;
   /** Annulation demandée, état `cancelled` pas encore publié (`cancelDelayMs`). */
   cancelling?: boolean;
+  /** Le processus du premier tour s'arrête seul (issue `session_stopped`). */
+  crash?: boolean;
 };
 
 /** Clé du `sessionStorage` où le cœur simulé garde son état à travers un rechargement. */
@@ -923,6 +957,7 @@ export class MockSelfUpdate {
   live: SessionResync[];
   attachFail: number;
   cancelDelayMs: number;
+  unmerged: string[] | null;
   #timers: ReturnType<typeof setTimeout>[] = [];
   #n = 0;
   #cycle: MockCycle | null = null;
@@ -941,6 +976,7 @@ export class MockSelfUpdate {
     this.live = opts.live ?? [];
     this.attachFail = opts.attachFail ?? 0;
     this.cancelDelayMs = opts.cancelDelayMs ?? 0;
+    this.unmerged = opts.unmerged ?? null;
     if (opts.repo) this.info.repo = opts.repo;
     this.#storage = mockStorage();
     this.#restore();
@@ -1030,13 +1066,27 @@ export class MockSelfUpdate {
       failsLeft: o === "fix" ? 1 : o === "exhausted" ? MOCK_MAX_ATTEMPTS + 1 : 0,
       noCommitLeft: o === "no_commit" ? 1 : 0,
       violation: o === "violation",
+      crash: o === "session_stopped",
       end: o === "restart_required" || o === "failed" ? o : "merged",
       dismissed: false,
     };
     const first = this.#status();
     this.info.improve = first;
+    if (this.unmerged) {
+      const branches = this.unmerged;
+      this.unmerged = null;
+      this.#events([
+        {
+          kind: "notice",
+          level: "Warn",
+          code: "improve.unmerged_worktrees",
+          message: `amélioration(s) précédente(s) non fusionnée(s), gardée(s) pour inspection (pas de reprise) : ${branches.join(", ")}`,
+          detail: { branches },
+        },
+      ]);
+    }
     this.#note("Info", "improve.preparing", `✻ Préparation de la branche ${this.#cycle.branch}`);
-    this.#after(this.#stepMs, () => this.#startTurn("working", request));
+    this.#after(this.#stepMs, () => this.#startTurn("working", mockImprovePrompt(request)));
     return Promise.resolve(first);
   }
 
@@ -1121,6 +1171,7 @@ export class MockSelfUpdate {
     if (c.inTurn) {
       c.inTurn = false;
       this.#events([
+        this.#turnEnd("cancelled"),
         { kind: "status", state: "Idle" },
         { kind: "exited", code: 1, during_turn: true, stderr_tail: [] },
       ]);
@@ -1224,6 +1275,36 @@ export class MockSelfUpdate {
     this.#events([{ kind: "notice", level, code, message, detail: null }]);
   }
 
+  /**
+   * `improve.turn_end` (format du superviseur) juste avant l'arrêt voulu du
+   * processus d'un tour : sans elle, `exited` est une vraie erreur.
+   */
+  #turnEnd(end: "done" | "interrupted" | "cancelled", turn = this.#cycle!.turn): EventBody {
+    const message =
+      end === "done"
+        ? "tour terminé : session en pause"
+        : end === "interrupted"
+          ? "tour interrompu : session en pause"
+          : "session arrêtée";
+    return { kind: "notice", level: "Info", code: "improve.turn_end", message, detail: { turn, end, pid: this.#pid() } };
+  }
+
+  /** Processus du tour arrêté seul (issue `session_stopped`) : `exited` sans `improve.turn_end`, puis attente. */
+  #crashTurn(): void {
+    const c = this.#cycle!;
+    c.crash = false;
+    c.inTurn = false;
+    this.#events([{ kind: "exited", code: 3221225477, during_turn: true, stderr_tail: ["panique simulée"] }]);
+    c.turn++;
+    this.#note("Info", "improve.guard", `✓ Garde de sécurité (tour ${c.turn})`);
+    this.#set({
+      step: "awaiting_user",
+      waiting: "session_stopped",
+      detail: "la session s'est arrêtée avant la fin de son tour",
+    });
+    this.#note("Info", "improve.awaiting", "⏸ La session s'est arrêtée avant la fin de son tour : en attente de votre message");
+  }
+
   /** Un tour de la session : premier lancement (`--session-id`), puis `--resume` du même identifiant. */
   #startTurn(kind: "working" | "fixing", message: string): void {
     const c = this.#cycle!;
@@ -1245,6 +1326,10 @@ export class MockSelfUpdate {
       { kind: "user_message", thread: "main", uuid: null, text: message, origin: "Typed" },
       { kind: "status", state: "Streaming" },
     ]);
+    if (c.crash) {
+      this.#after(this.#stepMs, () => this.#crashTurn());
+      return;
+    }
     this.#after(this.#stepMs / 2, () => this.#turnBody(kind, commits, msg));
     this.#after(this.#stepMs, () => this.#endTurn(false));
   }
@@ -1321,6 +1406,7 @@ export class MockSelfUpdate {
         result: null,
       },
       { kind: "status", state: "Idle" },
+      this.#turnEnd(interrupted ? "interrupted" : "done", c.turn),
       { kind: "exited", code: 0, during_turn: false, stderr_tail: [] },
     ]);
     // Garde après chaque tour, avec ou sans commit ; une violation n'est jamais renvoyée à la session.
@@ -1500,7 +1586,7 @@ export class MockSelfUpdate {
     }
     switch (c.step) {
       case "preparing":
-        this.#after(S, () => this.#startTurn("working", c.request));
+        this.#after(S, () => this.#startTurn("working", mockImprovePrompt(c.request)));
         break;
       case "working":
       case "fixing":
