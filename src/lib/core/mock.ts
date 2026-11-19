@@ -19,6 +19,8 @@ import type { EventBody } from "./bindings/EventBody";
 import type { HistoryLoaded } from "./bindings/HistoryLoaded";
 import type { ImproveStatus } from "./bindings/ImproveStatus";
 import type { ImproveStep } from "./bindings/ImproveStep";
+import type { ImproveWaiting } from "./bindings/ImproveWaiting";
+import type { PushResult } from "./bindings/PushResult";
 import type { QuestionItem } from "./bindings/QuestionItem";
 import type { RepoStatus } from "./bindings/RepoStatus";
 import type { SessionResync } from "./bindings/SessionResync";
@@ -587,13 +589,52 @@ export const MOCK_IMPROVE_STEPS: ImproveStep[] = [
   "merged",
 ];
 
-/** Issue simulée d'un cycle (`?improve=` en mode simulé). */
-export type MockImproveOutcome = "merged" | "restart_required" | "failed";
+/**
+ * Issue simulée d'un cycle (`?improve=` en mode simulé, J14 et J16) :
+ * - `merged` : un tour, contrôles et tests verts, fusion ;
+ * - `restart_required` : idem, mais relance requise (décision 18) ;
+ * - `failed` : échec définitif après les tests (`MOCK_FAIL_DETAIL`) ;
+ * - `fix` : tests en échec au premier passage, retour à la session, un tour
+ *   de correction (`fixing`, tentative 1/3), puis fusion ;
+ * - `exhausted` : 4 échecs de suite, donc 3 tours de correction puis
+ *   `awaiting_user` (`attempts_exhausted`) ; un message de l'utilisateur
+ *   relance un tour qui passe ;
+ * - `no_commit` : le premier tour pose une question sans commiter, puis
+ *   `awaiting_user` (`no_new_commit`) ;
+ * - `violation` : la garde échoue après le premier tour, `failed` sans
+ *   retour à la session.
+ */
+export type MockImproveOutcome =
+  | "merged"
+  | "restart_required"
+  | "failed"
+  | "fix"
+  | "exhausted"
+  | "no_commit"
+  | "violation";
 
-/** Étapes simulées pour chaque issue (relance requise : pas de build ni de bascule, décision 18). */
+/**
+ * Étapes simulées pour chaque issue, sans intervention de l'utilisateur
+ * (relance requise : pas de build ni de bascule, décision 18).
+ */
 export function mockImproveSteps(outcome: MockImproveOutcome): ImproveStep[] {
-  if (outcome === "merged") return MOCK_IMPROVE_STEPS;
-  return ["preparing", "working", "checking", "testing", outcome];
+  const checks: ImproveStep[] = ["checking", "testing"];
+  const fix: ImproveStep[] = ["checking", "testing", "fixing"];
+  switch (outcome) {
+    case "merged":
+      return MOCK_IMPROVE_STEPS;
+    case "restart_required":
+    case "failed":
+      return ["preparing", "working", ...checks, outcome];
+    case "fix":
+      return ["preparing", "working", ...fix, ...MOCK_IMPROVE_STEPS.slice(2)];
+    case "exhausted":
+      return ["preparing", "working", ...fix, ...fix, ...fix, ...checks, "awaiting_user"];
+    case "no_commit":
+      return ["preparing", "working", "awaiting_user"];
+    case "violation":
+      return ["preparing", "working", "failed"];
+  }
 }
 
 /** Envoi simulé de la branche après la fusion (`?push=` ; propriétaire de l'app seulement). */
@@ -614,11 +655,39 @@ export type MockSelfUpdateOptions = {
   attachFail?: number;
 };
 
-/** Détail d'un échec simulé (étape `testing`). */
-export const MOCK_FAIL_DETAIL = "npm test : 2 tests en échec (e2e/unit/resync.test.ts)";
+/** Détail d'un échec définitif simulé (issue `failed`, après les tests ; rien n'est renvoyé à la session). */
+export const MOCK_FAIL_DETAIL = "npm ci : registre npm injoignable (simulé)";
+
+/** Raison d'un échec de tests simulé, corrigible : renvoyée à la session (issues `fix`, `exhausted`). */
+export const MOCK_TEST_FAIL = "npm test : 2 tests en échec (e2e/unit/resync.test.ts)";
+
+/** Raison d'un contrôle simulé en échec quand la branche n'a aucun commit (« Valider » après un tour sans commit). */
+export const MOCK_NO_COMMIT_FAIL = "aucun commit sur la branche";
+
+/** Violation de la garde simulée (issue `violation`) : visible par l'utilisateur, jamais renvoyée à la session. */
+export const MOCK_VIOLATION = "garde : .git/config modifié pendant le tour";
 
 /** Plafond des tours de correction automatique (`MAX_AUTO_ATTEMPTS` côté Rust, J16). */
 export const MOCK_MAX_ATTEMPTS = 3;
+
+/**
+ * Retour d'erreur simulé envoyé à la session (format de
+ * `selfupdate/feedback.rs` : en-tête, étape, raison, extrait).
+ */
+export function mockFeedback(attempt: number, max: number, step: string, reason: string): string {
+  return [
+    `[Contrôle automatique — tentative ${attempt}/${max}]`,
+    `Étape : ${step}`,
+    `Raison : ${reason}`,
+    "",
+    "```",
+    " FAIL  e2e/unit/resync.test.ts > rattachement > rejoue le journal",
+    "AssertionError: expected 41 to be 40",
+    " ❯ e2e/unit/resync.test.ts:88:24",
+    "```",
+    "Corrige puis commite ; les contrôles et les tests repartent à la fin du tour.",
+  ].join("\n");
+}
 
 /**
  * Sessions vivantes simulées pour `attachSessions` : la session principale
@@ -713,11 +782,12 @@ export function mockLiveSessions(rows: number, historyRows = 0, seed = 15): Sess
 }
 
 /**
- * Paramètres J14 du mode simulé lus dans l'URL : `improve=merged|restart|failed`,
- * `push=pushed|failed` (envoi de la branche après la fusion, propriétaire),
- * `repo=disabled|cloning`, `attach=<lignes>` (sessions vivantes au montage),
- * `attachFail=<n>` (les n premiers rattachements échouent), `step=<ms>`
- * (durée d'une étape).
+ * Paramètres J14 et J16 du mode simulé lus dans l'URL :
+ * `improve=merged|restart|failed|fix|exhausted|nocommit|violation` (issue du
+ * cycle, voir `MockImproveOutcome`), `push=pushed|failed` (envoi de la branche
+ * après la fusion, propriétaire), `repo=disabled|cloning`, `attach=<lignes>`
+ * (sessions vivantes au montage), `attachFail=<n>` (les n premiers
+ * rattachements échouent), `step=<ms>` (durée d'une étape et d'un tour).
  */
 export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & { stepMs?: number } {
   const p = new URLSearchParams(search);
@@ -725,6 +795,10 @@ export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & {
   const imp = p.get("improve");
   if (imp === "restart" || imp === "restart_required") out.outcome = "restart_required";
   else if (imp === "failed" || imp === "fail") out.outcome = "failed";
+  else if (imp === "fix" || imp === "fixing") out.outcome = "fix";
+  else if (imp === "exhausted" || imp === "attempts_exhausted") out.outcome = "exhausted";
+  else if (imp === "nocommit" || imp === "no_commit" || imp === "no_new_commit") out.outcome = "no_commit";
+  else if (imp === "violation" || imp === "guard") out.outcome = "violation";
   const push = p.get("push");
   if (push === "pushed" || push === "ok") out.push = "pushed";
   else if (push === "failed" || push === "fail") out.push = "failed";
@@ -740,14 +814,85 @@ export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & {
   return out;
 }
 
+/** Étapes finales d'un cycle (plus de tour ni de contrôle ; `improve_dismiss` permis). */
+const FINAL_STEPS: ReadonlySet<ImproveStep> = new Set([
+  "merged",
+  "restart_required",
+  "failed",
+  "cancelled",
+  "rolled_back",
+]);
+
+/** Cycle simulé : ce que le pipeline (`selfupdate/pipeline.rs`) tient en mémoire. */
+export type MockCycle = {
+  n: number;
+  id: string;
+  session: string;
+  branch: string;
+  request: string;
+  step: ImproveStep;
+  attempt: number;
+  turn: number;
+  waiting: ImproveWaiting | null;
+  commit: string | null;
+  commits: number;
+  detail: string | null;
+  push: PushResult | null;
+  /** Journal de la conversation du cycle (un `Outlet` pour tous les tours, `seq` continu). */
+  journal: CoreEvent[];
+  seq: number;
+  /** Messages reçus pendant un tour, livrés au tour suivant. */
+  queued: string[];
+  /** Tour en cours, et s'il commitera. */
+  inTurn: boolean;
+  turnCommits: boolean;
+  /** Échecs de tests encore à simuler, tours sans commit encore à simuler. */
+  failsLeft: number;
+  noCommitLeft: number;
+  violation: boolean;
+  end: "merged" | "restart_required" | "failed";
+  /** Onglet fermé après un état final (`improve_dismiss`) : plus rendu par `attachSessions`. */
+  dismissed: boolean;
+};
+
+/** Clé du `sessionStorage` où le cœur simulé garde son état à travers un rechargement. */
+export const MOCK_SELFUPDATE_KEY = "orchestrator.mock.selfupdate.v1";
+
 /**
- * Commandes J14 simulées (`attach_sessions`, `ui_ready`, `get_ui_info`,
- * `improve_start`, `improve_cancel`, `ui_rollback`) : réponses conformes au
- * contrat. `improveStart` déroule les étapes de l'issue choisie, une toutes
- * les `stepMs` ms, et passe chaque `ImproveStatus` à `onStatus` et aux
- * abonnés de `onImproveStatus` (l'équivalent de l'événement global
- * `improve_status`). Pendant `working`, la session dédiée émet sur le canal
- * de `attachSessions` : elle doit rester hors de la conversation principale.
+ * Stockage du cœur simulé : seulement dans la page de l'app en mode simulé
+ * (`?mock=` dans l'URL), jamais dans les tests unitaires. Le vrai cœur survit
+ * au rechargement de l'interface ; le simulé, qui vit dans la page, garde son
+ * état ici pour le reprendre.
+ */
+function mockStorage(): Storage | null {
+  try {
+    if (typeof sessionStorage === "undefined" || typeof location === "undefined") return null;
+    return new URLSearchParams(location.search).has("mock") ? sessionStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Commandes J14 et J16 simulées (`attach_sessions`, `ui_ready`, `get_ui_info`,
+ * `improve_start`, `improve_cancel`, `improve_send`, `improve_validate`,
+ * `improve_interrupt`, `improve_dismiss`, `ui_rollback`) : réponses conformes
+ * au contrat.
+ *
+ * Le cycle suit le pipeline itératif (décision 17) : `preparing`, puis des
+ * tours (`working`, ou `fixing` pour une correction automatique) suivis de la
+ * garde, puis, si le tour a commité, `checking` et `testing` ; un échec
+ * corrigible renvoie l'erreur à la session (message `[Contrôle automatique —
+ * tentative n/3]`) et relance un tour `fixing`, au plus `MOCK_MAX_ATTEMPTS`
+ * fois, puis `awaiting_user`. Chaque étape dure `stepMs` ms, un tour aussi.
+ *
+ * La conversation du cycle est une vraie session (rôle `improve`, clé
+ * `improve-<n>`) : ses événements (`starting`, message, texte, outils,
+ * `turn_result`, `exited` attendu entre deux tours, et les lignes d'état
+ * `notice` de code `improve.*`) partent sur le canal de `attachSessions`, et
+ * `attachSessions` la rend tant que l'onglet n'est pas fermé
+ * (`improveDismiss`). Chaque `ImproveStatus` est passé à `onStatus` et aux
+ * abonnés de `onImproveStatus` (l'événement global `improve_status`).
  */
 export class MockSelfUpdate {
   info: UiInfo = {
@@ -764,16 +909,20 @@ export class MockSelfUpdate {
   readyCalls: (string | null)[] = [];
   /** Commandes reçues, dans l'ordre (vérifiées par les tests e2e). */
   calls: { cmd: string; args: unknown }[] = [];
+  /** Passages de la garde (un après chaque tour, avec ou sans commit). */
+  guardRuns = 0;
   outcome: MockImproveOutcome;
   pushOutcome: MockPushOutcome | null;
   live: SessionResync[];
   attachFail: number;
   #timers: ReturnType<typeof setTimeout>[] = [];
   #n = 0;
+  #cycle: MockCycle | null = null;
   #onStatus: (s: ImproveStatus) => void;
   #listeners = new Set<(s: ImproveStatus) => void>();
   #attached: ((batch: CoreEvent[]) => void) | null = null;
   #stepMs: number;
+  #storage: Storage | null;
 
   constructor(onStatus: (s: ImproveStatus) => void = () => {}, stepMs = 300, opts: MockSelfUpdateOptions = {}) {
     this.#onStatus = onStatus;
@@ -784,6 +933,13 @@ export class MockSelfUpdate {
     this.live = opts.live ?? [];
     this.attachFail = opts.attachFail ?? 0;
     if (opts.repo) this.info.repo = opts.repo;
+    this.#storage = mockStorage();
+    this.#restore();
+  }
+
+  /** Cycle en cours ou dernier cycle (lecture seule, pour les tests). */
+  get cycle(): Readonly<MockCycle> | null {
+    return this.#cycle;
   }
 
   attachSessions(onEvents?: (batch: CoreEvent[]) => void): Promise<SessionResync[]> {
@@ -793,7 +949,23 @@ export class MockSelfUpdate {
       return Promise.reject({ kind: "internal", message: "canal de rattachement refusé (simulé)" });
     }
     this.#attached = onEvents ?? null;
-    return Promise.resolve(structuredClone(this.live));
+    const c = this.#cycle;
+    const own: SessionResync[] =
+      c && !c.dismissed && c.journal.length > 0
+        ? [
+            {
+              session: c.session,
+              role: "improve",
+              cwd: this.#cwd(),
+              pid: this.#pid(),
+              resumed_from: null,
+              history: null,
+              events: c.journal,
+              running: c.inTurn,
+            },
+          ]
+        : [];
+    return Promise.resolve(structuredClone([...this.live, ...own]));
   }
 
   uiReady(hash: string | null): Promise<boolean> {
@@ -813,12 +985,6 @@ export class MockSelfUpdate {
     });
   }
 
-  #emit(s: ImproveStatus): void {
-    this.info.improve = s;
-    this.#onStatus(s);
-    for (const l of this.#listeners) l(s);
-  }
-
   improveStart(request: string): Promise<ImproveStatus> {
     this.calls.push({ cmd: "improve_start", args: { request } });
     const repo = this.info.repo;
@@ -826,113 +992,129 @@ export class MockSelfUpdate {
       const why = repo.state === "disabled" ? repo.reason : "clone indisponible";
       return Promise.reject({ kind: "unsupported", message: why });
     }
+    const cur = this.#cycle;
+    if (cur && !FINAL_STEPS.has(cur.step))
+      return Promise.reject({ kind: "rejected", message: "une amélioration est déjà en cours" });
     const n = ++this.#n;
-    const id = `improve-${n}`;
-    const session = `improve-${n}`;
     const slug = request.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "demande";
-    const commit = `mock${n}`.padEnd(7, "0");
-    const status = (step: ImproveStep): ImproveStatus => ({
-      id,
+    const o = this.outcome;
+    // Un seul cycle à la fois : le précédent (final) est remplacé.
+    this.#cycle = {
+      n,
+      id: `improve-${n}`,
+      session: `improve-${n}`,
       branch: `auto/20261117-1200-${slug}`,
       request,
-      step,
-      session: step === "preparing" ? null : session,
-      commit: step === "preparing" || step === "working" ? null : commit,
-      detail: step === "failed" ? MOCK_FAIL_DETAIL : null,
-      push: null,
-      t: Date.now(),
+      step: "preparing",
       attempt: 0,
-      max_attempts: MOCK_MAX_ATTEMPTS,
       turn: 0,
       waiting: null,
-    });
-    mockImproveSteps(this.outcome).forEach((step, i) => {
-      if (i === 0) return;
-      this.#timers.push(
-        setTimeout(() => {
-          const s = status(step);
-          if (step === "merged") {
-            this.info.previous_hash = this.info.active_hash;
-            this.info.active_hash = s.commit;
-            this.info.source = "disk";
-          } else if (step === "restart_required") {
-            this.info.restart_required = s.commit;
-          } else if (step === "working") {
-            this.#improveEvents(session);
-          }
-          this.#emit(s);
-          if (step === "merged" || step === "restart_required") this.#push(s);
-        }, i * this.#stepMs),
-      );
-    });
-    const first = status("preparing");
+      commit: null,
+      commits: 0,
+      detail: null,
+      push: null,
+      journal: [],
+      seq: 0,
+      queued: [],
+      inTurn: false,
+      turnCommits: false,
+      failsLeft: o === "fix" ? 1 : o === "exhausted" ? MOCK_MAX_ATTEMPTS + 1 : 0,
+      noCommitLeft: o === "no_commit" ? 1 : 0,
+      violation: o === "violation",
+      end: o === "restart_required" || o === "failed" ? o : "merged",
+      dismissed: false,
+    };
+    const first = this.#status();
     this.info.improve = first;
+    this.#note("Info", "improve.preparing", `✻ Préparation de la branche ${this.#cycle.branch}`);
+    this.#after(this.#stepMs, () => this.#startTurn("working", request));
     return Promise.resolve(first);
   }
 
-  /** Envoi simulé de la branche après la fusion (propriétaire) : « en cours », puis son issue une étape plus tard. */
-  #push(merged: ImproveStatus): void {
-    const outcome = this.pushOutcome;
-    if (!outcome) return;
-    const branch = merged.branch;
-    this.#emit({ ...merged, push: { state: "pushing", branch }, t: Date.now() });
-    this.#timers.push(
-      setTimeout(() => {
-        const cur = this.info.improve;
-        if (!cur || cur.id !== merged.id) return;
-        this.#emit({
-          ...cur,
-          push:
-            outcome === "pushed" ? { state: "pushed", branch } : { state: "failed", branch, reason: MOCK_PUSH_FAIL },
-          t: Date.now(),
-        });
-      }, this.#stepMs),
-    );
+  /**
+   * Message de l'utilisateur à la session du cycle. Pendant un tour (ou la
+   * préparation) : mis en file, livré comme tour suivant (garde entre les
+   * deux, pas de tests). Pendant les contrôles ou les tests : ceux-ci sont
+   * abandonnés et un tour part. En attente : un tour part. Chaque message
+   * remet `attempt` à 0 (au départ du tour qui le porte).
+   */
+  improveSend(id: string, text: string): Promise<void> {
+    this.calls.push({ cmd: "improve_send", args: { id, text } });
+    const c = this.#cycle;
+    if (!c || c.id !== id) return Promise.reject({ kind: "invalid_argument", message: id });
+    const msg = text.trim();
+    if (!msg) return Promise.reject({ kind: "invalid_argument", message: "message vide" });
+    switch (c.step) {
+      case "preparing":
+      case "working":
+      case "fixing":
+        c.queued.push(msg);
+        return Promise.resolve();
+      case "checking":
+      case "testing":
+        this.#clearTimers();
+        this.#note("Info", "improve.aborted", "✻ Contrôles abandonnés : nouveau message");
+        this.#startTurn("working", msg);
+        return Promise.resolve();
+      case "awaiting_user":
+        this.#startTurn("working", msg);
+        return Promise.resolve();
+      default:
+        return Promise.reject({ kind: "rejected", message: `pas de message à l'étape ${c.step}` });
+    }
   }
 
-  /** Quelques événements de la session dédiée, sur le canal du rattachement. */
-  #improveEvents(session: string): void {
-    const f = new EventFactory();
-    const ev = (body: EventBody): CoreEvent => ({ ...f.make(body), session });
-    this.#attached?.([
-      ev({ kind: "starting", pid: 6000 + this.#n, cwd: "C:\\mock\\work\\auto", args: [] }),
-      ev({ kind: "user_message", thread: "main", uuid: null, text: "Prompt d'amélioration (simulé)", origin: "Typed" }),
-      ev({ kind: "status", state: "Streaming" }),
-    ]);
-  }
-
-  improveCancel(id: string): Promise<void> {
-    this.calls.push({ cmd: "improve_cancel", args: { id } });
-    const cur = this.info.improve;
-    if (!cur || cur.id !== id) return Promise.reject({ kind: "invalid_argument", message: id });
-    this.#timers.forEach(clearTimeout);
-    this.#timers = [];
-    this.#emit({ ...cur, step: "cancelled", t: Date.now() });
+  /** « Valider » : seulement en attente ; garde, contrôles et tests ; `attempt` inchangé. */
+  improveValidate(id: string): Promise<void> {
+    this.calls.push({ cmd: "improve_validate", args: { id } });
+    const c = this.#cycle;
+    if (!c || c.id !== id) return Promise.reject({ kind: "invalid_argument", message: id });
+    if (c.step !== "awaiting_user")
+      return Promise.reject({ kind: "rejected", message: `rien à valider à l'étape ${c.step}` });
+    this.#checks();
     return Promise.resolve();
   }
 
-  // J16 (onglet d'amélioration), étape 0 : ébauches. Comme le cœur
-  // provisoire, `improve_send`, `improve_validate` et `improve_interrupt`
-  // répondent `not_implemented` ; `improve_dismiss` est neutre. Le mode
-  // simulé de la conversation est écrit à l'étape D.
-
-  improveSend(id: string, text: string): Promise<void> {
-    this.calls.push({ cmd: "improve_send", args: { id, text } });
-    return Promise.reject({ kind: "not_implemented", message: "improve_send (simulé, étape 0)" });
-  }
-
-  improveValidate(id: string): Promise<void> {
-    this.calls.push({ cmd: "improve_validate", args: { id } });
-    return Promise.reject({ kind: "not_implemented", message: "improve_validate (simulé, étape 0)" });
-  }
-
+  /** Échap dans l'onglet : le tour en cours s'arrête, le cycle attend (`interrupted`), sans tests. */
   improveInterrupt(id: string): Promise<void> {
     this.calls.push({ cmd: "improve_interrupt", args: { id } });
-    return Promise.reject({ kind: "not_implemented", message: "improve_interrupt (simulé, étape 0)" });
+    const c = this.#cycle;
+    if (!c || c.id !== id) return Promise.reject({ kind: "invalid_argument", message: id });
+    if (!c.inTurn) return Promise.reject({ kind: "rejected", message: "aucun tour en cours" });
+    this.#clearTimers();
+    this.#endTurn(true);
+    return Promise.resolve();
   }
 
+  /** Fermeture de l'onglet après un état final : la conversation du cycle n'est plus rattachée. */
   improveDismiss(id: string): Promise<void> {
     this.calls.push({ cmd: "improve_dismiss", args: { id } });
+    const c = this.#cycle;
+    if (!c || c.id !== id) return Promise.resolve();
+    if (!FINAL_STEPS.has(c.step))
+      return Promise.reject({ kind: "rejected", message: "amélioration en cours : l'annuler d'abord" });
+    c.dismissed = true;
+    this.#save();
+    return Promise.resolve();
+  }
+
+  /** Annulation (bouton ou fermeture de l'onglet) : branche gardée non fusionnée ; impossible à partir de `switching`. */
+  improveCancel(id: string): Promise<void> {
+    this.calls.push({ cmd: "improve_cancel", args: { id } });
+    const c = this.#cycle;
+    if (!c || c.id !== id) return Promise.reject({ kind: "invalid_argument", message: id });
+    if (c.step === "switching" || FINAL_STEPS.has(c.step))
+      return Promise.reject({ kind: "rejected", message: `annulation impossible à l'étape ${c.step}` });
+    this.#clearTimers();
+    if (c.inTurn) {
+      c.inTurn = false;
+      this.#events([
+        { kind: "status", state: "Idle" },
+        { kind: "exited", code: 1, during_turn: true, stderr_tail: [] },
+      ]);
+    }
+    this.#note("Warn", "improve.cancelled", `✗ Amélioration annulée : branche ${c.branch} gardée non fusionnée`);
+    this.#set({ step: "cancelled", waiting: null });
     return Promise.resolve();
   }
 
@@ -942,16 +1124,365 @@ export class MockSelfUpdate {
     this.info.active_hash = this.info.previous_hash;
     this.info.previous_hash = null;
     this.info.source = this.info.active_hash ? "disk" : "embedded";
-    const cur = this.info.improve;
-    if (cur)
-      this.#emit({ ...cur, step: "rolled_back", commit: from ?? cur.commit, detail: null, push: null, t: Date.now() });
+    const c = this.#cycle;
+    if (c) this.#set({ step: "rolled_back", commit: from ?? c.commit, detail: null, push: null, waiting: null });
     return this.getUiInfo();
   }
 
   dispose(): void {
-    this.#timers.forEach(clearTimeout);
-    this.#timers = [];
+    this.#clearTimers();
     this.#listeners.clear();
   }
-}
 
+  // --- déroulement du cycle --------------------------------------------------
+
+  #after(ms: number, fn: () => void): void {
+    this.#timers.push(setTimeout(fn, ms));
+  }
+
+  #clearTimers(): void {
+    this.#timers.forEach(clearTimeout);
+    this.#timers = [];
+  }
+
+  #pid(): number {
+    const c = this.#cycle;
+    return c ? 6000 + c.n * 10 + c.turn : 6000;
+  }
+
+  #cwd(): string {
+    return `C:\\mock\\work\\${this.#cycle!.branch.replace("/", "-")}`;
+  }
+
+  #status(): ImproveStatus {
+    const c = this.#cycle!;
+    return {
+      id: c.id,
+      branch: c.branch,
+      request: c.request,
+      step: c.step,
+      session: c.step === "preparing" ? null : c.session,
+      commit: c.commit,
+      detail: c.detail,
+      push: c.push,
+      t: Date.now(),
+      attempt: c.attempt,
+      max_attempts: MOCK_MAX_ATTEMPTS,
+      turn: c.turn,
+      waiting: c.step === "awaiting_user" ? c.waiting : null,
+    };
+  }
+
+  /** Nouvel état du cycle, publié comme `improve_status`. */
+  #set(patch: Partial<MockCycle>): void {
+    const c = this.#cycle!;
+    Object.assign(c, patch);
+    const s = this.#status();
+    this.info.improve = s;
+    this.#save();
+    this.#onStatus(s);
+    for (const l of this.#listeners) l(s);
+  }
+
+  /** Événements de la conversation du cycle : journal, puis canal du rattachement. */
+  #events(bodies: EventBody[]): void {
+    const c = this.#cycle!;
+    const evs = bodies.map((b) => ({ ...b, seq: c.seq++, t: Date.now(), session: c.session }) as CoreEvent);
+    c.journal.push(...evs);
+    this.#save();
+    this.#attached?.(evs);
+  }
+
+  /** Ligne d'état dans le fil (`PipelineHost::note` : `notice` de code `improve.*`). */
+  #note(level: "Info" | "Warn" | "Error", code: string, message: string): void {
+    this.#events([{ kind: "notice", level, code, message, detail: null }]);
+  }
+
+  /** Un tour de la session : premier lancement (`--session-id`), puis `--resume` du même identifiant. */
+  #startTurn(kind: "working" | "fixing", message: string): void {
+    const c = this.#cycle!;
+    const commits = kind === "fixing" || c.noCommitLeft <= 0;
+    if (!commits) c.noCommitLeft--;
+    c.inTurn = true;
+    c.turnCommits = commits;
+    const msg = `msg_improve_${c.n}_${c.turn}`;
+    this.#set({ step: kind, waiting: null, detail: null, ...(kind === "working" ? { attempt: 0 } : {}) });
+    if (kind === "fixing")
+      this.#note("Info", "improve.fixing", `✻ Correction automatique (tentative ${c.attempt}/${MOCK_MAX_ATTEMPTS})`);
+    this.#events([
+      {
+        kind: "starting",
+        pid: this.#pid(),
+        cwd: this.#cwd(),
+        args: c.turn === 0 ? ["--session-id", c.id] : ["--resume", c.id],
+      },
+      { kind: "user_message", thread: "main", uuid: null, text: message, origin: "Typed" },
+      { kind: "status", state: "Streaming" },
+    ]);
+    this.#after(this.#stepMs / 2, () => this.#turnBody(kind, commits, msg));
+    this.#after(this.#stepMs, () => this.#endTurn(false));
+  }
+
+  /** Milieu du tour : une question en texte (sans commit), ou une modification commitée. */
+  #turnBody(kind: "working" | "fixing", commits: boolean, msg: string): void {
+    const c = this.#cycle!;
+    const text = (index: number, t: string): EventBody[] => [
+      { kind: "block_start", thread: "main", msg, index, block: { type: "Text" } },
+      { kind: "block_done", thread: "main", msg, index, block: { type: "Text", text: t } },
+    ];
+    const tool = (index: number, id: string, name: string, input: Record<string, string>, out: string): EventBody[] => [
+      { kind: "block_start", thread: "main", msg, index, block: { type: "ToolUse", tool_use_id: id, name } },
+      { kind: "block_done", thread: "main", msg, index, block: { type: "ToolUse", tool_use_id: id, name, input } },
+      { kind: "tool_result", thread: "main", tool_use_id: id, content: [{ type: "Text", text: out }], is_error: false, meta: null },
+    ];
+    if (!commits) {
+      this.#events(
+        text(
+          0,
+          "Avant de modifier quoi que ce soit : faut-il garder l'ancien comportement derrière un réglage, " +
+            "ou le remplacer partout ? Je ne commite rien tant que je n'ai pas ta réponse.",
+        ),
+      );
+      return;
+    }
+    const base = `toolu_improve_${c.n}_${c.turn}`;
+    this.#events([
+      ...text(
+        0,
+        kind === "fixing"
+          ? "Le contrôle automatique signale des tests en échec : je corrige `src/App.svelte`, puis je commite."
+          : "Je modifie `src/App.svelte`, puis je commite.",
+      ),
+      ...tool(1, `${base}_e`, "Edit", { file_path: "src/App.svelte" }, "The file src/App.svelte has been updated."),
+      ...tool(
+        2,
+        `${base}_g`,
+        "Bash",
+        { command: "git commit -F .git/MSG -- src/App.svelte" },
+        `[${c.branch} ${this.#nextCommit()}] ${c.request}`,
+      ),
+    ]);
+  }
+
+  #nextCommit(): string {
+    const c = this.#cycle!;
+    const k = c.commits + 1;
+    return (`mock${c.n}` + (k > 1 ? String.fromCharCode(96 + k) : "")).padEnd(7, "0");
+  }
+
+  /** Fin d'un tour : arrêt du processus (`exited` attendu), garde, puis suite selon le tour. */
+  #endTurn(interrupted: boolean): void {
+    const c = this.#cycle!;
+    const committed = c.turnCommits && !interrupted;
+    if (committed) {
+      c.commit = this.#nextCommit();
+      c.commits++;
+    }
+    c.inTurn = false;
+    c.turn++;
+    this.#events([
+      {
+        kind: "turn_result",
+        subtype: interrupted ? "error_during_execution" : "success",
+        is_error: false,
+        terminal_reason: interrupted ? "interrupted" : null,
+        duration_ms: this.#stepMs,
+        cost_usd: 0.01,
+        num_turns: 1,
+        context_used: null,
+        context_window: null,
+        permission_denials: [],
+        result: null,
+      },
+      { kind: "status", state: "Idle" },
+      { kind: "exited", code: 0, during_turn: false, stderr_tail: [] },
+    ]);
+    // Garde après chaque tour, avec ou sans commit ; une violation n'est jamais renvoyée à la session.
+    this.guardRuns++;
+    if (c.violation && c.turn === 1) {
+      this.#set({ step: "failed", detail: MOCK_VIOLATION });
+      this.#note("Error", "improve.failed", `✗ Échec (Checking) : ${MOCK_VIOLATION} ; branche ${c.branch} gardée non fusionnée`);
+      return;
+    }
+    this.#note("Info", "improve.guard", `✓ Garde de sécurité (tour ${c.turn})`);
+    if (c.queued.length > 0) {
+      this.#startTurn("working", c.queued.splice(0).join("\n\n"));
+      return;
+    }
+    if (interrupted) {
+      this.#set({ step: "awaiting_user", waiting: "interrupted", detail: "tour interrompu" });
+      this.#note("Info", "improve.awaiting", "⏸ Tour interrompu : en attente de votre message");
+      return;
+    }
+    if (!committed) {
+      this.#set({
+        step: "awaiting_user",
+        waiting: "no_new_commit",
+        detail: "tour terminé sans nouveau commit : rien à tester",
+      });
+      this.#note("Info", "improve.awaiting", "⏸ Tour terminé sans nouveau commit : répondez, ou « Valider »");
+      return;
+    }
+    this.#checks();
+  }
+
+  /** Contrôles déterministes puis tests ; un échec corrigible repart vers la session. */
+  #checks(): void {
+    const S = this.#stepMs;
+    const c = this.#cycle!;
+    this.#set({ step: "checking", waiting: null, detail: null });
+    this.#note("Info", "improve.checking", "✻ Contrôles…");
+    this.#after(S, () => {
+      if (c.commit === null) {
+        this.#failed("checking", "contrôles", MOCK_NO_COMMIT_FAIL);
+        return;
+      }
+      this.#set({ step: "testing" });
+      this.#note("Info", "improve.testing", "✻ Tests…");
+      this.#after(S, () => {
+        if (c.failsLeft > 0) {
+          c.failsLeft--;
+          this.#failed("testing", "tests", MOCK_TEST_FAIL);
+          return;
+        }
+        this.#passed();
+      });
+    });
+  }
+
+  /** Échec corrigible : retour à la session (tour `fixing`), ou attente une fois les tentatives épuisées. */
+  #failed(step: "checking" | "testing", label: string, reason: string): void {
+    const c = this.#cycle!;
+    const head = step === "testing" ? "Tests en échec" : "Contrôles en échec";
+    if (c.attempt < MOCK_MAX_ATTEMPTS) {
+      const attempt = c.attempt + 1;
+      this.#note("Warn", "improve.fault", `✗ ${head} (tentative ${attempt}/${MOCK_MAX_ATTEMPTS}) : erreur renvoyée à la session`);
+      c.attempt = attempt;
+      this.#startTurn("fixing", mockFeedback(attempt, MOCK_MAX_ATTEMPTS, label, reason));
+      return;
+    }
+    this.#note(
+      "Warn",
+      "improve.fault",
+      `✗ ${head} : ${MOCK_MAX_ATTEMPTS} corrections automatiques sans succès, à vous de reprendre`,
+    );
+    this.#set({ step: "awaiting_user", waiting: "attempts_exhausted", detail: reason });
+    this.#note("Info", "improve.awaiting", "⏸ Corrections automatiques épuisées : en attente de votre message");
+  }
+
+  /** Contrôles et tests verts : fusion (build, attente du repos, bascule), relance requise, ou échec définitif. */
+  #passed(): void {
+    const S = this.#stepMs;
+    const c = this.#cycle!;
+    if (c.end === "failed") {
+      this.#set({ step: "failed", detail: MOCK_FAIL_DETAIL });
+      this.#note("Error", "improve.failed", `✗ Échec (Testing) : ${MOCK_FAIL_DETAIL} ; branche ${c.branch} gardée non fusionnée`);
+      return;
+    }
+    if (c.end === "restart_required") {
+      this.info.restart_required = c.commit;
+      this.#set({ step: "restart_required", detail: null });
+      this.#note("Info", "improve.restart_required", `✓ Fusionné ${c.commit} : relance requise (src-tauri/ modifié)`);
+      this.#push();
+      return;
+    }
+    this.#set({ step: "building", detail: null });
+    this.#note("Info", "improve.building", "✻ Construction de l'interface…");
+    this.#after(S, () => {
+      this.#set({ step: "waiting_idle" });
+      this.#note("Info", "improve.waiting_idle", "✻ Attente du repos de la session principale…");
+      this.#after(S, () => {
+        this.#set({ step: "switching" });
+        this.#note("Info", "improve.switching", "✻ Bascule vers la nouvelle interface…");
+        this.#after(S, () => {
+          this.info.previous_hash = this.info.active_hash;
+          this.info.active_hash = c.commit;
+          this.info.source = "disk";
+          this.#set({ step: "merged" });
+          this.#note("Info", "improve.merged", `✓ Fusionné ${c.commit}`);
+          this.#push();
+        });
+      });
+    });
+  }
+
+  /** Envoi simulé de la branche après la fusion (propriétaire) : « en cours », puis son issue une étape plus tard. */
+  #push(): void {
+    const outcome = this.pushOutcome;
+    const c = this.#cycle!;
+    if (!outcome) return;
+    const branch = c.branch;
+    this.#set({ push: { state: "pushing", branch } });
+    this.#after(this.#stepMs, () => {
+      if (this.#cycle !== c) return;
+      this.#set({
+        push: outcome === "pushed" ? { state: "pushed", branch } : { state: "failed", branch, reason: MOCK_PUSH_FAIL },
+      });
+    });
+  }
+
+  // --- état gardé à travers un rechargement (mode simulé seulement) ----------
+
+  #save(): void {
+    if (!this.#storage) return;
+    const { source, active_hash, previous_hash, restart_required } = this.info;
+    try {
+      this.#storage.setItem(
+        MOCK_SELFUPDATE_KEY,
+        JSON.stringify({
+          n: this.#n,
+          guardRuns: this.guardRuns,
+          info: { source, active_hash, previous_hash, restart_required },
+          cycle: this.#cycle,
+        }),
+      );
+    } catch {
+      // Stockage plein ou refusé : l'état ne survivra pas au rechargement.
+    }
+  }
+
+  /**
+   * Reprise après un rechargement de la page : un état final ou une attente
+   * restent tels quels ; une étape en cours reprend au début de sa phase
+   * (fin du tour, contrôles, ou suite de la fusion), une étape plus tard.
+   */
+  #restore(): void {
+    if (!this.#storage) return;
+    type Saved = { n?: number; guardRuns?: number; info?: Partial<UiInfo>; cycle?: MockCycle | null };
+    let saved: Saved | null = null;
+    try {
+      saved = JSON.parse(this.#storage.getItem(MOCK_SELFUPDATE_KEY) ?? "null") as Saved | null;
+    } catch {
+      saved = null;
+    }
+    if (!saved || typeof saved !== "object") return;
+    this.#n = saved.n ?? 0;
+    this.guardRuns = saved.guardRuns ?? 0;
+    Object.assign(this.info, saved.info ?? {});
+    const c = saved.cycle;
+    if (!c) return;
+    this.#cycle = c;
+    this.info.improve = this.#status();
+    const S = this.#stepMs;
+    switch (c.step) {
+      case "preparing":
+        this.#after(S, () => this.#startTurn("working", c.request));
+        break;
+      case "working":
+      case "fixing":
+        this.#after(S, () => this.#endTurn(false));
+        break;
+      case "checking":
+      case "testing":
+        this.#after(S, () => this.#checks());
+        break;
+      case "building":
+      case "waiting_idle":
+      case "switching":
+        this.#after(S, () => this.#passed());
+        break;
+      default:
+        break;
+    }
+  }
+}
