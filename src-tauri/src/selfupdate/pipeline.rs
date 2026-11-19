@@ -391,6 +391,9 @@ enum Phase {
     /// Tour de la session : un message est mis en file et livré au tour
     /// suivant ; l'interruption est possible.
     Turn,
+    /// Tour fini (arrêt de la session, garde) : un message est mis en file ;
+    /// l'interruption est refusée (le tour n'est plus en cours).
+    AfterTurn,
     /// Contrôles ou tests : un message les abandonne.
     Checking,
     /// Attente de l'utilisateur : message ou « Valider ».
@@ -461,6 +464,11 @@ impl Control {
         s.phase = Phase::Turn;
         s.validate = false;
         s.interrupted = false;
+    }
+
+    /// Fin réelle du tour : plus d'interruption possible.
+    fn end_turn(&self) {
+        self.lock().phase = Phase::AfterTurn;
     }
 
     fn take_validate(&self) -> bool {
@@ -548,15 +556,31 @@ enum Next {
     Verify,
 }
 
+impl Ctx {
+    /// Worktree de tests à supprimer plus tard.
+    fn left(&self, p: PathBuf) {
+        self.tests_left
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(p);
+    }
+}
+
 /// Ce qui est fixe pendant un cycle.
 struct Ctx {
     clone: PathBuf,
     wt: PathBuf,
-    tests: PathBuf,
+    /// Base des worktrees jetables des tests : un par passage
+    /// (`<base>-<n>`), pour qu'un dossier encore tenu par un processus en
+    /// cours d'arrêt (tests abandonnés) ne bloque pas le passage suivant.
+    tests_base: PathBuf,
+    tests_run: std::sync::atomic::AtomicU32,
+    /// Worktrees de tests pas encore supprimés (abandon, suppression ratée).
+    tests_left: std::sync::Mutex<Vec<PathBuf>>,
     common: PathBuf,
     base: String,
     snapshot: Snapshot,
-    redact: feedback::Redactions,
+    redact: std::sync::Mutex<feedback::Redactions>,
 }
 
 /// Ce que le cycle fait après le worktree.
@@ -1353,10 +1377,10 @@ impl Pipeline {
             hooks: hooks_in(&common),
             deps: sha256_file(&clone.join("node_modules").join(".package-lock.json")),
         };
-        let tests = self.tests_path(&req.branch);
-        // Chemins locaux retirés du retour d'erreur (le plus précis d'abord).
+        let tests_base = self.tests_path(&req.branch);
+        // Chemins locaux retirés du retour d'erreur (le plus précis d'abord ;
+        // chaque worktree de tests y est ajouté à sa création).
         let mut redact = feedback::Redactions::new()
-            .add(&tests, ".")
             .add(&wt, ".")
             .add(&clone, "<clone>");
         if let Some(d) = super::data_dir() {
@@ -1368,19 +1392,22 @@ impl Pipeline {
         let ctx = Ctx {
             clone,
             wt,
-            tests,
+            tests_base,
+            tests_run: std::sync::atomic::AtomicU32::new(0),
+            tests_left: std::sync::Mutex::new(Vec::new()),
             common,
             base,
             snapshot,
-            redact,
+            redact: std::sync::Mutex::new(redact),
         };
 
         match mode {
             Mode::Improve => self.converse(req, &ctx, rep, cancel, ctl).await,
             // Retour arrière : pas de session, tout échec est définitif.
             Mode::Revert(_) => {
-                let res = guarded(cancel, self.verify(&ctx, rep)).await;
-                self.remove_tree(&ctx.tests, true).await;
+                let tests = self.next_tests_tree(&ctx).await;
+                let res = guarded(cancel, self.verify(&ctx, &tests, rep)).await;
+                self.drop_tests_tree(&ctx, &tests).await;
                 let v = match res? {
                     Ok(v) => v,
                     Err(VErr::Fault(f)) => return Err(f.stop()),
@@ -1442,7 +1469,9 @@ impl Pipeline {
                     rep.emit(S::Working, None);
                 }
             }
-            let end = self.one_turn(req, ctx, &message, resume, cancel).await?;
+            let end = self
+                .one_turn(req, ctx, &message, resume, cancel, ctl)
+                .await?;
             rep.status.turn += 1;
 
             // --- Garde de sécurité, après chaque tour : une violation arrête
@@ -1551,7 +1580,7 @@ impl Pipeline {
                                     max,
                                     f.label(),
                                     &f.text,
-                                    &ctx.redact,
+                                    &ctx.redact.lock().unwrap_or_else(|e| e.into_inner()),
                                 );
                                 break (fb, Some(f));
                             }
@@ -1575,6 +1604,7 @@ impl Pipeline {
         message: &str,
         resume: bool,
         cancel: &mut watch::Receiver<bool>,
+        ctl: &Control,
     ) -> Result<Result<TurnEnd, CoreError>, Stop> {
         use ImproveStep as S;
         // Verrou posé avant : un arrêt brutal pendant le tour laisse de quoi
@@ -1598,6 +1628,7 @@ impl Pipeline {
             }
         };
         let done = guarded(cancel, turn).await;
+        ctl.end_turn();
         // Arrêt effectif de la session (fin, délai ou annulation) avant de
         // rendre `.git/config` inscriptible et avant la garde.
         self.host.session_stopped().await;
@@ -1610,6 +1641,53 @@ impl Pipeline {
             }
         }
         done
+    }
+
+    /// Garde rejouée avant le build et avant la bascule : garde d'après tour,
+    /// et la branche pointe toujours sur la tête testée `head` (un commit
+    /// arrivé après les tests ne sera ni activé ni fusionné).
+    async fn guard_tested(&self, ctx: &Ctx, branch: &str, head: &str) -> Result<(), String> {
+        self.guard(ctx, branch).await?;
+        let now = resolve(&ctx.wt, "HEAD").await;
+        let tip = resolve(&ctx.clone, &format!("refs/heads/{branch}")).await;
+        if now.as_deref() != Some(head) || tip.as_deref() != Some(head) {
+            return Err(format!(
+                "la branche {branch} a bougé après les tests : commit non testé,                  ni activé ni fusionné"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Worktree jetable des tests du passage suivant (`<base>-<n>`) ; les
+    /// restes des passages précédents sont supprimés si possible d'abord.
+    async fn next_tests_tree(&self, ctx: &Ctx) -> PathBuf {
+        let left = std::mem::take(&mut *ctx.tests_left.lock().unwrap_or_else(|e| e.into_inner()));
+        for t in left {
+            if !self.remove_tree(&t, true).await {
+                ctx.left(t);
+            }
+        }
+        let n = ctx
+            .tests_run
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let p = PathBuf::from(format!("{}-{n}", ctx.tests_base.to_string_lossy()));
+        let mut r = ctx.redact.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = std::mem::take(&mut *r);
+        *r = cur.add(&p, ".");
+        p
+    }
+
+    /// Supprime le worktree de tests `tests` ; s'il résiste (processus en
+    /// cours d'arrêt), il est retenté au passage suivant.
+    async fn drop_tests_tree(&self, ctx: &Ctx, tests: &Path) {
+        if !self.remove_tree(tests, true).await {
+            tracing::warn!(
+                "worktree de tests {} non supprimé : retenté plus tard",
+                tests.display()
+            );
+            ctx.left(tests.to_path_buf());
+        }
     }
 
     /// Garde de sécurité d'après tour : fichiers de l'app (rétablis),
@@ -1679,12 +1757,15 @@ impl Pipeline {
         if let Some(m) = ctl.enter(Phase::Checking) {
             return Ok(Verdict::Message(m));
         }
-        let res = abortable(cancel, ctl, self.verify(ctx, rep)).await;
+        let tests = self.next_tests_tree(ctx).await;
+        let res = abortable(cancel, ctl, self.verify(ctx, &tests, rep)).await;
         // Abandon par un message : le tour part tout de suite ; le worktree
-        // des tests (processus déjà tués) est supprimé au début des tests
-        // suivants, ou par `cleanup_merged`.
-        if !matches!(res, Ok(None)) {
-            self.remove_tree(&ctx.tests, true).await;
+        // des tests (processus en cours d'arrêt) est supprimé au passage
+        // suivant, ou par `cleanup_merged` et au démarrage.
+        if matches!(res, Ok(None)) {
+            ctx.left(tests);
+        } else {
+            self.drop_tests_tree(ctx, &tests).await;
         }
         let v = match res? {
             None => return Ok(Verdict::Message(ctl.take_message().unwrap_or_default())),
@@ -1704,7 +1785,7 @@ impl Pipeline {
 
     /// Contrôles corrigibles puis tests dans un worktree jetable au harnais
     /// restauré (supprimé par l'appelant).
-    async fn verify(&self, ctx: &Ctx, rep: &mut Reporter) -> Result<Verified, VErr> {
+    async fn verify(&self, ctx: &Ctx, tests: &Path, rep: &mut Reporter) -> Result<Verified, VErr> {
         use ImproveStep as S;
         rep.emit(S::Checking, None);
         rep.note(NoticeLevel::Info, "improve.checking", "✻ Contrôles…");
@@ -1722,7 +1803,7 @@ impl Pipeline {
         rep.note(NoticeLevel::Info, "improve.testing", "✻ Tests…");
         let rust = files.iter().any(|f| f.starts_with("src-tauri/"));
         let fingerprint = self
-            .run_tests(&ctx.clone, &ctx.wt, &ctx.tests, &head, &ctx.base, rust)
+            .run_tests(&ctx.clone, &ctx.wt, tests, &head, &ctx.base, rust)
             .await?;
         Ok(Verified {
             files,
@@ -1748,6 +1829,12 @@ impl Pipeline {
         use ImproveStep as S;
         let clone = &ctx.clone;
         let (head, short) = (v.head, v.short);
+        // Garde rejouée après les tests (ils partagent le `node_modules` du
+        // clone et peuvent atteindre les fichiers de l'app) : violation
+        // fatale, jamais renvoyée à la session.
+        self.guard_tested(ctx, &req.branch, &head)
+            .await
+            .map_err(|e| Stop::Failed(S::Checking, e))?;
         let mut reasons = restart_reasons(&v.files);
         match v.fingerprint {
             Ok(fp) if fp.trim() == self.contract => {}
@@ -1818,6 +1905,12 @@ impl Pipeline {
         can_merge(clone, &ctx.base, &head)
             .await
             .map_err(|e| Stop::Failed(S::Switching, format!("fusion impossible : {e}")))?;
+        // Garde rejouée juste avant la bascule (build et tests partagent le
+        // `node_modules` du clone) : la branche doit toujours pointer sur la
+        // tête testée.
+        self.guard_tested(ctx, &req.branch, &head)
+            .await
+            .map_err(|e| Stop::Failed(S::Checking, e))?;
         // Plus d'annulation à partir d'ici : la bascule va au bout.
         rep.emit(S::Switching, None);
         rep.note(
@@ -2370,13 +2463,15 @@ async fn can_merge(clone: &Path, base: &str, head: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `git merge --ff-only` de `branch` dans le main du clone, si les conditions
-/// tiennent toujours ; vérifie que main vaut ensuite `head`.
-async fn merge(clone: &Path, base: &str, branch: &str, head: &str) -> Result<(), String> {
+/// `git merge --ff-only` du commit testé `head` (pas de la tête de `_branch`,
+/// qui a pu bouger) dans le main du clone, si les conditions tiennent
+/// toujours ; vérifie que main vaut ensuite `head`.
+async fn merge(clone: &Path, base: &str, _branch: &str, head: &str) -> Result<(), String> {
     can_merge(clone, base, head)
         .await
         .map_err(|e| format!("{e} : fusion abandonnée"))?;
-    git(clone, &["merge", "--ff-only", "-q", branch]).await?;
+    // Le commit testé, pas la tête de la branche (qui a pu bouger).
+    git(clone, &["merge", "--ff-only", "-q", head]).await?;
     if resolve(clone, "refs/heads/main").await.as_deref() != Some(head) {
         return Err("main ne pointe pas sur la tête de la branche après la fusion".into());
     }

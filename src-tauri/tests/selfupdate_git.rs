@@ -28,17 +28,39 @@ use orchestrator_lib::selfupdate::{
 
 // --- Outils de test -----------------------------------------------------------
 
+/// Charge du binaire de test : chaque test la prend en lecture (via
+/// [`TempRoot::new`]) ; une mesure de latence la prend en écriture
+/// ([`TempRoot::exclusive`]) et tourne donc seule, sans dépendre de la
+/// saturation de la machine par les autres tests (processus git en rafale).
+static LOAD: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+enum LoadGuard {
+    Shared(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
+    Exclusive(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>),
+}
+
 /// Dossier temporaire d'un test, supprimé au drop (même après un échec).
-struct TempRoot(PathBuf);
+struct TempRoot(PathBuf, #[allow(dead_code)] LoadGuard);
 
 impl TempRoot {
     fn new(name: &str) -> Self {
+        let g = LOAD.read().unwrap_or_else(|e| e.into_inner());
+        Self::with(name, LoadGuard::Shared(g))
+    }
+
+    /// Comme [`TempRoot::new`], seul test en cours (mesure de latence).
+    fn exclusive(name: &str) -> Self {
+        let g = LOAD.write().unwrap_or_else(|e| e.into_inner());
+        Self::with(name, LoadGuard::Exclusive(g))
+    }
+
+    fn with(name: &str, guard: LoadGuard) -> Self {
         let d = std::env::temp_dir().join(format!("orch-c-{name}-{}", std::process::id()));
         if d.exists() {
             let _ = std::fs::remove_dir_all(&d);
         }
         std::fs::create_dir_all(&d).unwrap();
-        TempRoot(d)
+        TempRoot(d, guard)
     }
 }
 
@@ -284,6 +306,8 @@ struct FakeToolchain {
     tests: Mutex<Vec<TestCall>>,
     installs: Mutex<Vec<PathBuf>>,
     on_build: Hook,
+    /// Action pendant les tests (reçoit le dossier des tests).
+    on_test: Hook,
 }
 
 impl FakeToolchain {
@@ -295,6 +319,7 @@ impl FakeToolchain {
             tests: Mutex::new(Vec::new()),
             installs: Mutex::new(Vec::new()),
             on_build: None,
+            on_test: None,
         }
     }
 
@@ -310,8 +335,9 @@ enum TestStep {
     Ok,
     /// Échec avec cette sortie (`{TREE}` : dossier des tests).
     Fail(String),
-    /// Ne finit jamais (abandon par un message).
-    Hang,
+    /// Vrai processus sous Job Object, dossier courant = dossier des tests
+    /// (il le tient ouvert), qui ne finit jamais (abandon par un message).
+    HangProcess,
 }
 
 fn list_rel(root: &Path, sub: &str) -> Vec<String> {
@@ -351,12 +377,30 @@ impl Toolchain for FakeToolchain {
                 list_rel(tree, "e2e"),
                 spec.replace('\r', ""),
             ));
+            if let Some(f) = &self.on_test {
+                f(tree);
+            }
             let step = self.script.lock().unwrap().pop_front();
             match step {
                 Some(TestStep::Ok) => Ok(()),
                 Some(TestStep::Fail(text)) => Err(text.replace("{TREE}", &tree.to_string_lossy())),
-                Some(TestStep::Hang) => {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                Some(TestStep::HangProcess) => {
+                    let mut c = if cfg!(windows) {
+                        let mut c = orchestrator_lib::selfupdate::git::command("cmd");
+                        c.args(["/C", "ping", "-n", "600", "127.0.0.1"]);
+                        c
+                    } else {
+                        let mut c = orchestrator_lib::selfupdate::git::command("sleep");
+                        c.arg("600");
+                        c
+                    };
+                    c.current_dir(tree);
+                    let _ = orchestrator_lib::selfupdate::git::run(
+                        c,
+                        Duration::from_secs(3600),
+                        "attente",
+                    )
+                    .await;
                     Ok(())
                 }
                 None if self.tests_ok => Ok(()),
@@ -2800,6 +2844,13 @@ struct TurnHost {
     started: Mutex<Vec<Instant>>,
     interrupt: tokio::sync::Notify,
     switch_ok: bool,
+    /// Porte armée dans `session_stopped` (après le tour, avant la garde) et
+    /// dans `wait_idle` (entre les tests et la bascule) : signale `reached`
+    /// puis attend `release`, une fois chacune.
+    gate_stopped: std::sync::atomic::AtomicBool,
+    gate_idle: std::sync::atomic::AtomicBool,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl TurnHost {
@@ -2911,6 +2962,20 @@ impl PipelineHost for TurnHost {
     fn session_stopped(&self) -> BoxFut<'_, ()> {
         Box::pin(async move {
             self.stopped.fetch_add(1, Ordering::SeqCst);
+            if self.gate_stopped.swap(false, Ordering::SeqCst) {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+        })
+    }
+
+    fn wait_idle(&self) -> BoxFut<'_, Result<(), CoreError>> {
+        Box::pin(async move {
+            if self.gate_idle.swap(false, Ordering::SeqCst) {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
         })
     }
 }
@@ -3292,14 +3357,16 @@ async fn git_config_modified_on_turn_two_fails_without_feedback() {
 /// 1 s et lance un nouveau tour.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_during_testing_aborts_tests_and_starts_a_turn() {
-    let root = TempRoot::new("j16-abort");
+    // Mesure de latence : seul test en cours.
+    let root = TempRoot::exclusive("j16-abort");
     let (cfg, _, _) = ready_clone(&root).await;
     let host = Arc::new(TurnHost::new(vec![
         turn(vec![("src/a.txt", "a\n")]),
         turn(vec![("src/b.txt", "b\n")]),
     ]));
     let tc = Arc::new(FakeToolchain::new());
-    tc.script.lock().unwrap().push_back(TestStep::Hang);
+    // Vrai processus sous Job, qui tient le dossier des tests.
+    tc.script.lock().unwrap().push_back(TestStep::HangProcess);
     let p = j16_pipeline(&root, &cfg, host.clone(), tc.clone());
     let req = p.request("abandon").unwrap();
     let (task, log) = spawn_cycle(&p, &req);
@@ -3321,15 +3388,29 @@ async fn message_during_testing_aborts_tests_and_starts_a_turn() {
     assert_eq!(host.calls()[1], ("change plutôt b".to_string(), true));
     let out = finished(task).await;
     assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
-    assert_eq!(tc.tests.lock().unwrap().len(), 2);
-    assert_eq!(host.notes_with("improve.aborted").len(), 1);
-    // Worktree des tests abandonnés supprimé.
-    assert!(!root
-        .join("work")
-        .join(".tests")
-        .read_dir()
+    let trees: Vec<PathBuf> = tc
+        .tests
+        .lock()
         .unwrap()
-        .any(|_| true));
+        .iter()
+        .map(|t| t.0.clone())
+        .collect();
+    assert_eq!(trees.len(), 2);
+    assert_ne!(trees[0], trees[1], "un worktree de tests par passage");
+    assert_eq!(host.notes_with("improve.aborted").len(), 1);
+    // Worktrees des tests supprimés (celui des tests abandonnés au passage
+    // suivant, sinon par le nettoyage).
+    let tests_root = root.join("work").join(".tests");
+    let mut empty = false;
+    for _ in 0..50 {
+        p.cleanup_merged().await;
+        if !tests_root.read_dir().unwrap().any(|_| true) {
+            empty = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(empty, "worktrees de tests restés");
     // Plus de message une fois le cycle fini.
     assert!(p.send(&req.id, "trop tard").await.is_err());
 }
@@ -3452,4 +3533,173 @@ async fn out_of_scope_file_is_fed_back_and_fixed() {
         calls[1].0
     );
     assert_eq!(tc.tests.lock().unwrap().len(), 1, "pas de tests au tour 1");
+}
+
+/// Relecture 1 : la garde est rejouée après les tests et après le build
+/// (`node_modules` du clone partagé, fichiers de l'app) : violation fatale,
+/// sans retour à la session ni fusion.
+#[tokio::test]
+async fn guard_replayed_after_tests_and_build() {
+    let root = TempRoot::new("j16-guard-tests");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    // Les tests modifient le node_modules du clone.
+    let lock = cfg.dir.join("node_modules").join(".package-lock.json");
+    let target = lock.clone();
+    let mut tc = FakeToolchain::new();
+    tc.on_test = Some(Box::new(move |_| {
+        std::fs::write(&target, "{\"par les tests\":1}").unwrap()
+    }));
+    let host = Arc::new(TurnHost::new(vec![turn(vec![("src/a.txt", "a\n")])]));
+    let p = j16_pipeline(&root, &cfg, host.clone(), Arc::new(tc));
+    let req = p.request("tests").unwrap();
+    let (task, _) = spawn_cycle(&p, &req);
+    let out = finished(task).await;
+    assert_refused(&out, "node_modules");
+    assert_eq!(host.calls().len(), 1, "rien de renvoyé à la session");
+    assert_eq!(main_of(&cfg), c1);
+    std::fs::remove_file(&lock).unwrap();
+
+    // Le build modifie config.json.
+    let conf = root.join("config.json");
+    let target = conf.clone();
+    let mut tc = FakeToolchain::new();
+    tc.on_build = Some(Box::new(move |_| std::fs::write(&target, "{}").unwrap()));
+    let host = Arc::new(TurnHost::new(vec![turn(vec![("src/b.txt", "b\n")])]));
+    let p = j16_pipeline(&root, &cfg, host.clone(), Arc::new(tc));
+    let req = p.request("build").unwrap();
+    let (task, log) = spawn_cycle(&p, &req);
+    let out = finished(task).await;
+    assert_refused(&out, "config.json");
+    assert_eq!(host.calls().len(), 1);
+    assert_eq!(main_of(&cfg), c1);
+    assert!(
+        !steps(&log).contains(&ImproveStep::Switching),
+        "jamais activée"
+    );
+}
+
+/// Relecture 5 : un commit arrivé après les tests (pendant le build) n'est
+/// ni activé ni fusionné.
+#[tokio::test]
+async fn commit_after_tests_is_never_merged() {
+    let root = TempRoot::new("j16-moved");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    let mut tc = FakeToolchain::new();
+    tc.on_build = Some(Box::new(|wt| {
+        write(wt, "src/tard.txt", "x\n");
+        sh(wt, &["add", "--", "src/tard.txt"]);
+        sh(wt, &["commit", "-q", "-m", "tard", "--", "src/tard.txt"]);
+    }));
+    let host = Arc::new(TurnHost::new(vec![turn(vec![("src/a.txt", "a\n")])]));
+    let p = j16_pipeline(&root, &cfg, host.clone(), Arc::new(tc));
+    let req = p.request("commit tardif").unwrap();
+    let (task, log) = spawn_cycle(&p, &req);
+    let out = finished(task).await;
+    assert_refused(&out, "a bougé après les tests");
+    assert_eq!(main_of(&cfg), c1);
+    assert!(!steps(&log).contains(&ImproveStep::Switching));
+    assert_eq!(host.calls().len(), 1);
+}
+
+/// Relecture 5 : entre les tests et la bascule, ni message, ni « Valider »,
+/// ni interruption ; le cycle fusionne la tête testée.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_accepted_between_tests_and_switch() {
+    let root = TempRoot::new("j16-closed");
+    let (cfg, _, _) = ready_clone(&root).await;
+    let host = Arc::new(TurnHost::new(vec![turn(vec![("src/a.txt", "a\n")])]));
+    host.gate_idle.store(true, Ordering::SeqCst);
+    let p = j16_pipeline(&root, &cfg, host.clone(), Arc::new(FakeToolchain::new()));
+    let req = p.request("fermé").unwrap();
+    let (task, log) = spawn_cycle(&p, &req);
+    tokio::time::timeout(Duration::from_secs(600), host.reached.notified())
+        .await
+        .expect("attente du repos atteinte");
+    assert_eq!(
+        last_step(&log.lock().unwrap()),
+        Some(ImproveStep::WaitingIdle)
+    );
+    assert!(p.send(&req.id, "encore une chose").await.is_err());
+    assert!(p.validate(&req.id).await.is_err());
+    assert!(p.interrupt(&req.id).await.is_err());
+    host.release.notify_one();
+    let out = finished(task).await;
+    let ImproveOutcome::Merged { commit } = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(main_of(&cfg), commit);
+    assert_eq!(host.calls().len(), 1);
+}
+
+/// Relecture 4 : une interruption après la fin réelle du tour (pendant
+/// l'arrêt de la session et la garde) est refusée et ne marque pas le tour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_after_turn_end_is_refused() {
+    let root = TempRoot::new("j16-late-int");
+    let (cfg, _, _) = ready_clone(&root).await;
+    let host = Arc::new(TurnHost::new(vec![turn(vec![("src/a.txt", "a\n")])]));
+    host.gate_stopped.store(true, Ordering::SeqCst);
+    let p = j16_pipeline(&root, &cfg, host.clone(), Arc::new(FakeToolchain::new()));
+    let req = p.request("tard").unwrap();
+    let (task, log) = spawn_cycle(&p, &req);
+    tokio::time::timeout(Duration::from_secs(600), host.reached.notified())
+        .await
+        .expect("fin du tour atteinte");
+    assert!(p.interrupt(&req.id).await.is_err(), "tour déjà fini");
+    host.release.notify_one();
+    let out = finished(task).await;
+    assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
+    assert!(!steps(&log).contains(&ImproveStep::AwaitingUser));
+}
+
+/// Relecture 5 (critère 4) : la garde arrête le cycle aussi après un tour
+/// sans commit, un tour interrompu, ou un tour suivi d'un message en file
+/// (jamais livré).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guard_violation_on_no_commit_interrupted_and_queued_turns() {
+    let root = TempRoot::new("j16-guard-cases");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    let hook = cfg.dir.join(".git").join("hooks").join("post-commit");
+    for case in ["sans commit", "interrompu", "message en file"] {
+        let h = hook.clone();
+        let extra: Hook = Some(Box::new(move |_| {
+            std::fs::write(&h, "#!/bin/sh\n").unwrap();
+        }));
+        let t = match case {
+            "sans commit" => Turn {
+                files: Vec::new(),
+                extra,
+                end: TurnScript::Done,
+            },
+            _ => Turn {
+                files: vec![("src/a.txt", "a\n")],
+                extra,
+                end: TurnScript::UntilInterrupt,
+            },
+        };
+        let host = Arc::new(TurnHost::new(vec![t]));
+        let tc = Arc::new(FakeToolchain::new());
+        let p = j16_pipeline(&root, &cfg, host.clone(), tc.clone());
+        let req = p.request(case).unwrap();
+        let (task, _) = spawn_cycle(&p, &req);
+        if case != "sans commit" {
+            assert!(wait_cond(600, || host.calls().len() == 1).await);
+            if case == "message en file" {
+                p.send(&req.id, "jamais livré").await.unwrap();
+            }
+            p.interrupt(&req.id).await.unwrap();
+        }
+        let out = finished(task).await;
+        match &out {
+            ImproveOutcome::Failed {
+                step: ImproveStep::Checking,
+                reason,
+            } => assert!(reason.contains("hooks"), "{case} : {reason}"),
+            other => panic!("{case} : {other:?}"),
+        }
+        assert_eq!(host.calls().len(), 1, "{case}");
+        assert!(tc.tests.lock().unwrap().is_empty(), "{case}");
+        assert_eq!(main_of(&cfg), c1);
+        std::fs::remove_file(&hook).unwrap();
+    }
 }

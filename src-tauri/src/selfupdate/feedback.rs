@@ -36,67 +36,162 @@ impl Redactions {
         Redactions::default()
     }
 
-    /// Remplace `path` (et ses variantes `/`, `\`, `\\`, casse ASCII
-    /// ignorée) par `by`. Chemin vide ou trop court (racine) : ignoré.
+    /// Remplace `path` par `by`, sous toutes ses formes : séparateurs `\`,
+    /// `/`, `\\` (JSON) ou mélangés, casse ASCII ignorée. Chemin vide ou
+    /// trop court (racine) : ignoré.
     pub fn add(mut self, path: &Path, by: &str) -> Self {
         let s = path.to_string_lossy();
         let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
-        let s = s.trim_end_matches(['/', '\\']);
-        if s.len() < 4 {
+        let s = s.trim_end_matches(['/', '\\']).replace('\\', "/");
+        if s.len() < 4 || self.pairs.iter().any(|(p, _)| p.eq_ignore_ascii_case(&s)) {
             return self;
         }
-        let back = s.replace('/', "\\");
-        let fwd = s.replace('\\', "/");
-        let dbl = back.replace('\\', "\\\\");
-        for v in [back, fwd, dbl] {
-            if !self.pairs.iter().any(|(p, _)| p.eq_ignore_ascii_case(&v)) {
-                self.pairs.push((v, by.to_string()));
-            }
-        }
+        self.pairs.push((s, by.to_string()));
         self.pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         self
     }
 
-    /// `text` avec les chemins remplacés.
+    /// `text` avec les chemins remplacés, puis tout dossier d'utilisateur
+    /// restant (`C:\Users\<nom>`, forme courte 8.3 comprise) remplacé par `~`.
     pub fn apply(&self, text: &str) -> String {
         let mut out = text.to_string();
         for (p, by) in &self.pairs {
-            out = replace_ascii_ci(&out, p, by);
+            out = replace_path(&out, p, by);
         }
-        out
+        mask_user_dirs(&out)
     }
 }
 
-/// Remplace toutes les occurrences de `needle` (casse ASCII ignorée : les
-/// chemins Windows) par `by`.
-fn replace_ascii_ci(hay: &str, needle: &str, by: &str) -> String {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return hay.to_string();
+const BACKSLASH: u8 = 0x5c;
+
+/// Caractères qui terminent un nom d'utilisateur dans un chemin.
+const NAME_END: &[u8] = b" \t\n\"':;,()[]<>|";
+
+fn is_sep(b: u8) -> bool {
+    b == b'/' || b == BACKSLASH
+}
+
+/// Longueur de l'occurrence de `needle` (séparateurs `/`) au début de `h` :
+/// un séparateur de `needle` accepte `/`, `\` ou `\\`, le reste est comparé
+/// sans casse ASCII.
+fn path_match(h: &[u8], needle: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    for &n in needle {
+        if n == b'/' {
+            if !h.get(i).copied().is_some_and(is_sep) {
+                return None;
+            }
+            i += 1;
+            if h[i - 1] == BACKSLASH && h.get(i) == Some(&BACKSLASH) {
+                i += 1;
+            }
+        } else {
+            if !h.get(i).is_some_and(|c| c.eq_ignore_ascii_case(&n)) {
+                return None;
+            }
+            i += 1;
+        }
     }
+    Some(i)
+}
+
+/// Remplace toutes les occurrences du chemin `needle` (voir [`path_match`])
+/// par `by`.
+fn replace_path(hay: &str, needle: &str, by: &str) -> String {
     let h = hay.as_bytes();
     let n = needle.as_bytes();
     let mut out = String::with_capacity(hay.len());
     let mut last = 0;
     let mut i = 0;
-    while i + n.len() <= h.len() {
-        if h[i..i + n.len()].eq_ignore_ascii_case(n)
-            && hay.is_char_boundary(i)
-            && hay.is_char_boundary(i + n.len())
-        {
-            out.push_str(&hay[last..i]);
-            out.push_str(by);
-            i += n.len();
-            last = i;
-        } else {
-            i += 1;
+    while i < h.len() {
+        match path_match(&h[i..], n) {
+            Some(len) if hay.is_char_boundary(i) && hay.is_char_boundary(i + len) => {
+                out.push_str(&hay[last..i]);
+                out.push_str(by);
+                i += len;
+                last = i;
+            }
+            _ => i += 1,
         }
     }
     out.push_str(&hay[last..]);
     out
 }
 
+/// Remplace par `~` tout `<lecteur>:\Users\<nom>` (ou `/Users/<nom>`,
+/// `/c/Users/<nom>`, séparateurs quelconques), y compris un nom court 8.3
+/// (`MMEDAR~1`) : le dossier personnel n'apparaît sous aucune forme.
+fn mask_user_dirs(text: &str) -> String {
+    let h = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < h.len() {
+        // `<sep>users<sep>`
+        let hit = is_sep(h[i])
+            && h.len() >= i + 7
+            && h[i + 1..i + 6].eq_ignore_ascii_case(b"users")
+            && is_sep(h[i + 6]);
+        if !hit {
+            i += 1;
+            continue;
+        }
+        let mut start = i;
+        // Séparateur doublé avant `users` (JSON).
+        if start > 0 && h[start] == BACKSLASH && h[start - 1] == BACKSLASH {
+            start -= 1;
+        }
+        // Lecteur `C:` ou `/c` juste avant ; sinon `users` doit être à la
+        // racine du chemin (`src/users/x` n'est pas un dossier d'utilisateur).
+        let pathish = |b: u8| b.is_ascii_alphanumeric() || b"._-~$".contains(&b) || is_sep(b);
+        let drive = start >= 2 && h[start - 1] == b':' && h[start - 2].is_ascii_alphabetic();
+        let msys_drive = start >= 2
+            && h[start - 1].is_ascii_alphabetic()
+            && h[start - 2] == b'/'
+            && (start == 2 || !pathish(h[start - 3]));
+        if drive || msys_drive {
+            start -= 2;
+        } else if start > 0 && pathish(h[start - 1]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 7;
+        if h[j - 1] == BACKSLASH && h.get(j) == Some(&BACKSLASH) {
+            j += 1;
+        }
+        let name_start = j;
+        while j < h.len() && !is_sep(h[j]) && !NAME_END.contains(&h[j]) {
+            j += 1;
+        }
+        if j == name_start || !text.is_char_boundary(start) || !text.is_char_boundary(j) {
+            i += 1;
+            continue;
+        }
+        out.push_str(&text[last..start]);
+        out.push('~');
+        last = j;
+        i = j;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Texte sans séquences ANSI (CSI, OSC, autres échappements) ni caractères
 /// de contrôle ; `\r\n` et `\r` deviennent `\n`, la tabulation est gardée.
+/// Saute une séquence CSI (paramètres puis octet final 0x40–0x7E) ; non
+/// terminée, elle s'arrête à la fin de la ligne (saut de ligne gardé).
+fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut String) {
+    for d in chars.by_ref() {
+        if d == '\n' {
+            out.push(d);
+            return;
+        }
+        if ('\u{40}'..='\u{7e}').contains(&d) {
+            return;
+        }
+    }
+}
+
 pub fn strip_control(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -104,18 +199,20 @@ pub fn strip_control(text: &str) -> String {
         match c {
             '\u{1b}' => match chars.peek() {
                 // CSI : paramètres puis un octet final 0x40–0x7E.
+                // Séquence non terminée : coupée jusqu'à la fin de la ligne
+                // seulement (le saut de ligne est gardé).
                 Some('[') => {
                     chars.next();
-                    for d in chars.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&d) {
-                            break;
-                        }
-                    }
+                    skip_csi(&mut chars, &mut out);
                 }
-                // OSC : jusqu'à BEL ou ESC \.
+                // OSC : jusqu'à BEL ou ESC \ (ou la fin de la ligne).
                 Some(']') => {
                     chars.next();
                     while let Some(d) = chars.next() {
+                        if d == '\n' {
+                            out.push(d);
+                            break;
+                        }
                         if d == '\u{7}' {
                             break;
                         }
@@ -134,13 +231,7 @@ pub fn strip_control(text: &str) -> String {
                 None => {}
             },
             // CSI sur 8 bits.
-            '\u{9b}' => {
-                for d in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&d) {
-                        break;
-                    }
-                }
-            }
+            '\u{9b}' => skip_csi(&mut chars, &mut out),
             '\r' => {
                 if chars.peek() != Some(&'\n') {
                     out.push('\n');
@@ -283,6 +374,47 @@ fn cut_bytes(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unterminated_sequences_cut_to_end_of_line_only() {
+        assert_eq!(strip_control("a\u{1b}[31\nb\nc"), "a\nb\nc");
+        assert_eq!(strip_control("a\u{1b}]0;titre\nb"), "a\nb");
+        assert_eq!(strip_control("a\u{9b}12\nb"), "a\nb");
+        assert_eq!(strip_control("fin\u{1b}["), "fin");
+    }
+
+    #[test]
+    fn mixed_separators_and_json_escapes() {
+        let r = Redactions::new().add(
+            Path::new(r"C:\Users\moi\AppData\Local\orchestrator\work\auto\x"),
+            ".",
+        );
+        for t in [
+            r"C:\Users\moi/AppData\Local/orchestrator\work/auto\x/src/a.ts",
+            r"c:/USERS/MOI/appdata/local/orchestrator/work/auto/x/src/a.ts",
+            r"C:\\Users\\moi\\AppData\\Local\\orchestrator\\work\\auto\\x/src/a.ts",
+        ] {
+            assert_eq!(r.apply(t), "./src/a.ts", "{t}");
+        }
+    }
+
+    #[test]
+    fn any_user_dir_is_masked_including_short_names() {
+        let r = Redactions::new();
+        assert_eq!(
+            r.apply(r"at C:\Users\MMEDAR~1\AppData\x.js"),
+            r"at ~\AppData\x.js"
+        );
+        assert_eq!(
+            r.apply("voir C:/Users/autre/p et /c/Users/moi/q"),
+            "voir ~/p et ~/q"
+        );
+        assert_eq!(r.apply(r#"{"p":"C:\\Users\\moi\\a"}"#), r#"{"p":"~\\a"}"#);
+        assert_eq!(r.apply("/Users/moi/x (mac)"), "~/x (mac)");
+        // Pas un dossier d'utilisateur.
+        assert_eq!(r.apply("src/users/list.ts"), "src/users/list.ts");
+        assert_eq!(r.apply("UserService"), "UserService");
+    }
 
     #[test]
     fn strips_ansi_and_controls() {
