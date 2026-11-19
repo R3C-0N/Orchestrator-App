@@ -1394,16 +1394,20 @@ export class MockSelfUpdate {
       this.#after(S, () => {
         this.#set({ step: "switching" });
         this.#note("Info", "improve.switching", "✻ Bascule vers la nouvelle interface…");
-        this.#after(S, () => {
-          this.info.previous_hash = this.info.active_hash;
-          this.info.active_hash = c.commit;
-          this.info.source = "disk";
-          this.#set({ step: "merged" });
-          this.#note("Info", "improve.merged", `✓ Fusionné ${c.commit}`);
-          this.#push();
-        });
+        this.#after(S, () => this.#merged());
       });
     });
+  }
+
+  /** Après la bascule (« prêt » reçu) : fusion fast-forward, puis envoi éventuel. */
+  #merged(): void {
+    const c = this.#cycle!;
+    this.info.previous_hash = this.info.active_hash;
+    this.info.active_hash = c.commit;
+    this.info.source = "disk";
+    this.#set({ step: "merged" });
+    this.#note("Info", "improve.merged", `✓ Fusionné ${c.commit}`);
+    this.#push();
   }
 
   /** Envoi simulé de la branche après la fusion (propriétaire) : « en cours », puis son issue une étape plus tard. */
@@ -1478,8 +1482,11 @@ export class MockSelfUpdate {
         break;
       case "building":
       case "waiting_idle":
-      case "switching":
         this.#after(S, () => this.#passed());
+        break;
+      case "switching":
+        // La bascule recharge l'interface : la nouvelle page voit la fusion.
+        this.#after(S, () => this.#merged());
         break;
       default:
         break;
