@@ -3,13 +3,18 @@
 //! `PipelineHost` et une `Toolchain` simulés. Aucun accès réseau. Chaque test
 //! nettoie son dossier, même en cas d'échec (garde `Drop`).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use orchestrator_lib::api::types::{CoreError, ImproveStatus, ImproveStep, RepoStatus};
+use orchestrator_lib::api::events::NoticeLevel;
+use orchestrator_lib::api::types::{
+    CoreError, ImproveStatus, ImproveStep, ImproveWaiting, RepoStatus,
+};
+use orchestrator_lib::selfupdate::feedback::MAX_FEEDBACK_BYTES;
 use orchestrator_lib::selfupdate::pipeline::{
     recover_interrupted_session, NpmToolchain, Toolchain, IMPROVE_LOCK,
 };
@@ -18,6 +23,7 @@ use orchestrator_lib::selfupdate::repo::{
 };
 use orchestrator_lib::selfupdate::{
     BoxFut, ImproveOutcome, ImproveRequest, Pipeline, PipelineHost, RepoConfig, StatusSink,
+    TurnEnd, MAX_AUTO_ATTEMPTS,
 };
 
 // --- Outils de test -----------------------------------------------------------
@@ -273,6 +279,8 @@ type TestCall = (PathBuf, bool, Vec<String>, String);
 struct FakeToolchain {
     contract: String,
     tests_ok: bool,
+    /// Issues des appels successifs de `test` (jalon J16), avant `tests_ok`.
+    script: Mutex<VecDeque<TestStep>>,
     tests: Mutex<Vec<TestCall>>,
     installs: Mutex<Vec<PathBuf>>,
     on_build: Hook,
@@ -283,6 +291,7 @@ impl FakeToolchain {
         FakeToolchain {
             contract: CONTRACT.into(),
             tests_ok: true,
+            script: Mutex::default(),
             tests: Mutex::new(Vec::new()),
             installs: Mutex::new(Vec::new()),
             on_build: None,
@@ -295,6 +304,15 @@ impl FakeToolchain {
 }
 
 const CONTRACT: &str = "00c0ffee00c0ffee";
+
+/// Issue d'un appel de `FakeToolchain::test` (jalon J16).
+enum TestStep {
+    Ok,
+    /// Échec avec cette sortie (`{TREE}` : dossier des tests).
+    Fail(String),
+    /// Ne finit jamais (abandon par un message).
+    Hang,
+}
 
 fn list_rel(root: &Path, sub: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -333,10 +351,16 @@ impl Toolchain for FakeToolchain {
                 list_rel(tree, "e2e"),
                 spec.replace('\r', ""),
             ));
-            if self.tests_ok {
-                Ok(())
-            } else {
-                Err("npm test a échoué :\n1 test en échec".into())
+            let step = self.script.lock().unwrap().pop_front();
+            match step {
+                Some(TestStep::Ok) => Ok(()),
+                Some(TestStep::Fail(text)) => Err(text.replace("{TREE}", &tree.to_string_lossy())),
+                Some(TestStep::Hang) => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Ok(())
+                }
+                None if self.tests_ok => Ok(()),
+                None => Err("npm test a échoué :\n1 test en échec".into()),
             }
         })
     }
@@ -1009,16 +1033,34 @@ async fn dirty_tree_and_no_commit_are_refused_and_kept() {
     assert_refused(&out, "arbre non propre");
     assert!(format!("{out:?}").contains("src/oubli.txt"));
 
-    let p = pipeline(
+    // Jalon J16 (décision 1) : un tour sans commit ne lance pas les tests et
+    // attend l'utilisateur ; ici, il annule.
+    let tc = Arc::new(FakeToolchain::new());
+    let p = Arc::new(pipeline(
         &root,
         cfg.clone(),
         Arc::new(success_host(vec![])),
-        Arc::new(FakeToolchain::new()),
-    );
+        tc.clone(),
+    ));
     let empty_req = p.request("rien").unwrap();
-    let (sink, _) = collector();
-    let out = p.run(empty_req.clone(), sink).await.unwrap();
-    assert_refused(&out, "aucun commit");
+    let (sink, log) = collector();
+    let task = {
+        let (p, req) = (p.clone(), empty_req.clone());
+        tokio::spawn(async move { p.run(req, sink).await })
+    };
+    assert!(
+        wait_until(&log, 600, |v| last_step(v)
+            == Some(ImproveStep::AwaitingUser))
+        .await,
+        "{:?}",
+        steps(&log)
+    );
+    let last = log.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last.waiting, Some(ImproveWaiting::NoNewCommit));
+    assert!(tc.tests.lock().unwrap().is_empty(), "pas de tests");
+    p.cancel(&empty_req.id).await.unwrap();
+    let out = task.await.unwrap().unwrap();
+    assert_eq!(out, ImproveOutcome::Cancelled);
     assert_eq!(main_of(&cfg), c1);
 
     // Nettoyage : la branche sans commit est « fusionnée » (égale à main)
@@ -2703,4 +2745,711 @@ async fn app_files_restored_on_failed_session_and_checked_before() {
         prompts,
         "pas de session"
     );
+}
+
+// --- Jalon J16 : conversation avec la session, tours successifs ---------------
+//
+// `TurnHost` simule une session à plusieurs tours (`run_turn`) : chaque tour
+// joue le `Turn` suivant de son script (un commit, une action libre, puis une
+// fin) ; script épuisé : tour sans commit. Les lignes d'état (`note`) et les
+// messages reçus sont consignés.
+
+/// Fin d'un tour simulé.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TurnScript {
+    Done,
+    /// La session s'arrête avant la fin de son tour (erreur de l'hôte).
+    Fail,
+    /// Le tour dure jusqu'à `interrupt_turn` (fin `Interrupted`).
+    UntilInterrupt,
+}
+
+/// Un tour de la session simulée.
+struct Turn {
+    files: Vec<(&'static str, &'static str)>,
+    extra: Hook,
+    end: TurnScript,
+}
+
+fn turn(files: Vec<(&'static str, &'static str)>) -> Turn {
+    Turn {
+        files,
+        extra: None,
+        end: TurnScript::Done,
+    }
+}
+
+fn turn_end(end: TurnScript) -> Turn {
+    Turn {
+        files: Vec::new(),
+        extra: None,
+        end,
+    }
+}
+
+#[derive(Default)]
+struct TurnHost {
+    turns: Mutex<VecDeque<Turn>>,
+    /// (message, resume) de chaque `run_turn`.
+    calls: Mutex<Vec<(String, bool)>>,
+    cwds: Mutex<Vec<PathBuf>>,
+    notes: Mutex<Vec<(NoticeLevel, String, String)>>,
+    /// Appels de `session_stopped` (un par tour).
+    stopped: AtomicUsize,
+    /// Instant de chaque début de tour.
+    started: Mutex<Vec<Instant>>,
+    interrupt: tokio::sync::Notify,
+    switch_ok: bool,
+}
+
+impl TurnHost {
+    fn new(turns: Vec<Turn>) -> Self {
+        TurnHost {
+            turns: Mutex::new(turns.into()),
+            switch_ok: true,
+            ..Default::default()
+        }
+    }
+
+    fn calls(&self) -> Vec<(String, bool)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn notes_with(&self, code: &str) -> Vec<String> {
+        self.notes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.1 == code)
+            .map(|n| n.2.clone())
+            .collect()
+    }
+}
+
+impl PipelineHost for TurnHost {
+    fn run_session<'a>(
+        &'a self,
+        _request: &'a ImproveRequest,
+        _cwd: &'a Path,
+        _prompt: &'a str,
+    ) -> BoxFut<'a, Result<(), CoreError>> {
+        Box::pin(async { panic!("le pipeline J16 passe par run_turn") })
+    }
+
+    fn run_turn<'a>(
+        &'a self,
+        _request: &'a ImproveRequest,
+        cwd: &'a Path,
+        message: &'a str,
+        resume: bool,
+    ) -> BoxFut<'a, Result<TurnEnd, CoreError>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((message.to_string(), resume));
+            self.cwds.lock().unwrap().push(cwd.to_path_buf());
+            self.started.lock().unwrap().push(Instant::now());
+            let t = self.turns.lock().unwrap().pop_front();
+            let Some(t) = t else {
+                return Ok(TurnEnd::Done);
+            };
+            if !t.files.is_empty() {
+                let names: Vec<&str> = t.files.iter().map(|f| f.0).collect();
+                for (rel, content) in &t.files {
+                    write(cwd, rel, content);
+                }
+                let mut args = vec!["add", "--"];
+                args.extend(&names);
+                sh(cwd, &args);
+                let mut args = vec!["commit", "-q", "-m", "tour", "--"];
+                args.extend(&names);
+                sh(cwd, &args);
+            }
+            if let Some(f) = &t.extra {
+                f(cwd);
+            }
+            match t.end {
+                TurnScript::Done => Ok(TurnEnd::Done),
+                TurnScript::Fail => Err(CoreError::Io(
+                    "la session dédiée s'est arrêtée avant la fin de son tour".into(),
+                )),
+                TurnScript::UntilInterrupt => {
+                    self.interrupt.notified().await;
+                    Ok(TurnEnd::Interrupted)
+                }
+            }
+        })
+    }
+
+    fn interrupt_turn(&self) -> BoxFut<'_, Result<(), CoreError>> {
+        Box::pin(async move {
+            self.interrupt.notify_one();
+            Ok(())
+        })
+    }
+
+    fn note(&self, level: NoticeLevel, code: &str, message: &str) {
+        self.notes
+            .lock()
+            .unwrap()
+            .push((level, code.to_string(), message.to_string()));
+    }
+
+    fn switch_ui<'a>(
+        &'a self,
+        _hash: &'a str,
+        _dir: &'a Path,
+    ) -> BoxFut<'a, Result<bool, CoreError>> {
+        Box::pin(async move { Ok(self.switch_ok) })
+    }
+
+    fn rollback_ui(&self) -> BoxFut<'_, Result<(), CoreError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn session_stopped(&self) -> BoxFut<'_, ()> {
+        Box::pin(async move {
+            self.stopped.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+}
+
+fn last_step(v: &[ImproveStatus]) -> Option<ImproveStep> {
+    v.last().map(|s| s.step)
+}
+
+/// Attend (au plus `secs` s) que les statuts émis vérifient `pred`.
+async fn wait_until(
+    log: &Arc<Mutex<Vec<ImproveStatus>>>,
+    secs: u64,
+    pred: impl Fn(&[ImproveStatus]) -> bool,
+) -> bool {
+    let end = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < end {
+        if pred(&log.lock().unwrap()) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    pred(&log.lock().unwrap())
+}
+
+/// Attend (au plus `secs` s) que `cond` soit vrai.
+async fn wait_cond(secs: u64, cond: impl Fn() -> bool) -> bool {
+    let end = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < end {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    cond()
+}
+
+fn j16_pipeline(
+    root: &Path,
+    cfg: &RepoConfig,
+    host: Arc<TurnHost>,
+    tc: Arc<FakeToolchain>,
+) -> Arc<Pipeline> {
+    Arc::new(
+        Pipeline::new(cfg.clone(), host)
+            .with_toolchain(tc)
+            .with_dirs(root.join("work"), root.join("ui"))
+            .with_contract(CONTRACT)
+            .with_config_file(root.join("config.json")),
+    )
+}
+
+type CycleTask = tokio::task::JoinHandle<Result<ImproveOutcome, CoreError>>;
+
+/// Lance un cycle en tâche de fond.
+fn spawn_cycle(
+    p: &Arc<Pipeline>,
+    req: &ImproveRequest,
+) -> (CycleTask, Arc<Mutex<Vec<ImproveStatus>>>) {
+    let (sink, log) = collector();
+    let (p, req) = (p.clone(), req.clone());
+    (tokio::spawn(async move { p.run(req, sink).await }), log)
+}
+
+/// Issue du cycle, au plus 600 s (git est lent sous Windows chargé).
+async fn finished(task: CycleTask) -> ImproveOutcome {
+    tokio::time::timeout(Duration::from_secs(600), task)
+        .await
+        .expect("cycle fini en moins de 600 s")
+        .unwrap()
+        .unwrap()
+}
+
+fn count(log: &[ImproveStatus], step: ImproveStep) -> usize {
+    log.iter().filter(|s| s.step == step).count()
+}
+
+/// Le chemin `p` (toutes formes : `\`, `/`, casse) n'apparaît pas dans `text`.
+fn assert_no_path(text: &str, p: &Path) {
+    let s = p.to_string_lossy().to_lowercase();
+    let t = text.to_lowercase();
+    for v in [s.replace('/', "\\"), s.replace('\\', "/")] {
+        assert!(!t.contains(&v), "chemin {v} présent dans :\n{text}");
+    }
+}
+
+/// Critère 2 : des tests en échec renvoient à la session un retour borné,
+/// sans chemin local ni séquence ANSI ; le tour 2 (reprise) corrige et le
+/// cycle fusionne.
+#[tokio::test]
+async fn failing_tests_are_fed_back_then_fixed_and_merged() {
+    let root = TempRoot::new("j16-feedback");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    let host = Arc::new(TurnHost::new(vec![
+        turn(vec![("src/a.txt", "a\n")]),
+        turn(vec![("src/a.txt", "a corrigé\n")]),
+    ]));
+    let tc = Arc::new(FakeToolchain::new());
+    let p = j16_pipeline(&root, &cfg, host.clone(), tc.clone());
+    let req = p.request("ajouter a").unwrap();
+    let wt = p.worktree_path(&req.branch);
+    let home = PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users".into()));
+    // Sortie de test : ANSI, contrôle, chemins du worktree (formes `\` et
+    // `/`), du worktree de tests et du dossier personnel, 300 lignes.
+    let mut out = String::from(
+        "npm test a échoué :\n\u{1b}[31mFAIL\u{1b}[0m {TREE}\\e2e\\unit\\a.test.ts\r\n",
+    );
+    out.push_str(&format!(
+        "at {} (src/a.ts:1)\n",
+        wt.to_string_lossy().replace('\\', "/")
+    ));
+    for i in 0..300 {
+        out.push_str(&format!(
+            "  ligne {i} {}\\src\\a.ts {}\\.npmrc\u{7}\n",
+            wt.display(),
+            home.display()
+        ));
+    }
+    out.push_str("Tests: 1 failed\n");
+    tc.script
+        .lock()
+        .unwrap()
+        .extend([TestStep::Fail(out), TestStep::Ok]);
+
+    let (task, log) = spawn_cycle(&p, &req);
+    let outcome = finished(task).await;
+    let log = log.lock().unwrap().clone();
+    let ImproveOutcome::Merged { commit } = outcome else {
+        panic!("{outcome:?} / {:?}", log.last())
+    };
+    assert_eq!(main_of(&cfg), commit);
+    assert_eq!(
+        sh(&cfg.dir, &["rev-list", "--count", &format!("{c1}..main")]),
+        "2"
+    );
+    use ImproveStep as S;
+    assert_eq!(
+        log.iter().map(|s| s.step).collect::<Vec<_>>(),
+        [
+            S::Preparing,
+            S::Working,
+            S::Checking,
+            S::Testing,
+            S::Fixing,
+            S::Checking,
+            S::Testing,
+            S::Building,
+            S::WaitingIdle,
+            S::Switching,
+            S::Merged
+        ]
+    );
+    let fixing = log.iter().find(|s| s.step == S::Fixing).unwrap();
+    assert_eq!(
+        (fixing.attempt, fixing.max_attempts, fixing.turn),
+        (1, 3, 1)
+    );
+    assert_eq!(log.last().unwrap().turn, 2);
+    // Deux lancements : le premier avec le prompt, le second en reprise,
+    // dans le même worktree.
+    let calls = host.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(!calls[0].1 && calls[1].1, "{calls:?}");
+    assert!(calls[0].0.contains("ajouter a"));
+    let cwds = host.cwds.lock().unwrap().clone();
+    assert_eq!(cwds, [wt.clone(), wt.clone()]);
+    // Retour d'erreur : en-tête, borné, nettoyé.
+    let fb = &calls[1].0;
+    assert!(
+        fb.starts_with("[Contrôle automatique — tentative 1/3]\nÉtape : tests\n"),
+        "{fb}"
+    );
+    assert!(fb.contains("Raison : npm test a échoué"), "{fb}");
+    assert!(fb.len() <= MAX_FEEDBACK_BYTES, "{} octets", fb.len());
+    assert!(
+        fb.contains("Tests: 1 failed") && fb.contains("tronquée"),
+        "{fb}"
+    );
+    assert!(fb.contains(".\\src\\a.ts"), "{fb}");
+    assert!(fb.contains("~\\.npmrc"), "{fb}");
+    assert_no_path(fb, &wt);
+    assert_no_path(fb, &root.join("work").join(".tests"));
+    assert_no_path(fb, &home);
+    assert!(
+        !fb.chars().any(|c| c.is_control() && c != '\n' && c != '\t'),
+        "caractère de contrôle dans le retour"
+    );
+    // Garde après chaque tour, lignes d'état lisibles.
+    assert_eq!(host.stopped.load(Ordering::SeqCst), 2);
+    assert_eq!(host.notes_with("improve.guard").len(), 2);
+    assert_eq!(
+        host.notes_with("improve.fault"),
+        ["✗ Tests en échec (tentative 1/3) : erreur renvoyée à la session"]
+    );
+    assert_eq!(
+        host.notes_with("improve.merged"),
+        [format!(
+            "✓ Fusionné {}",
+            log.last().unwrap().commit.clone().unwrap()
+        )]
+    );
+    assert!(!host.notes_with("improve.checking").is_empty());
+}
+
+/// Critère 3 : 4 échecs consécutifs donnent exactement 3 tours `fixing`,
+/// puis l'attente (`attempts_exhausted`) ; un message de l'utilisateur
+/// remet `attempt` à 0 et relance un tour.
+#[tokio::test]
+async fn four_failures_wait_for_user_and_message_resets_attempts() {
+    let root = TempRoot::new("j16-attempts");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    let host = Arc::new(TurnHost::new(vec![
+        turn(vec![("src/a.txt", "1\n")]),
+        turn(vec![("src/a.txt", "2\n")]),
+        turn(vec![("src/a.txt", "3\n")]),
+        turn(vec![("src/a.txt", "4\n")]),
+        turn(vec![("src/a.txt", "5\n")]),
+    ]));
+    let tc = Arc::new(FakeToolchain::new());
+    tc.script
+        .lock()
+        .unwrap()
+        .extend((0..4).map(|i| TestStep::Fail(format!("npm test a échoué :\néchec {i}"))));
+    let p = j16_pipeline(&root, &cfg, host.clone(), tc.clone());
+    let req = p.request("quatre échecs").unwrap();
+    let (task, log) = spawn_cycle(&p, &req);
+    assert!(
+        wait_until(&log, 600, |v| last_step(v)
+            == Some(ImproveStep::AwaitingUser))
+        .await,
+        "{:?}",
+        steps(&log)
+    );
+    {
+        let v = log.lock().unwrap();
+        assert_eq!(count(&v, ImproveStep::Fixing), MAX_AUTO_ATTEMPTS as usize);
+        let last = v.last().unwrap();
+        assert_eq!(last.waiting, Some(ImproveWaiting::AttemptsExhausted));
+        assert_eq!((last.attempt, last.turn), (3, 4));
+        assert!(last.detail.as_deref().unwrap_or("").contains("échec 3"));
+    }
+    assert_eq!(tc.tests.lock().unwrap().len(), 4);
+    assert_eq!(host.calls().len(), 4);
+    assert_eq!(main_of(&cfg), c1);
+    assert!(p.interrupt(&req.id).await.is_err(), "pas de tour en cours");
+    // Le message relance un tour avec `attempt` = 0.
+    p.send(&req.id, "  essaie autrement  ").await.unwrap();
+    let out = finished(task).await;
+    assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
+    let calls = host.calls();
+    assert_eq!(calls.len(), 5);
+    assert_eq!(calls[4], ("essaie autrement".to_string(), true));
+    let v = log.lock().unwrap().clone();
+    let after = v
+        .iter()
+        .rposition(|s| s.step == ImproveStep::AwaitingUser)
+        .unwrap();
+    assert_eq!(v[after + 1].step, ImproveStep::Working);
+    assert_eq!(v[after + 1].attempt, 0);
+    assert_eq!(v[after + 1].waiting, None);
+    assert_eq!(v.last().unwrap().attempt, 0);
+    // Corrections numérotées 1, 2, 3.
+    let fixes: Vec<u32> = v
+        .iter()
+        .filter(|s| s.step == ImproveStep::Fixing)
+        .map(|s| s.attempt)
+        .collect();
+    assert_eq!(fixes, [1, 2, 3]);
+    assert!(calls[3]
+        .0
+        .starts_with("[Contrôle automatique — tentative 3/3]"));
+}
+
+/// Critère 4 (1) : la garde tourne après chaque tour, y compris un tour
+/// sans commit, qui ne lance pas les tests et attend l'utilisateur.
+#[tokio::test]
+async fn guard_after_every_turn_and_no_commit_turn_skips_tests() {
+    let root = TempRoot::new("j16-guard");
+    let (cfg, _, _) = ready_clone(&root).await;
+    let host = Arc::new(TurnHost::new(vec![
+        turn(vec![("src/a.txt", "a\n")]),
+        // Correction sans commit (question posée en texte).
+        turn(Vec::new()),
+        turn(vec![("src/a.txt", "a2\n")]),
+    ]));
+    let tc = Arc::new(FakeToolchain::new());
+    tc.script
+        .lock()
+        .unwrap()
+        .push_back(TestStep::Fail("npm test a échoué :\nx".into()));
+    let p = j16_pipeline(&root, &cfg, host.clone(), tc.clone());
+    let req = p.request("trois tours").unwrap();
+    let (task, log) = spawn_cycle(&p, &req);
+    assert!(
+        wait_until(&log, 600, |v| last_step(v)
+            == Some(ImproveStep::AwaitingUser))
+        .await
+    );
+    assert_eq!(
+        log.lock().unwrap().last().unwrap().waiting,
+        Some(ImproveWaiting::NoNewCommit)
+    );
+    assert_eq!(tc.tests.lock().unwrap().len(), 1, "pas de tests au tour 2");
+    p.send(&req.id, "oui, vas-y").await.unwrap();
+    let out = finished(task).await;
+    assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
+    assert_eq!(host.calls().len(), 3);
+    assert_eq!(tc.tests.lock().unwrap().len(), 2);
+    assert_eq!(host.stopped.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        host.notes_with("improve.guard"),
+        [
+            "✓ Garde de sécurité (tour 1)",
+            "✓ Garde de sécurité (tour 2)",
+            "✓ Garde de sécurité (tour 3)"
+        ]
+    );
+}
+
+/// Critère 4 (2) : `.git/config` modifié au tour 2 (tour de correction) :
+/// `failed`, rien n'est renvoyé à la session, branche non fusionnée.
+#[tokio::test]
+async fn git_config_modified_on_turn_two_fails_without_feedback() {
+    let root = TempRoot::new("j16-gitconf");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    let path = cfg.dir.join(".git").join("config");
+    let host = Arc::new(TurnHost::new(vec![
+        turn(vec![("src/a.txt", "a\n")]),
+        Turn {
+            files: vec![("src/a.txt", "a2\n")],
+            extra: Some(Box::new(move |_| {
+                let mut perm = std::fs::metadata(&path).unwrap().permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                perm.set_readonly(false);
+                std::fs::set_permissions(&path, perm).unwrap();
+                let mut c = std::fs::read(&path).unwrap();
+                c.extend_from_slice(b"[url \"C:/pirate.git\"]\n\tpushInsteadOf = git@\n");
+                std::fs::write(&path, c).unwrap();
+            })),
+            end: TurnScript::Done,
+        },
+    ]));
+    let tc = Arc::new(FakeToolchain::new());
+    tc.script
+        .lock()
+        .unwrap()
+        .push_back(TestStep::Fail("npm test a échoué :\nx".into()));
+    let p = j16_pipeline(&root, &cfg, host.clone(), tc.clone());
+    let req = p.request("config au tour 2").unwrap();
+    let (task, log) = spawn_cycle(&p, &req);
+    let out = finished(task).await;
+    assert_refused(&out, ".git/config");
+    assert_eq!(steps(&log).last(), Some(&ImproveStep::Failed));
+    let calls = host.calls();
+    assert_eq!(calls.len(), 2, "aucun tour après la violation");
+    // Seul retour : celui des tests du tour 1 (le prompt du tour 1 cite la
+    // configuration git dans ses interdits).
+    assert!(calls[1]
+        .0
+        .starts_with("[Contrôle automatique — tentative 1/3]\nÉtape : tests"));
+    assert!(!calls[1].0.contains(".git/config") && !calls[1].0.contains("configuration git"));
+    assert_eq!(
+        tc.tests.lock().unwrap().len(),
+        1,
+        "pas de tests après le tour 2"
+    );
+    assert_eq!(main_of(&cfg), c1);
+    let unmerged = sh(&cfg.dir, &["branch", "--no-merged", "main"]);
+    assert!(
+        unmerged
+            .lines()
+            .any(|l| l.trim_start_matches(['*', '+', ' ']) == req.branch),
+        "{unmerged}"
+    );
+    assert_eq!(host.notes_with("improve.fault").len(), 1);
+    assert_eq!(host.notes_with("improve.failed").len(), 1);
+}
+
+/// Critère 5 : un message pendant `testing` abandonne les tests en moins de
+/// 1 s et lance un nouveau tour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_during_testing_aborts_tests_and_starts_a_turn() {
+    let root = TempRoot::new("j16-abort");
+    let (cfg, _, _) = ready_clone(&root).await;
+    let host = Arc::new(TurnHost::new(vec![
+        turn(vec![("src/a.txt", "a\n")]),
+        turn(vec![("src/b.txt", "b\n")]),
+    ]));
+    let tc = Arc::new(FakeToolchain::new());
+    tc.script.lock().unwrap().push_back(TestStep::Hang);
+    let p = j16_pipeline(&root, &cfg, host.clone(), tc.clone());
+    let req = p.request("abandon").unwrap();
+    let (task, log) = spawn_cycle(&p, &req);
+    assert!(wait_until(&log, 600, |v| last_step(v) == Some(ImproveStep::Testing)).await);
+    assert!(
+        wait_cond(600, || !tc.tests.lock().unwrap().is_empty()).await,
+        "tests en cours"
+    );
+    assert!(
+        p.validate(&req.id).await.is_err(),
+        "« Valider » hors attente"
+    );
+    let t0 = Instant::now();
+    p.send(&req.id, "change plutôt b").await.unwrap();
+    assert!(wait_cond(30, || host.calls().len() == 2).await);
+    let started = host.started.lock().unwrap()[1];
+    let elapsed = started.duration_since(t0);
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(host.calls()[1], ("change plutôt b".to_string(), true));
+    let out = finished(task).await;
+    assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
+    assert_eq!(tc.tests.lock().unwrap().len(), 2);
+    assert_eq!(host.notes_with("improve.aborted").len(), 1);
+    // Worktree des tests abandonnés supprimé.
+    assert!(!root
+        .join("work")
+        .join(".tests")
+        .read_dir()
+        .unwrap()
+        .any(|_| true));
+    // Plus de message une fois le cycle fini.
+    assert!(p.send(&req.id, "trop tard").await.is_err());
+}
+
+/// Message pendant un tour : mis en file et livré comme tour suivant, sans
+/// tests entre les deux ; interruption sans message : attente
+/// (`interrupted`) ; « Valider » relance contrôles et tests sans tour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_message_interrupt_and_validate() {
+    let root = TempRoot::new("j16-queue");
+    let (cfg, _, _) = ready_clone(&root).await;
+    let host = Arc::new(TurnHost::new(vec![
+        Turn {
+            files: vec![("src/a.txt", "a\n")],
+            extra: None,
+            end: TurnScript::UntilInterrupt,
+        },
+        turn_end(TurnScript::UntilInterrupt),
+    ]));
+    let tc = Arc::new(FakeToolchain::new());
+    let p = j16_pipeline(&root, &cfg, host.clone(), tc.clone());
+    let req = p.request("file").unwrap();
+    assert!(p.send("inconnu", "x").await.is_err());
+    let (task, log) = spawn_cycle(&p, &req);
+    assert!(wait_cond(600, || host.calls().len() == 1).await);
+    assert!(
+        p.validate(&req.id).await.is_err(),
+        "« Valider » pendant un tour"
+    );
+    assert!(p.send(&req.id, "   ").await.is_err(), "message vide");
+    p.send(&req.id, "précision").await.unwrap();
+    p.interrupt(&req.id).await.unwrap();
+    // Tour 2 = le message en file, sans tests entre les deux.
+    assert!(wait_cond(600, || host.calls().len() == 2).await);
+    assert_eq!(host.calls()[1], ("précision".to_string(), true));
+    assert!(tc.tests.lock().unwrap().is_empty());
+    // Tour 2 interrompu sans message : attente.
+    p.interrupt(&req.id).await.unwrap();
+    assert!(
+        wait_until(&log, 600, |v| last_step(v)
+            == Some(ImproveStep::AwaitingUser))
+        .await
+    );
+    assert_eq!(
+        log.lock().unwrap().last().unwrap().waiting,
+        Some(ImproveWaiting::Interrupted)
+    );
+    assert!(tc.tests.lock().unwrap().is_empty());
+    assert!(p.interrupt(&req.id).await.is_err(), "pas de tour en cours");
+    // « Valider » : contrôles et tests sur le commit du tour 1.
+    p.validate(&req.id).await.unwrap();
+    let out = finished(task).await;
+    assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
+    assert_eq!(tc.tests.lock().unwrap().len(), 1);
+    assert_eq!(host.calls().len(), 2, "pas de tour pour « Valider »");
+    assert_eq!(host.stopped.load(Ordering::SeqCst), 2);
+}
+
+/// Session arrêtée avant la fin de son tour : attente (`session_stopped`)
+/// sans tests ni tentative ; annulation : branche gardée.
+#[tokio::test]
+async fn stopped_session_waits_without_attempt() {
+    let root = TempRoot::new("j16-stopped");
+    let (cfg, c1, _) = ready_clone(&root).await;
+    let host = Arc::new(TurnHost::new(vec![Turn {
+        files: vec![("src/a.txt", "a\n")],
+        extra: None,
+        end: TurnScript::Fail,
+    }]));
+    let tc = Arc::new(FakeToolchain::new());
+    let p = j16_pipeline(&root, &cfg, host.clone(), tc.clone());
+    let req = p.request("arrêt").unwrap();
+    let (task, log) = spawn_cycle(&p, &req);
+    assert!(
+        wait_until(&log, 600, |v| last_step(v)
+            == Some(ImproveStep::AwaitingUser))
+        .await
+    );
+    let last = log.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last.waiting, Some(ImproveWaiting::SessionStopped));
+    assert_eq!((last.attempt, last.turn), (0, 1));
+    assert!(tc.tests.lock().unwrap().is_empty());
+    p.cancel(&req.id).await.unwrap();
+    let out = finished(task).await;
+    assert_eq!(out, ImproveOutcome::Cancelled);
+    assert_eq!(main_of(&cfg), c1);
+    assert!(p.worktree_path(&req.branch).join("src/a.txt").is_file());
+    assert_eq!(host.notes_with("improve.cancelled").len(), 1);
+}
+
+/// Faute de périmètre corrigible : renvoyée à la session, corrigée au tour
+/// suivant par un commit qui rétablit le fichier.
+#[tokio::test]
+async fn out_of_scope_file_is_fed_back_and_fixed() {
+    let root = TempRoot::new("j16-scope");
+    let (cfg, _, _) = ready_clone(&root).await;
+    let host = Arc::new(TurnHost::new(vec![
+        turn(vec![("src/a.txt", "a\n"), ("README.md", "piraté\n")]),
+        Turn {
+            files: Vec::new(),
+            extra: Some(Box::new(|wt| {
+                write(wt, "README.md", "# app\n");
+                sh(wt, &["commit", "-q", "-m", "rétablit", "--", "README.md"]);
+            })),
+            end: TurnScript::Done,
+        },
+    ]));
+    let tc = Arc::new(FakeToolchain::new());
+    let p = j16_pipeline(&root, &cfg, host.clone(), tc.clone());
+    let req = p.request("périmètre").unwrap();
+    let (task, _log) = spawn_cycle(&p, &req);
+    let out = finished(task).await;
+    // README.md rétabli à l'identique : plus de différence hors périmètre.
+    assert!(matches!(out, ImproveOutcome::Merged { .. }), "{out:?}");
+    let calls = host.calls();
+    assert!(
+        calls[1].0.contains("Étape : contrôles")
+            && calls[1].0.contains("README.md (hors périmètre)"),
+        "{}",
+        calls[1].0
+    );
+    assert_eq!(tc.tests.lock().unwrap().len(), 1, "pas de tests au tour 1");
 }

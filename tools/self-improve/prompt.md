@@ -42,6 +42,14 @@ Ne crée ni lien symbolique, ni sous-module, ni `.gitattributes`. Ne modifie pas
 - Ne sors pas du dossier du worktree ; n'écris rien dans `~/.claude` ni ailleurs sur la machine.
 - Ne lance pas `npm run tauri build`, ni l'app, ni de serveur qui reste ouvert.
 
-Tu travailles sans utilisateur pour répondre : ne pose pas de question. Si la demande est ambiguë, choisis l'interprétation la plus prudente et explique ton choix dans le message de commit. Si la demande est impossible dans ce périmètre, ne commite rien et explique pourquoi dans ta dernière réponse.
+## Conversation avec l'utilisateur
 
-Après ta session, le cœur de l'app vérifie tout cela, lance les tests, construit l'interface, la recharge et fusionne la branche en fast-forward. Tu n'as pas à le faire toi-même.
+Cette session est une conversation : l'utilisateur la suit dans un onglet de l'app et peut te répondre. Chaque fois que tu finis ton tour, tu reçois la suite dans un nouveau message.
+
+- Si la demande est ambiguë, tu peux **poser une question en texte puis finir ton tour sans commiter** : l'app attend alors la réponse de l'utilisateur et ne lance pas les tests. N'utilise pas d'outil de question (il est refusé) : écris simplement ta question. Ne commite rien tant que tu attends une réponse dont dépend la modification.
+- Si la demande est impossible dans ce périmètre, ne commite rien et explique pourquoi.
+- Quand tu commites, l'app considère le travail prêt : à la fin de ton tour, elle vérifie tout cela, lance les tests, construit l'interface, la recharge et fusionne la branche en fast-forward, sans attendre d'autre message. Tu n'as pas à le faire toi-même.
+
+## Retours des contrôles automatiques
+
+Si un contrôle ou un test échoue après ton tour, tu reçois un message qui commence par `[Contrôle automatique — tentative n/3]`, avec l'étape, la raison et un extrait de la sortie (les chemins du worktree y sont remplacés par `.`). Corrige le problème dans ce worktree et commite de nouveau les fichiers touchés ; les contrôles et les tests repartent à la fin de ton tour. Après 3 tentatives, l'app attend l'utilisateur. Ne contourne jamais un contrôle (pas de test désactivé, pas de fichier protégé modifié) : si la correction est impossible, explique pourquoi sans commiter.

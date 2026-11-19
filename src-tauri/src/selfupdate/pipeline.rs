@@ -7,18 +7,23 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
+use super::feedback;
 use super::git::{self, git, git_ok, resolve};
 use super::repo::NO_PUSH_URL;
 use super::{
-    push, repo, BoxFut, ImproveOutcome, ImproveRequest, Pipeline, StatusSink, ALLOWED_DIRS,
-    BRANCH_PREFIX,
+    push, repo, BoxFut, ImproveOutcome, ImproveRequest, Pipeline, PipelineHost, StatusSink,
+    TurnEnd, ALLOWED_DIRS, BRANCH_PREFIX, MAX_AUTO_ATTEMPTS,
 };
-use crate::api::types::{CoreError, ImproveStatus, ImproveStep, PushResult, PushStatus};
+use crate::api::events::NoticeLevel;
+use crate::api::types::{
+    CoreError, ImproveStatus, ImproveStep, ImproveWaiting, PushResult, PushStatus,
+};
 
 /// Prompt versionné de la session dédiée, relu dans le worktree.
 pub const PROMPT_FILE: &str = "tools/self-improve/prompt.md";
@@ -243,7 +248,12 @@ impl NpmToolchain {
         if out.ok {
             Ok(out.stdout)
         } else {
-            Err(format!("{what} a échoué :\n{}", out.tail(20)))
+            // Fin de sortie longue : renvoyée à la session (jalon J16) ; le
+            // statut n'en montre que `feedback::short_detail`.
+            Err(format!(
+                "{what} a échoué :\n{}",
+                out.tail(feedback::MAX_LINES_PER_STEP)
+            ))
         }
     }
 }
@@ -360,10 +370,193 @@ impl Toolchain for NpmToolchain {
     }
 }
 
+/// Délai maximal d'un tour de la session dédiée (jalon J16) : au-delà, le
+/// tour est abandonné (l'hôte arrête la session) et le cycle attend
+/// l'utilisateur (`ImproveWaiting::SessionStopped`).
+pub const TURN_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 /// Cycle en cours (un seul à la fois).
 pub(super) struct Active {
     pub id: String,
     pub cancel: watch::Sender<bool>,
+    /// Messages, « Valider » et interruption de l'onglet d'amélioration.
+    pub(super) ctl: Arc<Control>,
+}
+
+/// Où en est le cycle, pour les commandes de l'onglet (jalon J16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Worktree en préparation : un message est mis en file.
+    Preparing,
+    /// Tour de la session : un message est mis en file et livré au tour
+    /// suivant ; l'interruption est possible.
+    Turn,
+    /// Contrôles ou tests : un message les abandonne.
+    Checking,
+    /// Attente de l'utilisateur : message ou « Valider ».
+    Awaiting,
+    /// Build, bascule, fusion, ou retour arrière : plus de message.
+    Closed,
+}
+
+struct ControlState {
+    phase: Phase,
+    queue: Vec<String>,
+    validate: bool,
+    interrupted: bool,
+}
+
+/// État partagé entre le cycle et les commandes `send`, `validate`,
+/// `interrupt` ; `wake` réveille le cycle en contrôles ou en attente.
+pub(super) struct Control {
+    state: std::sync::Mutex<ControlState>,
+    wake: tokio::sync::Notify,
+}
+
+impl Control {
+    fn new() -> Self {
+        Control {
+            state: std::sync::Mutex::new(ControlState {
+                phase: Phase::Preparing,
+                queue: Vec::new(),
+                validate: false,
+                interrupted: false,
+            }),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ControlState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Messages en file, joints, retirés de la file.
+    fn take_message(&self) -> Option<String> {
+        let mut s = self.lock();
+        if s.queue.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut s.queue).join("\n\n"))
+        }
+    }
+
+    fn has_message(&self) -> bool {
+        !self.lock().queue.is_empty()
+    }
+
+    /// Passe en `phase`, sauf si des messages attendent : ils sont alors
+    /// rendus (et la phase ne change pas, un tour va partir).
+    fn enter(&self, phase: Phase) -> Option<String> {
+        let mut s = self.lock();
+        if !s.queue.is_empty() {
+            return Some(std::mem::take(&mut s.queue).join("\n\n"));
+        }
+        s.phase = phase;
+        s.validate = false;
+        None
+    }
+
+    fn begin_turn(&self) {
+        let mut s = self.lock();
+        s.phase = Phase::Turn;
+        s.validate = false;
+        s.interrupted = false;
+    }
+
+    fn take_validate(&self) -> bool {
+        std::mem::take(&mut self.lock().validate)
+    }
+
+    fn was_interrupted(&self) -> bool {
+        self.lock().interrupted
+    }
+}
+
+/// Échec corrigible (jalon J16) : renvoyé à la session pour correction.
+struct Fault {
+    step: ImproveStep,
+    /// Raison (première ligne) et sortie de la commande en échec (fin
+    /// gardée, `feedback::MAX_LINES_PER_STEP` lignes au plus).
+    text: String,
+}
+
+impl Fault {
+    fn new(step: ImproveStep, text: impl Into<String>) -> Self {
+        Fault {
+            step,
+            text: text.into(),
+        }
+    }
+
+    /// Libellé de l'étape dans le retour à la session.
+    fn label(&self) -> &'static str {
+        match self.step {
+            ImproveStep::Checking => "contrôles",
+            ImproveStep::Testing => "tests",
+            ImproveStep::Building => "build de l'interface (vite build)",
+            ImproveStep::Switching => "bascule de l'interface (signal « prêt »)",
+            _ => "contrôles",
+        }
+    }
+
+    /// Ligne d'état de l'échec.
+    fn headline(&self) -> &'static str {
+        match self.step {
+            ImproveStep::Testing => "Tests en échec",
+            ImproveStep::Building => "Build de l'interface en échec",
+            ImproveStep::Switching => "Interface sans signal « prêt »",
+            _ => "Contrôles en échec",
+        }
+    }
+
+    fn stop(&self) -> Stop {
+        Stop::Failed(self.step, feedback::short_detail(&self.text))
+    }
+}
+
+/// Erreur des contrôles et des tests : corrigible ou non.
+enum VErr {
+    Fault(Fault),
+    Fatal(ImproveStep, String),
+}
+
+/// Contrôles et tests passés.
+struct Verified {
+    files: Vec<String>,
+    head: String,
+    short: String,
+    fingerprint: Result<String, String>,
+}
+
+/// Issue d'un passage contrôles → tests → build → bascule → fusion.
+enum Verdict {
+    Done(ImproveOutcome),
+    /// Abandonné par un message de l'utilisateur (nouveau tour).
+    Message(String),
+    Fault(Fault),
+}
+
+/// Ce que l'utilisateur a fait pendant l'attente.
+enum UserAction {
+    Message(String),
+    Validate,
+}
+
+/// Suite d'un tour.
+enum Next {
+    Wait(ImproveWaiting, Option<String>),
+    Verify,
+}
+
+/// Ce qui est fixe pendant un cycle.
+struct Ctx {
+    clone: PathBuf,
+    wt: PathBuf,
+    tests: PathBuf,
+    common: PathBuf,
+    base: String,
+    snapshot: Snapshot,
+    redact: feedback::Redactions,
 }
 
 /// Ce que le cycle fait après le worktree.
@@ -388,14 +581,27 @@ fn fail(step: ImproveStep) -> impl Fn(String) -> Stop {
 struct Reporter {
     status: ImproveStatus,
     sink: StatusSink,
+    /// Lignes d'état `improve.*` de la conversation du cycle (`None` : retour
+    /// arrière, sans conversation).
+    host: Option<Arc<dyn PipelineHost>>,
 }
 
 impl Reporter {
     fn emit(&mut self, step: ImproveStep, detail: Option<String>) {
         self.status.step = step;
         self.status.detail = detail;
+        if step != ImproveStep::AwaitingUser {
+            self.status.waiting = None;
+        }
         self.status.t = now_ms();
         (self.sink)(self.status.clone());
+    }
+
+    /// Ligne d'état dans la conversation du cycle ([`PipelineHost::note`]).
+    fn note(&self, level: NoticeLevel, code: &str, message: &str) {
+        if let Some(h) = &self.host {
+            h.note(level, code, message);
+        }
     }
 
     /// Réémet l'état courant (même étape), par exemple après l'envoi.
@@ -446,6 +652,34 @@ async fn guarded<T>(
         biased;
         _ = cancelled => Err(Stop::Cancelled),
         v = fut => Ok(v),
+    }
+}
+
+/// Comme [`guarded`], et abandonne aussi `fut` dès qu'un message de
+/// l'utilisateur arrive (`Ok(None)`) : contrôles et tests abandonnés, leurs
+/// processus tués par leur Job Object.
+async fn abortable<T>(
+    cancel: &mut watch::Receiver<bool>,
+    ctl: &Control,
+    fut: impl Future<Output = T>,
+) -> Result<Option<T>, Stop> {
+    tokio::pin!(fut);
+    loop {
+        let cancelled = async {
+            if cancel.wait_for(|c| *c).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancelled => return Err(Stop::Cancelled),
+            _ = ctl.wake.notified() => {
+                if ctl.has_message() {
+                    return Ok(None);
+                }
+            }
+            v = &mut fut => return Ok(Some(v)),
+        }
     }
 }
 
@@ -890,6 +1124,7 @@ impl Pipeline {
         sink: StatusSink,
     ) -> Result<ImproveOutcome, CoreError> {
         let (tx, mut rx) = watch::channel(false);
+        let ctl = Arc::new(Control::new());
         {
             let mut a = self
                 .active
@@ -904,6 +1139,7 @@ impl Pipeline {
             *a = Some(Active {
                 id: request.id.clone(),
                 cancel: tx,
+                ctl: ctl.clone(),
             });
         }
         let _guard = ActiveGuard(&self.active);
@@ -912,6 +1148,10 @@ impl Pipeline {
             Some(c) => Mode::Revert(c),
             None => Mode::Improve,
         };
+        if reverting {
+            // Pas de conversation : ni message, ni « Valider ».
+            ctl.enter(Phase::Closed);
+        }
         let mut rep = Reporter {
             status: ImproveStatus {
                 id: request.id.clone(),
@@ -924,18 +1164,27 @@ impl Pipeline {
                 push: None,
                 t: now_ms(),
                 attempt: 0,
-                max_attempts: super::MAX_AUTO_ATTEMPTS,
+                max_attempts: MAX_AUTO_ATTEMPTS,
                 turn: 0,
                 waiting: None,
             },
             sink,
+            host: (!reverting).then(|| self.host.clone()),
         };
-        let outcome = match self.cycle(&request, &mode, &mut rep, &mut rx).await {
+        let outcome = match self.cycle(&request, &mode, &mut rep, &mut rx, &ctl).await {
             Ok(o) => o,
             Err(Stop::Cancelled) => {
                 rep.emit(
                     ImproveStep::Cancelled,
                     Some("annulée : branche laissée non fusionnée".into()),
+                );
+                rep.note(
+                    NoticeLevel::Warn,
+                    "improve.cancelled",
+                    &format!(
+                        "✗ Amélioration annulée : branche {} gardée non fusionnée",
+                        request.branch
+                    ),
                 );
                 ImproveOutcome::Cancelled
             }
@@ -948,6 +1197,15 @@ impl Pipeline {
                 rep.emit(
                     ImproveStep::Failed,
                     Some(format!("{what} en échec ({step:?}) : {reason}")),
+                );
+                rep.note(
+                    NoticeLevel::Error,
+                    "improve.failed",
+                    &format!(
+                        "✗ Échec ({step:?}) : {} ; branche {} gardée non fusionnée",
+                        reason.lines().next().unwrap_or(""),
+                        request.branch
+                    ),
                 );
                 ImproveOutcome::Failed { step, reason }
             }
@@ -1037,12 +1295,18 @@ impl Pipeline {
         mode: &Mode,
         rep: &mut Reporter,
         cancel: &mut watch::Receiver<bool>,
+        ctl: &Control,
     ) -> Result<ImproveOutcome, Stop> {
         use ImproveStep as S;
         let clone = self.repo.dir.clone();
 
         // --- Préparation : vérifications, worktree, branche, node_modules.
         rep.emit(S::Preparing, None);
+        rep.note(
+            NoticeLevel::Info,
+            "improve.preparing",
+            &format!("✻ Préparation de la branche {}", req.branch),
+        );
         guarded(cancel, self.toolchain.preflight())
             .await?
             .map_err(fail(S::Preparing))?;
@@ -1089,79 +1353,403 @@ impl Pipeline {
             hooks: hooks_in(&common),
             deps: sha256_file(&clone.join("node_modules").join(".package-lock.json")),
         };
+        let tests = self.tests_path(&req.branch);
+        // Chemins locaux retirés du retour d'erreur (le plus précis d'abord).
+        let mut redact = feedback::Redactions::new()
+            .add(&tests, ".")
+            .add(&wt, ".")
+            .add(&clone, "<clone>");
+        if let Some(d) = super::data_dir() {
+            redact = redact.add(&d, "<app>");
+        }
+        if let Some(h) = super::home_dir() {
+            redact = redact.add(&h, "~");
+        }
+        let ctx = Ctx {
+            clone,
+            wt,
+            tests,
+            common,
+            base,
+            snapshot,
+            redact,
+        };
 
-        // --- Session dédiée.
-        if let Mode::Improve = mode {
-            // `config.json` déjà changé depuis le lancement : échec immédiat.
-            self.check_config_file()
-                .map_err(|e| Stop::Failed(S::Preparing, e))?;
-            rep.emit(S::Working, None);
-            let prompt = build_prompt(&wt, req);
-            // `.git/config` en lecture seule pendant la session (rétabli à la
-            // destruction de la garde, erreur ou annulation comprises).
-            // Verrou posé avant : un arrêt brutal pendant la session laisse
-            // de quoi rétablir l'attribut au démarrage suivant.
-            let lock = ActiveLock::create(&common)
-                .map_err(|e| Stop::Failed(S::Working, format!("verrou {IMPROVE_LOCK} : {e}")))?;
-            let ro = ReadOnly::set(&common.join("config")).map_err(|e| {
-                Stop::Failed(S::Working, format!(".git/config en lecture seule : {e}"))
-            })?;
-            let done = guarded(cancel, self.host.run_session(req, &wt, &prompt)).await;
-            // Arrêt effectif de la session (fin ou annulation) avant de
-            // rendre `.git/config` inscriptible et avant les contrôles.
-            self.host.session_stopped().await;
-            drop(ro);
-            drop(lock);
-            // Fichiers de l'app atteignables par la session (`config.json`,
-            // envois en attente) : contrôlés et rétablis après l'arrêt de la
-            // session, qu'elle ait abouti, échoué ou été annulée.
-            match (done, self.check_app_files()) {
-                // Annulée : fichiers rétablis, annulation rapportée.
-                (Err(stop), files) => {
-                    if let Err(e) = files {
-                        tracing::warn!("après la session annulée : {e}");
-                    }
-                    return Err(stop);
+        match mode {
+            Mode::Improve => self.converse(req, &ctx, rep, cancel, ctl).await,
+            // Retour arrière : pas de session, tout échec est définitif.
+            Mode::Revert(_) => {
+                let res = guarded(cancel, self.verify(&ctx, rep)).await;
+                self.remove_tree(&ctx.tests, true).await;
+                let v = match res? {
+                    Ok(v) => v,
+                    Err(VErr::Fault(f)) => return Err(f.stop()),
+                    Err(VErr::Fatal(step, reason)) => return Err(Stop::Failed(step, reason)),
+                };
+                match self.finish(req, mode, &ctx, v, rep, cancel).await? {
+                    Ok(o) => Ok(o),
+                    Err(f) => Err(f.stop()),
                 }
-                (Ok(Ok(())), Err(e)) => return Err(Stop::Failed(S::Checking, e)),
-                (Ok(Err(se)), Err(e)) => {
-                    return Err(Stop::Failed(S::Checking, format!("{e} ; session : {se}")))
-                }
-                (Ok(r), Ok(())) => r.map_err(|e| Stop::Failed(S::Working, e.to_string()))?,
             }
         }
+    }
 
-        // --- Contrôles déterministes.
-        rep.emit(S::Checking, None);
-        let files = guarded(
-            cancel,
-            check(&clone, &wt, &req.branch, &base, &common, &snapshot),
-        )
-        .await?
-        .map_err(fail(S::Checking))?;
-        let head = resolve(&wt, "HEAD")
+    /// Conversation du cycle (jalon J16) : tours de la session, garde après
+    /// chacun, contrôles et tests quand la tête a avancé, corrections
+    /// automatiques (au plus [`MAX_AUTO_ATTEMPTS`]), attente de
+    /// l'utilisateur, jusqu'à la fusion.
+    async fn converse(
+        &self,
+        req: &ImproveRequest,
+        ctx: &Ctx,
+        rep: &mut Reporter,
+        cancel: &mut watch::Receiver<bool>,
+        ctl: &Control,
+    ) -> Result<ImproveOutcome, Stop> {
+        use ImproveStep as S;
+        // `config.json` déjà changé depuis le lancement : échec immédiat.
+        self.check_config_file()
+            .map_err(|e| Stop::Failed(S::Preparing, e))?;
+        let mut message = build_prompt(&ctx.wt, req);
+        // `Some` : ce tour corrige cet échec (tour `Fixing`).
+        let mut fixing: Option<Fault> = None;
+        let mut resume = false;
+        // Tête de la branche au début du tour : `base` au premier, puis celle
+        // relevée après le tour précédent (le pipeline ne commite jamais).
+        let mut head = Some(ctx.base.clone());
+        loop {
+            // --- Tour de la session.
+            let before = head.clone();
+            ctl.begin_turn();
+            match &fixing {
+                Some(f) => {
+                    rep.emit(
+                        S::Fixing,
+                        Some(f.text.lines().next().unwrap_or("").to_string()),
+                    );
+                    rep.note(
+                        NoticeLevel::Info,
+                        "improve.fixing",
+                        &format!(
+                            "✻ Correction automatique (tentative {}/{})",
+                            rep.status.attempt, rep.status.max_attempts
+                        ),
+                    );
+                }
+                None => {
+                    // Message de l'utilisateur (ou demande initiale).
+                    rep.status.attempt = 0;
+                    rep.emit(S::Working, None);
+                }
+            }
+            let end = self.one_turn(req, ctx, &message, resume, cancel).await?;
+            rep.status.turn += 1;
+
+            // --- Garde de sécurité, après chaque tour : une violation arrête
+            // le cycle, rien n'est renvoyé à la session.
+            if let Err(e) = self.guard(ctx, &req.branch).await {
+                let reason = match &end {
+                    Err(se) => format!("{e} ; session : {se}"),
+                    Ok(_) => e,
+                };
+                return Err(Stop::Failed(S::Checking, reason));
+            }
+            rep.note(
+                NoticeLevel::Info,
+                "improve.guard",
+                &format!("✓ Garde de sécurité (tour {})", rep.status.turn),
+            );
+            // Hôte sans reprise de la session (implémentation par défaut de
+            // `run_turn`) : comportement J14, l'échec corrigible est définitif.
+            if resume {
+                if let Err(CoreError::NotImplemented(m)) = &end {
+                    return Err(match &fixing {
+                        Some(f) => f.stop(),
+                        None => Stop::Failed(S::Working, m.clone()),
+                    });
+                }
+            }
+            resume = true;
+            let after = resolve(&ctx.wt, "HEAD").await;
+            head = after.clone();
+
+            // --- Suite : message en file, attente ou contrôles.
+            if let Some(m) = ctl.take_message() {
+                message = m;
+                fixing = None;
+                continue;
+            }
+            let mut next = if ctl.was_interrupted() || matches!(end, Ok(TurnEnd::Interrupted)) {
+                Next::Wait(ImproveWaiting::Interrupted, Some("tour interrompu".into()))
+            } else if let Err(e) = &end {
+                Next::Wait(
+                    ImproveWaiting::SessionStopped,
+                    Some(format!(
+                        "la session s'est arrêtée avant la fin de son tour : {e}"
+                    )),
+                )
+            } else if after == before {
+                Next::Wait(
+                    ImproveWaiting::NoNewCommit,
+                    Some("tour terminé sans nouveau commit : rien à tester".into()),
+                )
+            } else {
+                Next::Verify
+            };
+            let (m, f) = loop {
+                match next {
+                    Next::Wait(why, detail) => {
+                        match self.await_user(why, detail, rep, cancel, ctl).await? {
+                            UserAction::Message(m) => break (m, None),
+                            UserAction::Validate => next = Next::Verify,
+                        }
+                    }
+                    Next::Verify => {
+                        match self
+                            .verify_cycle(req, &Mode::Improve, ctx, rep, cancel, ctl)
+                            .await?
+                        {
+                            Verdict::Done(o) => return Ok(o),
+                            Verdict::Message(m) => {
+                                rep.note(
+                                    NoticeLevel::Info,
+                                    "improve.aborted",
+                                    "✻ Contrôles abandonnés : nouveau message",
+                                );
+                                break (m, None);
+                            }
+                            Verdict::Fault(f) => {
+                                let max = rep.status.max_attempts;
+                                if rep.status.attempt >= max {
+                                    rep.note(
+                                        NoticeLevel::Warn,
+                                        "improve.fault",
+                                        &format!(
+                                            "✗ {} : {max} corrections automatiques sans succès, \
+                                             à vous de reprendre",
+                                            f.headline()
+                                        ),
+                                    );
+                                    next = Next::Wait(
+                                        ImproveWaiting::AttemptsExhausted,
+                                        Some(feedback::short_detail(&f.text)),
+                                    );
+                                    continue;
+                                }
+                                rep.status.attempt += 1;
+                                let n = rep.status.attempt;
+                                rep.note(
+                                    NoticeLevel::Warn,
+                                    "improve.fault",
+                                    &format!(
+                                        "✗ {} (tentative {n}/{max}) : erreur renvoyée à la session",
+                                        f.headline()
+                                    ),
+                                );
+                                let fb = feedback::format_feedback(
+                                    n,
+                                    max,
+                                    f.label(),
+                                    &f.text,
+                                    &ctx.redact,
+                                );
+                                break (fb, Some(f));
+                            }
+                        }
+                    }
+                }
+            };
+            message = m;
+            fixing = f;
+        }
+    }
+
+    /// Un tour : verrou [`IMPROVE_LOCK`] et `.git/config` en lecture seule
+    /// pendant le tour, arrêt effectif de la session attendu avant de les
+    /// lever. Délai : [`TURN_TIMEOUT`]. `Err` : annulation (fichiers de l'app
+    /// rétablis).
+    async fn one_turn(
+        &self,
+        req: &ImproveRequest,
+        ctx: &Ctx,
+        message: &str,
+        resume: bool,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<Result<TurnEnd, CoreError>, Stop> {
+        use ImproveStep as S;
+        // Verrou posé avant : un arrêt brutal pendant le tour laisse de quoi
+        // rétablir l'attribut au démarrage suivant.
+        let lock = ActiveLock::create(&ctx.common)
+            .map_err(|e| Stop::Failed(S::Working, format!("verrou {IMPROVE_LOCK} : {e}")))?;
+        let ro = ReadOnly::set(&ctx.common.join("config"))
+            .map_err(|e| Stop::Failed(S::Working, format!(".git/config en lecture seule : {e}")))?;
+        let turn = async {
+            match tokio::time::timeout(
+                TURN_TIMEOUT,
+                self.host.run_turn(req, &ctx.wt, message, resume),
+            )
             .await
-            .ok_or_else(|| Stop::Failed(S::Checking, "tête de branche illisible".into()))?;
-        let short = git::short(&wt, "HEAD").await.map_err(fail(S::Checking))?;
-        rep.status.commit = Some(short.clone());
-        let mut reasons = restart_reasons(&files);
-
-        // --- Tests obligatoires, dans un worktree jetable au harnais restauré.
-        rep.emit(S::Testing, None);
-        let rust = files.iter().any(|f| f.starts_with("src-tauri/"));
-        let tests = self.tests_path(&req.branch);
-        let tested = self
-            .run_tests(&clone, &wt, &tests, &head, &base, rust, cancel)
-            .await;
-        let fingerprint = match tested {
-            Ok(fp) => fp,
-            Err(stop) => {
-                self.remove_tree(&tests, true).await;
-                return Err(stop);
+            {
+                Ok(r) => r,
+                Err(_) => Err(CoreError::Timeout(format!(
+                    "tour de la session ({} min)",
+                    TURN_TIMEOUT.as_secs() / 60
+                ))),
             }
         };
-        self.remove_tree(&tests, true).await;
-        match fingerprint {
+        let done = guarded(cancel, turn).await;
+        // Arrêt effectif de la session (fin, délai ou annulation) avant de
+        // rendre `.git/config` inscriptible et avant la garde.
+        self.host.session_stopped().await;
+        drop(ro);
+        drop(lock);
+        if done.is_err() {
+            // Annulé : fichiers de l'app rétablis, annulation rapportée.
+            if let Err(e) = self.check_app_files() {
+                tracing::warn!("après la session annulée : {e}");
+            }
+        }
+        done
+    }
+
+    /// Garde de sécurité d'après tour : fichiers de l'app (rétablis),
+    /// configuration git, hooks, `node_modules` du clone, `main`, branche.
+    async fn guard(&self, ctx: &Ctx, branch: &str) -> Result<(), String> {
+        self.check_app_files()?;
+        guard_git(
+            &ctx.clone,
+            &ctx.wt,
+            branch,
+            &ctx.base,
+            &ctx.common,
+            &ctx.snapshot,
+        )
+        .await
+    }
+
+    /// Attente de l'utilisateur (`AwaitingUser`) : message ou « Valider ».
+    async fn await_user(
+        &self,
+        why: ImproveWaiting,
+        detail: Option<String>,
+        rep: &mut Reporter,
+        cancel: &mut watch::Receiver<bool>,
+        ctl: &Control,
+    ) -> Result<UserAction, Stop> {
+        if let Some(m) = ctl.enter(Phase::Awaiting) {
+            return Ok(UserAction::Message(m));
+        }
+        rep.status.waiting = Some(why);
+        rep.emit(ImproveStep::AwaitingUser, detail);
+        let text = match why {
+            ImproveWaiting::NoNewCommit => {
+                "⏸ Tour terminé sans nouveau commit : répondez, ou « Valider »"
+            }
+            ImproveWaiting::Interrupted => "⏸ Tour interrompu : en attente de votre message",
+            ImproveWaiting::AttemptsExhausted => {
+                "⏸ Corrections automatiques épuisées : en attente de votre message"
+            }
+            ImproveWaiting::SessionStopped => {
+                "⏸ La session s'est arrêtée avant la fin de son tour : en attente de votre message"
+            }
+        };
+        rep.note(NoticeLevel::Info, "improve.awaiting", text);
+        loop {
+            guarded(cancel, ctl.wake.notified()).await?;
+            if let Some(m) = ctl.take_message() {
+                return Ok(UserAction::Message(m));
+            }
+            if ctl.take_validate() {
+                return Ok(UserAction::Validate);
+            }
+        }
+    }
+
+    /// Contrôles puis tests (abandonnés par un message), puis build,
+    /// bascule et fusion.
+    async fn verify_cycle(
+        &self,
+        req: &ImproveRequest,
+        mode: &Mode,
+        ctx: &Ctx,
+        rep: &mut Reporter,
+        cancel: &mut watch::Receiver<bool>,
+        ctl: &Control,
+    ) -> Result<Verdict, Stop> {
+        if let Some(m) = ctl.enter(Phase::Checking) {
+            return Ok(Verdict::Message(m));
+        }
+        let res = abortable(cancel, ctl, self.verify(ctx, rep)).await;
+        // Abandon par un message : le tour part tout de suite ; le worktree
+        // des tests (processus déjà tués) est supprimé au début des tests
+        // suivants, ou par `cleanup_merged`.
+        if !matches!(res, Ok(None)) {
+            self.remove_tree(&ctx.tests, true).await;
+        }
+        let v = match res? {
+            None => return Ok(Verdict::Message(ctl.take_message().unwrap_or_default())),
+            Some(Err(VErr::Fault(f))) => return Ok(Verdict::Fault(f)),
+            Some(Err(VErr::Fatal(step, reason))) => return Err(Stop::Failed(step, reason)),
+            Some(Ok(v)) => v,
+        };
+        // Message arrivé juste à la fin des tests : il passe d'abord.
+        if let Some(m) = ctl.enter(Phase::Closed) {
+            return Ok(Verdict::Message(m));
+        }
+        Ok(match self.finish(req, mode, ctx, v, rep, cancel).await? {
+            Ok(o) => Verdict::Done(o),
+            Err(f) => Verdict::Fault(f),
+        })
+    }
+
+    /// Contrôles corrigibles puis tests dans un worktree jetable au harnais
+    /// restauré (supprimé par l'appelant).
+    async fn verify(&self, ctx: &Ctx, rep: &mut Reporter) -> Result<Verified, VErr> {
+        use ImproveStep as S;
+        rep.emit(S::Checking, None);
+        rep.note(NoticeLevel::Info, "improve.checking", "✻ Contrôles…");
+        let files = check_work(&ctx.wt, &ctx.base)
+            .await
+            .map_err(|e| VErr::Fault(Fault::new(S::Checking, e)))?;
+        let head = resolve(&ctx.wt, "HEAD")
+            .await
+            .ok_or_else(|| VErr::Fatal(S::Checking, "tête de branche illisible".into()))?;
+        let short = git::short(&ctx.wt, "HEAD")
+            .await
+            .map_err(|e| VErr::Fatal(S::Checking, e))?;
+        rep.status.commit = Some(short.clone());
+        rep.emit(S::Testing, None);
+        rep.note(NoticeLevel::Info, "improve.testing", "✻ Tests…");
+        let rust = files.iter().any(|f| f.starts_with("src-tauri/"));
+        let fingerprint = self
+            .run_tests(&ctx.clone, &ctx.wt, &ctx.tests, &head, &ctx.base, rust)
+            .await?;
+        Ok(Verified {
+            files,
+            head,
+            short,
+            fingerprint,
+        })
+    }
+
+    /// Après des contrôles et des tests verts : « relance requise »
+    /// (fusion sans activation), sinon build, attente du repos, bascule et
+    /// fusion. `Ok(Err(..))` : échec corrigible (build, interface sans
+    /// signal « prêt »).
+    async fn finish(
+        &self,
+        req: &ImproveRequest,
+        mode: &Mode,
+        ctx: &Ctx,
+        v: Verified,
+        rep: &mut Reporter,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<Result<ImproveOutcome, Fault>, Stop> {
+        use ImproveStep as S;
+        let clone = &ctx.clone;
+        let (head, short) = (v.head, v.short);
+        let mut reasons = restart_reasons(&v.files);
+        match v.fingerprint {
             Ok(fp) if fp.trim() == self.contract => {}
             Ok(fp) => reasons.push(format!(
                 "empreinte du contrat {} différente de celle de l'exe ({})",
@@ -1173,19 +1761,32 @@ impl Pipeline {
 
         // --- Cœur modifié : fusion sans activation (décision 18).
         if !reasons.is_empty() {
-            merge(&clone, &base, &req.branch, &head)
+            merge(clone, &ctx.base, &req.branch, &head)
                 .await
                 .map_err(fail(S::Merged))?;
-            self.remove_tree(&wt, false).await;
+            self.remove_tree(&ctx.wt, false).await;
             rep.emit(
                 S::RestartRequired,
                 Some(format!("relance requise : {}", reasons.join(" ; "))),
             );
-            return Ok(ImproveOutcome::RestartRequired { commit: head });
+            rep.note(
+                NoticeLevel::Info,
+                "improve.restart_required",
+                &format!(
+                    "✓ Fusionné {short} : relance requise ({})",
+                    reasons.join(" ; ")
+                ),
+            );
+            return Ok(Ok(ImproveOutcome::RestartRequired { commit: head }));
         }
 
         // --- Build de l'interface étiquetée par le hash.
         rep.emit(S::Building, None);
+        rep.note(
+            NoticeLevel::Info,
+            "improve.building",
+            "✻ Construction de l'interface…",
+        );
         std::fs::create_dir_all(&self.ui_root)
             .map_err(|e| Stop::Failed(S::Building, format!("{} : {e}", self.ui_root.display())))?;
         let out = self.ui_root.join(format!("{short}.tmp"));
@@ -1193,43 +1794,54 @@ impl Pipeline {
             std::fs::remove_dir_all(&out)
                 .map_err(|e| Stop::Failed(S::Building, format!("{} : {e}", out.display())))?;
         }
-        guarded(cancel, self.toolchain.build_ui(&wt, &short, &out))
-            .await?
-            .map_err(fail(S::Building))?;
+        if let Err(e) = guarded(cancel, self.toolchain.build_ui(&ctx.wt, &short, &out)).await? {
+            return Ok(Err(Fault::new(S::Building, e)));
+        }
         if !out.join("index.html").is_file() {
-            return Err(Stop::Failed(
+            return Ok(Err(Fault::new(
                 S::Building,
-                format!("index.html absent de {}", out.display()),
-            ));
+                "vite build n'a pas produit index.html",
+            )));
         }
 
         // --- Bascule : attente du repos, puis rechargement et signal « prêt ».
         rep.emit(S::WaitingIdle, None);
+        rep.note(
+            NoticeLevel::Info,
+            "improve.waiting_idle",
+            "✻ Attente du repos de la session principale…",
+        );
         guarded(cancel, self.host.wait_idle())
             .await?
             .map_err(|e| Stop::Failed(S::WaitingIdle, e.to_string()))?;
         // Conditions de la fusion revalidées avant d'activer quoi que ce soit.
-        can_merge(&clone, &base, &head)
+        can_merge(clone, &ctx.base, &head)
             .await
             .map_err(|e| Stop::Failed(S::Switching, format!("fusion impossible : {e}")))?;
         // Plus d'annulation à partir d'ici : la bascule va au bout.
         rep.emit(S::Switching, None);
+        rep.note(
+            NoticeLevel::Info,
+            "improve.switching",
+            "✻ Bascule vers la nouvelle interface…",
+        );
         let ready = self
             .host
             .switch_ui(&short, &out)
             .await
             .map_err(|e| Stop::Failed(S::Switching, e.to_string()))?;
         if !ready {
-            return Err(Stop::Failed(
+            return Ok(Err(Fault::new(
                 S::Switching,
                 "la nouvelle interface n'a pas signalé « prêt » à temps : version précédente \
-                 rétablie, branche non fusionnée"
-                    .into(),
-            ));
+                 rétablie, branche non fusionnée\nCause probable : une erreur au montage de \
+                 l'interface (exception dans un composant, import manquant) ; l'app attend \
+                 l'appel `ui_ready` après le montage.",
+            )));
         }
 
         // --- Fusion fast-forward dans le main du clone.
-        if let Err(e) = merge(&clone, &base, &req.branch, &head).await {
+        if let Err(e) = merge(clone, &ctx.base, &req.branch, &head).await {
             // Interface active mais pas fusionnée : retour à la précédente.
             let back = match self.host.rollback_ui().await {
                 Ok(()) => "interface précédente rétablie".to_string(),
@@ -1237,7 +1849,7 @@ impl Pipeline {
             };
             return Err(Stop::Failed(S::Merged, format!("{e} ; {back}")));
         }
-        self.remove_tree(&wt, false).await;
+        self.remove_tree(&ctx.wt, false).await;
         let (step, detail) = match mode {
             Mode::Improve => (S::Merged, format!("fusionnée dans main ({short})")),
             Mode::Revert(c) => (
@@ -1246,13 +1858,18 @@ impl Pipeline {
             ),
         };
         rep.emit(step, Some(detail));
-        Ok(ImproveOutcome::Merged { commit: head })
+        rep.note(
+            NoticeLevel::Info,
+            "improve.merged",
+            &format!("✓ Fusionné {short}"),
+        );
+        Ok(Ok(ImproveOutcome::Merged { commit: head }))
     }
 
     /// Worktree jetable (détaché) sur `head`, harnais protégé restauré depuis
     /// `base`, puis tests et empreinte du contrat dedans. Renvoie l'empreinte
-    /// (ou son erreur) si les tests passent.
-    #[allow(clippy::too_many_arguments)]
+    /// (ou son erreur) si les tests passent. Abandon (annulation, message) :
+    /// par l'appelant, qui supprime aussi le worktree.
     async fn run_tests(
         &self,
         clone: &Path,
@@ -1261,31 +1878,27 @@ impl Pipeline {
         head: &str,
         base: &str,
         rust: bool,
-        cancel: &mut watch::Receiver<bool>,
-    ) -> Result<Result<String, String>, Stop> {
-        let failed = fail(ImproveStep::Testing);
+    ) -> Result<Result<String, String>, VErr> {
+        let fatal = |e: String| VErr::Fatal(ImproveStep::Testing, e);
         if tests.exists() {
             self.remove_tree(tests, true).await;
         }
         if let Some(parent) = tests.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| failed(format!("{} : {e}", parent.display())))?;
+                .map_err(|e| fatal(format!("{} : {e}", parent.display())))?;
         }
         let tests_s = tests.to_string_lossy().into_owned();
-        guarded(
-            cancel,
-            git(
-                clone,
-                &["worktree", "add", "-q", "--detach", &tests_s, head],
-            ),
+        git(
+            clone,
+            &["worktree", "add", "-q", "--detach", &tests_s, head],
         )
-        .await?
-        .map_err(&failed)?;
+        .await
+        .map_err(fatal)?;
         let mut restore: Vec<&str> = Vec::new();
         for p in HARNESS_PATHS {
             let listed = git(clone, &["ls-tree", "--name-only", base, "--", p])
                 .await
-                .map_err(&failed)?;
+                .map_err(fatal)?;
             if !listed.trim().is_empty() {
                 restore.push(p);
             }
@@ -1295,7 +1908,7 @@ impl Pipeline {
             args.extend(restore.iter().copied());
             git(tests, &args)
                 .await
-                .map_err(|e| failed(format!("restauration du harnais : {e}")))?;
+                .map_err(|e| fatal(format!("restauration du harnais : {e}")))?;
         }
         let wt_nm = wt.join("node_modules");
         let target = if is_link(&wt_nm) {
@@ -1306,12 +1919,13 @@ impl Pipeline {
         if target.is_dir() {
             link_dir(&tests.join("node_modules"), &target)
                 .await
-                .map_err(&failed)?;
+                .map_err(fatal)?;
         }
-        guarded(cancel, self.toolchain.test(tests, rust))
-            .await?
-            .map_err(&failed)?;
-        guarded(cancel, self.toolchain.contract(tests)).await
+        self.toolchain
+            .test(tests, rust)
+            .await
+            .map_err(|e| VErr::Fault(Fault::new(ImproveStep::Testing, e)))?;
+        Ok(self.toolchain.contract(tests).await)
     }
 
     /// `node_modules` du worktree : jonction vers celui du clone si
@@ -1459,28 +2073,85 @@ impl Pipeline {
         }
     }
 
-    /// Jalon J16, étape A : message de l'utilisateur pour le cycle `id`
-    /// ([`Pipeline::send`]). Provisoire (étape 0) : non pris en charge.
-    pub(super) fn send_active(&self, _id: &str, _text: &str) -> Result<(), CoreError> {
-        Err(CoreError::NotImplemented(
-            "message à la session d'amélioration (improve_send)".into(),
-        ))
+    /// Commandes de l'onglet du cycle `id`.
+    fn control(&self, id: &str) -> Result<Arc<Control>, CoreError> {
+        let a = self
+            .active
+            .lock()
+            .map_err(|_| CoreError::Io("état du cycle illisible".into()))?;
+        match a.as_ref() {
+            Some(cur) if cur.id == id => Ok(cur.ctl.clone()),
+            _ => Err(CoreError::UnknownRequest(format!(
+                "aucune amélioration en cours d'identifiant {id}"
+            ))),
+        }
     }
 
-    /// Jalon J16, étape A : « Valider » ([`Pipeline::validate`]). Provisoire
-    /// (étape 0) : non pris en charge.
-    pub(super) fn validate_active(&self, _id: &str) -> Result<(), CoreError> {
-        Err(CoreError::NotImplemented(
-            "validation de l'amélioration (improve_validate)".into(),
-        ))
+    /// Message de l'utilisateur pour le cycle `id` ([`Pipeline::send`]) :
+    /// pendant un tour (ou la préparation), mis en file et livré au tour
+    /// suivant ; pendant les contrôles ou les tests, ceux-ci sont abandonnés
+    /// et un tour part ; en attente, un tour part. Refusé à partir du build
+    /// et pour un retour arrière. Le tour livré remet `attempt` à 0.
+    pub(super) fn send_active(&self, id: &str, text: &str) -> Result<(), CoreError> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(CoreError::InvalidArgument("message vide".into()));
+        }
+        let ctl = self.control(id)?;
+        let wake = {
+            let mut s = ctl.lock();
+            if s.phase == Phase::Closed {
+                return Err(CoreError::InvalidArgument(
+                    "l'amélioration ne prend plus de message : contrôles et tests passés, \
+                     construction, bascule ou fusion en cours"
+                        .into(),
+                ));
+            }
+            s.queue.push(text.to_string());
+            matches!(s.phase, Phase::Checking | Phase::Awaiting)
+        };
+        if wake {
+            ctl.wake.notify_one();
+        }
+        Ok(())
     }
 
-    /// Jalon J16, étape A : interruption du tour ([`Pipeline::interrupt`]).
-    /// Provisoire (étape 0) : non pris en charge.
-    pub(super) async fn interrupt_active(&self, _id: &str) -> Result<(), CoreError> {
-        Err(CoreError::NotImplemented(
-            "interruption de la session d'amélioration (improve_interrupt)".into(),
-        ))
+    /// « Valider » ([`Pipeline::validate`]) : seulement en attente de
+    /// l'utilisateur ; relance garde, contrôles et tests (sans remettre
+    /// `attempt` à 0).
+    pub(super) fn validate_active(&self, id: &str) -> Result<(), CoreError> {
+        let ctl = self.control(id)?;
+        {
+            let mut s = ctl.lock();
+            if s.phase != Phase::Awaiting {
+                return Err(CoreError::InvalidArgument(
+                    "« Valider » n'agit que quand l'amélioration attend l'utilisateur".into(),
+                ));
+            }
+            s.validate = true;
+        }
+        ctl.wake.notify_one();
+        Ok(())
+    }
+
+    /// Interruption du tour en cours ([`Pipeline::interrupt`]) : le cycle
+    /// passe ensuite en attente (`Interrupted`), sans tests.
+    pub(super) async fn interrupt_active(&self, id: &str) -> Result<(), CoreError> {
+        let ctl = self.control(id)?;
+        {
+            let mut s = ctl.lock();
+            if s.phase != Phase::Turn {
+                return Err(CoreError::InvalidArgument(
+                    "aucun tour de la session d'amélioration en cours".into(),
+                ));
+            }
+            s.interrupted = true;
+        }
+        let r = self.host.interrupt_turn().await;
+        if r.is_err() {
+            ctl.lock().interrupted = false;
+        }
+        r
     }
 
     pub(super) async fn revert_request(
@@ -1533,17 +2204,18 @@ async fn branch_has_commits(clone: &Path, branch: &str) -> bool {
     }
 }
 
-/// Contrôles déterministes après la session ; renvoie les fichiers touchés
-/// par la branche (chemins git).
-async fn check(
+/// Garde de sécurité après chaque tour (jalon J16) : branche, `main`,
+/// configuration git, hooks, remotes, `node_modules` du clone. Une violation
+/// arrête le cycle ; sa raison n'est jamais renvoyée à la session.
+async fn guard_git(
     clone: &Path,
     wt: &Path,
     branch: &str,
     base: &str,
     common: &Path,
     snapshot: &Snapshot,
-) -> Result<Vec<String>, String> {
-    // Branche, main, arbre, commits.
+) -> Result<(), String> {
+    // Branche, main.
     let cur = git(wt, &["symbolic-ref", "--short", "HEAD"])
         .await
         .unwrap_or_default();
@@ -1559,26 +2231,6 @@ async fn check(
     }
     if resolve(clone, "refs/heads/main").await.as_deref() != Some(base) {
         return Err("main a été modifié pendant la session".into());
-    }
-    let status = git(wt, &["status", "--porcelain", "--untracked-files=all"]).await?;
-    if !status.trim().is_empty() {
-        let first: Vec<&str> = status.lines().take(10).collect();
-        return Err(format!(
-            "arbre non propre (modifications non commitées) :\n{}",
-            first.join("\n")
-        ));
-    }
-    if !git_ok(wt, &["merge-base", "--is-ancestor", base, "HEAD"]).await? {
-        return Err("la branche ne part plus du main du clone".into());
-    }
-    let range = format!("{base}..HEAD");
-    let count: u32 = git(wt, &["rev-list", "--count", &range])
-        .await?
-        .trim()
-        .parse()
-        .unwrap_or(0);
-    if count == 0 {
-        return Err("aucun commit sur la branche".into());
     }
 
     // Configuration git : rien d'ajouté (push, hooks, ssh…).
@@ -1616,6 +2268,33 @@ async fn check(
         return Err(
             "les dépendances (node_modules) du clone ont été modifiées pendant la session".into(),
         );
+    }
+    Ok(())
+}
+
+/// Contrôles corrigibles (renvoyés à la session) : arbre propre, commits sur
+/// la branche, fichiers dans le périmètre, harnais intact, pas de marqueur
+/// de test désactivé. Renvoie les fichiers touchés par la branche.
+async fn check_work(wt: &Path, base: &str) -> Result<Vec<String>, String> {
+    let status = git(wt, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    if !status.trim().is_empty() {
+        let first: Vec<&str> = status.lines().take(10).collect();
+        return Err(format!(
+            "arbre non propre (modifications non commitées) :\n{}",
+            first.join("\n")
+        ));
+    }
+    if !git_ok(wt, &["merge-base", "--is-ancestor", base, "HEAD"]).await? {
+        return Err("la branche ne part plus du main du clone".into());
+    }
+    let range = format!("{base}..HEAD");
+    let count: u32 = git(wt, &["rev-list", "--count", &range])
+        .await?
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    if count == 0 {
+        return Err("aucun commit sur la branche".into());
     }
 
     // Fichiers : modes, périmètre, harnais.
