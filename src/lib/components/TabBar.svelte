@@ -4,7 +4,9 @@
   // puis « + » qui ouvre un onglet sur le sélecteur des projets. Un point
   // signale un tour en cours (accent) ou une question en attente (lavande)
   // dans un onglet. La croix ferme l'onglet (et sa session) ; absente quand il
-  // n'en reste qu'un.
+  // n'en reste qu'un. J16 : l'onglet d'amélioration porte un badge d'étape
+  // (« tour 1 », « tests · 1/3 », « en attente », « fusionné »…) ; sa croix
+  // passe par l'app (confirmation dans la page pendant un cycle).
   import type { TabView } from "../state/tabs";
 
   let {
@@ -37,7 +39,14 @@
 <nav class="tab-bar" data-testid="tab-bar" aria-label="Conversations">
   <div class="tabs" role="tablist">
     {#each tabs as t (t.id)}
-      <div class="tab" class:active={t.id === active} data-testid="tab">
+      <div
+        class="tab"
+        class:active={t.id === active}
+        class:improve={!!t.improve}
+        data-testid="tab"
+        data-kind={t.improve ? "improve" : "conversation"}
+        data-step={t.improve?.step ?? null}
+      >
         <button
           type="button"
           class="pick"
@@ -53,8 +62,11 @@
             <span class="dot busy" aria-label="tour en cours"></span>
           {/if}
           <span class="label">{t.label}</span>
+          {#if t.improve?.badge}
+            <span class="badge {t.improve.badge.tone}" data-testid="tab-badge">{t.improve.badge.text}</span>
+          {/if}
         </button>
-        {#if tabs.length > 1}
+        {#if tabs.length > 1 || t.improve}
           <button
             type="button"
             class="close"
@@ -137,6 +149,34 @@
   .label {
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* Onglet d'amélioration (J16) : plus large pour le badge d'étape. */
+  .tab.improve {
+    max-width: 340px;
+  }
+  .badge {
+    flex: 0 0 auto;
+    padding: 0 5px;
+    border: 1px solid currentColor;
+    border-radius: 2px;
+    font-size: 11px;
+    line-height: 14px;
+    color: var(--muted);
+  }
+  .badge.run {
+    color: var(--accent);
+  }
+  .badge.wait {
+    color: var(--t-lavender);
+  }
+  .badge.ok {
+    color: var(--t-ok);
+  }
+  .badge.warn {
+    color: var(--warn);
+  }
+  .badge.err {
+    color: var(--danger);
   }
   .dot {
     width: 6px;

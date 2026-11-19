@@ -1,7 +1,7 @@
 // Onglets de conversation (`src/lib/state/tabs.ts`) : libellé, infobulle et
-// onglet affiché après une fermeture.
+// onglet affiché après une fermeture ; J16 : onglet d'amélioration en cours.
 import { describe, expect, it } from "vitest";
-import { afterClose, baseName, NEW_TAB_LABEL, tabLabel, tabTitle } from "../../src/lib/state/tabs";
+import { afterClose, baseName, NEW_TAB_LABEL, runningImproveTab, tabLabel, tabTitle } from "../../src/lib/state/tabs";
 
 describe("baseName", () => {
   it("chemins Windows et POSIX, séparateur final", () => {
@@ -47,5 +47,23 @@ describe("afterClose", () => {
 
   it("dernier onglet fermé : aucun", () => {
     expect(afterClose([1], 1, 1)).toBeNull();
+  });
+});
+
+describe("runningImproveTab (J16)", () => {
+  it("l'onglet d'amélioration d'un cycle en cours (état connu ou non)", () => {
+    expect(
+      runningImproveTab([
+        { id: 1, kind: "conversation", improve: null },
+        { id: 2, kind: "improve", improve: { step: "awaiting_user" } },
+      ]),
+    ).toBe(2);
+    expect(runningImproveTab([{ id: 3, kind: "improve", improve: null }])).toBe(3);
+  });
+
+  it("aucun : pas d'onglet d'amélioration, ou cycle fini", () => {
+    expect(runningImproveTab([{ id: 1, kind: "conversation", improve: null }])).toBeNull();
+    expect(runningImproveTab([{ id: 2, kind: "improve", improve: { step: "merged" } }])).toBeNull();
+    expect(runningImproveTab([{ id: 2, kind: "improve", improve: { step: "cancelled" } }])).toBeNull();
   });
 });

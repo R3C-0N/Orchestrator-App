@@ -281,8 +281,10 @@ export function resyncStore(store: SessionStore, r: Pick<SessionResync, "history
  * - Une session inconnue (lancée après le rattachement, une amélioration par
  *   exemple) reçoit un magasin à la volée, de rôle `improve` sauf indication.
  * - `make` peut rendre `null` : la session n'a alors pas de magasin (jamais
- *   affichée, une amélioration) ; seuls ses `TAIL_MAX` derniers événements
- *   sont gardés (`tail`), la mémoire reste bornée.
+ *   affichée) ; seuls ses `TAIL_MAX` derniers événements sont gardés
+ *   (`tail`), la mémoire reste bornée. Depuis J16, l'app donne un magasin
+ *   complet (sans limite) à la conversation d'une amélioration : elle est
+ *   affichée dans l'onglet d'amélioration.
  * - `dispose` : les lots arrivés ensuite sont ignorés (rattachement abandonné).
  */
 export class SessionRouter {
@@ -427,8 +429,13 @@ export type UiSnapshot = {
   agentsRunningOpen: boolean;
   /** Vue détaillée (Ctrl+O). */
   verbose: boolean;
-  /** Bandeau d'amélioration fermé (id de l'amélioration). */
+  /** Onglet d'amélioration fermé (id de l'amélioration) : il n'est pas rouvert au rechargement. */
   improveDismissed: string | null;
+  /**
+   * Onglet d'amélioration actif (J16) : la bascule recharge la page, l'utilisateur
+   * reste sur cet onglet (où paraît « fusionné »). Absent : faux.
+   */
+  improveTab?: boolean;
 };
 
 export const UI_SNAPSHOT_KEY = "orchestrator.ui.v1";
@@ -509,6 +516,7 @@ export function loadUiSnapshot(): UiSnapshot | null {
       agentsRunningOpen: v.agentsRunningOpen !== false,
       verbose: v.verbose === true,
       improveDismissed: typeof v.improveDismissed === "string" ? v.improveDismissed : null,
+      ...(v.improveTab === true ? { improveTab: true } : {}),
     };
   } catch {
     return null;

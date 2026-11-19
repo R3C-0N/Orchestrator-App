@@ -2,6 +2,11 @@
 // conversation ouverte par onglet, chacune avec son orchestrateur
 // (`claude.exe`) ; « + » ouvre un onglet sur le sélecteur des projets.
 // Fonctions pures, testées dans `e2e/unit/tabs.test.ts`.
+// J16 : onglet d'amélioration (`/ameliorer`), modèle dans `improve.ts`.
+
+import type { ImproveStep } from "../core/bindings/ImproveStep";
+import type { ImproveStatus } from "../core/bindings/ImproveStatus";
+import { isFinal, type ImproveBadge } from "./improve";
 
 /** Ce qu'il faut d'un onglet pour le nommer. */
 export type TabNaming = {
@@ -45,5 +50,29 @@ export function afterClose<T>(ids: readonly T[], active: T, closing: T): T | nul
   return rest[Math.min(i, rest.length - 1)];
 }
 
-/** Onglet tel que la barre l'affiche (`TabBar.svelte`). */
-export type TabView = { id: number; label: string; title: string; busy: boolean; waiting: boolean };
+/**
+ * Onglet tel que la barre l'affiche (`TabBar.svelte`). `improve` : onglet
+ * d'amélioration (J16), avec le badge d'étape de son cycle (`null` : état
+ * pas encore connu).
+ */
+export type TabView = {
+  id: number;
+  label: string;
+  title: string;
+  busy: boolean;
+  waiting: boolean;
+  improve?: { badge: ImproveBadge | null; step: ImproveStep | null } | null;
+};
+
+/** Genre d'onglet : conversation de l'utilisateur, ou conversation d'une amélioration. */
+export type TabKind = "conversation" | "improve";
+
+/**
+ * Onglet à activer pour un `/ameliorer` : l'onglet d'amélioration qui tient
+ * déjà un cycle en cours (un seul cycle à la fois), sinon `null`.
+ */
+export function runningImproveTab(
+  tabs: readonly { id: number; kind: TabKind; improve: Pick<ImproveStatus, "step"> | null }[],
+): number | null {
+  return tabs.find((t) => t.kind === "improve" && (t.improve === null || !isFinal(t.improve.step)))?.id ?? null;
+}

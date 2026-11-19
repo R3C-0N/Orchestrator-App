@@ -24,12 +24,17 @@
   // tout démarrage, puis signal « prêt » (`ui_ready`) ; saisie, historique ↑↓,
   // agents dépliés et Ctrl+O gardés dans `sessionStorage` à travers un
   // rechargement ; `/ameliorer <demande>` et `/revenir-version` (entrées
-  // locales de la palette) ; bandeau d'avancement (`ImproveBanner`) ; hash de
-  // l'interface dans la ligne d'état.
+  // locales de la palette) ; hash de l'interface dans la ligne d'état.
+  // J16 : `/ameliorer <demande>` ouvre un onglet d'amélioration (actif) qui
+  // montre la session dédiée en direct, avec le même rendu qu'une
+  // conversation ; badge d'étape dans son titre, barre « Valider » /
+  // « Annuler l'amélioration » (`ImproveControls`) au-dessus de la saisie,
+  // messages envoyés par `improve_send`, Échap par `improve_interrupt`.
+  // Fermer l'onglet pendant un cycle demande confirmation dans la page.
   import { onMount, tick } from "svelte";
   import AgentColumn from "./lib/components/agents/AgentColumn.svelte";
   import Conversation from "./lib/components/Conversation.svelte";
-  import ImproveBanner from "./lib/components/ImproveBanner.svelte";
+  import ImproveControls from "./lib/components/ImproveControls.svelte";
   import { entriesFrom, filterEntries, nameColumn } from "./lib/components/Palette.svelte";
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
   import Prompt from "./lib/components/Prompt.svelte";
@@ -76,7 +81,20 @@
     type UiSnapshot,
   } from "./lib/state/sessions.svelte";
   import { VERSION_NOTICE_CODE, noticeVersion } from "./lib/state/versionNotice";
-  import { afterClose, tabLabel, tabTitle, type TabView } from "./lib/state/tabs";
+  import { afterClose, runningImproveTab, tabLabel, tabTitle, type TabKind, type TabView } from "./lib/state/tabs";
+  import {
+    CLOSE_REFUSED_TEXT,
+    canInterrupt,
+    closeAction,
+    improveBadge,
+    improveTabLabel,
+    improveTabTitle,
+    improveToReopen,
+    isFinal,
+    isNewer,
+    pushLine,
+    sendBlocked,
+  } from "./lib/state/improve";
 
   // Mode simulé : `?mock=…`, ou d'office hors de Tauri. `mock.ts` n'est
   // chargé qu'à ce moment (import dynamique, hors du bundle principal).
@@ -139,6 +157,23 @@
   let agentsRunningOpen = $state(true);
 
   let session: SessionKey | null = $state(null);
+  /** Genre de l'onglet actif (J16) : conversation, ou conversation d'une amélioration. */
+  let tabKind = $state<TabKind>("conversation");
+  /** Onglet d'amélioration actif : id de son amélioration. */
+  let improveId = $state<string | null>(null);
+  /** Onglet d'amélioration fermé (id de l'amélioration) : pas rouvert au rechargement. */
+  let improveDismissed = $state<string | null>(null);
+  /** Dernier état reçu d'une amélioration (la plus récente). */
+  let improveLive = $state<ImproveStatus | null>(null);
+  /** Dernier état de chaque amélioration (id → état), pour le badge de son onglet. */
+  let improveById: Record<string, ImproveStatus> = $state.raw({});
+
+  function statusOf(id: string | null): ImproveStatus | null {
+    return id === null ? null : (improveById[id] ?? null);
+  }
+
+  /** État de l'amélioration de l'onglet actif (onglet d'amélioration seulement). */
+  const activeImprove = $derived(tabKind === "improve" ? statusOf(improveId) : null);
   let cwd = $state("");
   let startError: string | null = $state(null);
   let draft = $state("");
@@ -231,7 +266,8 @@
 
   /** Filtre en cours, ou `null` : palette fermée. */
   const paletteQuery = $derived.by((): string | null => {
-    if (store.question || verbose) return null;
+    // Onglet d'amélioration : ni palette (ni modèle ni commandes du CLI).
+    if (store.question || verbose || tabKind === "improve") return null;
     if (ctrlK) return draft.slice(ctrlKBase.length).replace(/^\//, "");
     const m = /^\/(\S*)$/.exec(draft);
     return m && draft !== slashDismissed ? m[1] : null;
@@ -264,6 +300,14 @@
   function choosePalette(i: number, how: "enter" | "tab" | "click"): void {
     const e = paletteItems[i];
     if (!e) return;
+    // Second `/ameliorer` pendant un cycle : l'onglet qui le tient est affiché.
+    if (e.name === IMPROVE_NAME && runningTab !== null) {
+      ctrlK = null;
+      slashDismissed = null;
+      draft = "";
+      showImproveTab(runningTab);
+      return;
+    }
     // Entrée locale indisponible : sa raison, rien n'est inséré ni envoyé.
     if (e.disabled) {
       ctrlK = null;
@@ -418,6 +462,10 @@
         break;
       case "openModelPicker":
         if (store.question) break;
+        if (tabKind === "improve") {
+          showNotice("Pas de choix de modèle dans l'onglet d'amélioration");
+          break;
+        }
         pickerOpen = true;
         prompt?.focus();
         break;
@@ -517,8 +565,20 @@
       void rollbackUi();
       return;
     }
+    // Onglet d'amélioration : le message va à la session dédiée (`improve_send`).
+    if (tabKind === "improve") {
+      if (/^\/model(?:\s|$)/.test(trimmed)) {
+        showNotice("Pas de choix de modèle dans l'onglet d'amélioration");
+        return;
+      }
+      const blocked = sendBlocked(activeImprove);
+      if (blocked) {
+        showNotice(`Envoi impossible : ${blocked}`);
+        return;
+      }
+    }
     // `/model` : sélecteur de modèle (le CLI en stream-json ne l'ouvre pas).
-    const model = /^\/model(?:\s+(\S+))?\s*$/.exec(trimmed);
+    const model = tabKind === "improve" ? null : /^\/model(?:\s+(\S+))?\s*$/.exec(trimmed);
     if (model) {
       draft = "";
       if (model[1]) {
@@ -574,10 +634,18 @@
   });
 
   let mockReady = $state(false);
-  const ready = $derived(mockReady || session !== null);
+  const ready = $derived(mockReady || session !== null || tabKind === "improve");
+  /** Onglet d'amélioration : raison pour laquelle on ne peut pas écrire à la session, ou `null`. */
+  const improveBlocked = $derived(tabKind === "improve" ? sendBlocked(activeImprove) : null);
   /** Texte d'invite tant qu'aucun message n'a été envoyé (`01`). */
   const placeholder = $derived(
-    !ready ? "session non démarrée" : store.rows.some((r) => r.kind === "user") ? "" : 'Try "how do I log an error?"',
+    tabKind === "improve"
+      ? (improveBlocked ?? "Écrire à la session d'amélioration (préciser, corriger)")
+      : !ready
+        ? "session non démarrée"
+        : store.rows.some((r) => r.kind === "user")
+          ? ""
+          : 'Try "how do I log an error?"',
   );
 
   $effect(() => {
@@ -695,6 +763,8 @@
       router: () => router,
       uiInfo: () => uiInfo,
       saveUi,
+      // J16 : onglet actif (genre, amélioration, état) et magasin affiché.
+      improveTab: () => ({ kind: tabKind, id: improveId, status: activeImprove, store }),
     };
   }
 
@@ -706,20 +776,15 @@
   /** Sessions rattachées au montage, et celles apparues ensuite sur le même canal. */
   let router: SessionRouter | null = null;
   /** Réponse de `get_ui_info` (`null` : pas encore lue, ou commande en échec). */
-  let uiInfo: UiInfo | null = $state(null);
+  let uiInfo = $state<UiInfo | null>(null);
   let uiInfoError: string | null = $state(null);
-  /** Bandeau d'amélioration fermé (id). */
-  let improveDismissed: string | null = $state(null);
-  /** Dernier état reçu d'une amélioration. */
-  let improveLive: ImproveStatus | null = $state(null);
   /** Hash et empreinte du contrat de cette interface (`define` de `vite.config.ts`). */
   const UI_HASH = typeof __UI_HASH__ === "string" ? __UI_HASH__ : "dev";
   const CONTRACT = typeof __CONTRACT__ === "string" ? __CONTRACT__ : null;
-  const FINAL_STEPS = ["merged", "restart_required", "failed", "cancelled", "rolled_back"];
 
   const improveRunning = $derived.by(() => {
     const st = improveLive ?? uiInfo?.improve ?? null;
-    return st !== null && !FINAL_STEPS.includes(st.step);
+    return st !== null && !isFinal(st.step);
   });
 
   /** Raison pour laquelle `/ameliorer` est grisé, ou `null`. */
@@ -738,7 +803,7 @@
     if (!selfUpdate) return "interface en cours de démarrage";
     if (!uiInfo) return uiInfoError ? `état inconnu (${uiInfoError})` : "état de l'interface en cours de lecture";
     // Pendant un cycle (bascule comprise), le retour arrière croiserait la bascule.
-    if (improveRunning) return "une amélioration est en cours";
+    if (improveRunning || runningTab !== null) return "une amélioration est en cours";
     if (uiInfo.source === "embedded" && !uiInfo.previous_hash) return "interface embarquée, aucune version précédente";
     return null;
   });
@@ -750,6 +815,8 @@
       const info = await su.getUiInfo();
       uiInfo = info ?? null;
       uiInfoError = info ? null : "réponse vide";
+      // L'événement global survit au rechargement, pas l'état de la page.
+      if (info?.improve) noteImprove(info.improve);
     } catch (err) {
       uiInfoError = describeError(err);
     }
@@ -772,21 +839,204 @@
       prompt?.focusEnd();
       return;
     }
+    // Un seul cycle à la fois : un second `/ameliorer` affiche l'onglet qui le tient.
+    if (runningTab !== null) {
+      draft = "";
+      showImproveTab(runningTab);
+      return;
+    }
     const su = selfUpdate;
+    // Cycle en cours sans onglet (rechargé pendant la préparation) : son onglet est ouvert.
+    const live = improveLive ?? uiInfo?.improve ?? null;
+    if (su && live && !isFinal(live.step)) {
+      draft = "";
+      openImproveTab(live, true);
+      showNotice("Une amélioration est déjà en cours : son onglet est affiché");
+      return;
+    }
     if (improveDisabled || !su) {
       showNotice(`/ameliorer indisponible : ${improveDisabled ?? "interface en cours de démarrage"}`);
       return;
     }
     draft = "";
+    const from = store;
     try {
       const st = await su.improveStart(request);
-      improveLive = st;
       improveDismissed = null;
+      noteImprove(st);
       if (uiInfo) uiInfo = { ...uiInfo, improve: st };
+      openImproveTab(st, true);
     } catch (err) {
-      store.addBanner("Error", "improve_start", `/ameliorer : ${describeError(err)}`);
+      from.addBanner("Error", "improve_start", `/ameliorer : ${describeError(err)}`);
       void refreshUiInfo();
     }
+  }
+
+  /** Affiche l'onglet d'amélioration `id` (un second `/ameliorer` pendant un cycle). */
+  function showImproveTab(id: number): void {
+    selectTab(id);
+    showNotice("Une amélioration est déjà en cours : son onglet est affiché");
+  }
+
+  /** Commandes de la saisie d'un onglet d'amélioration : vers la session dédiée du cycle `id`. */
+  function improveBackend(id: string): Backend {
+    const su = () => {
+      if (!selfUpdate) throw new Error("interface en cours de démarrage");
+      return selfUpdate;
+    };
+    const refused = async (): Promise<never> => {
+      throw new Error("pas de modèle ni de question dans l'onglet d'amélioration");
+    };
+    return {
+      send: (text) => su().improveSend(id, text),
+      interrupt: async () => {
+        if (canInterrupt(statusOf(id))) await su().improveInterrupt(id);
+      },
+      setModel: refused,
+      answer: refused,
+      skip: refused,
+    };
+  }
+
+  /** Magasin vide de la conversation d'une amélioration (le routeur le prend au premier événement). */
+  function improveStore(): SessionStore {
+    return new SessionStore(undefined, "improve");
+  }
+
+  /** Onglet (actif ou rangé) de l'amélioration `id`, ou `null`. */
+  function improveTabOf(id: string): { id: number; store: SessionStore } | null {
+    if (tabKind === "improve" && improveId === id) return { id: activeTab, store };
+    const t = tabs.find((x) => x.kind === "improve" && x.improveId === id);
+    return t ? { id: t.id, store: t.store } : null;
+  }
+
+  /**
+   * Ouvre l'onglet de l'amélioration `st` (actif si `activate`), ou rend
+   * celui qui existe déjà. Le magasin est celui que le routeur a déjà créé
+   * pour sa session, sinon un magasin vide, que le routeur prendra.
+   */
+  function openImproveTab(st: ImproveStatus, activate: boolean): number {
+    const have = improveTabOf(st.id);
+    if (have) {
+      if (activate) selectTab(have.id);
+      return have.id;
+    }
+    const s = (st.session !== null ? router?.get(st.session) : undefined) ?? improveStore();
+    const t = blankTab(nextTabId++, {
+      kind: "improve",
+      improveId: st.id,
+      store: s,
+      session: st.session,
+      backend: improveBackend(st.id),
+      phase: "start",
+      cwd: s.meta.cwd ?? "",
+    });
+    if (activate) {
+      const current = captureTab();
+      tabs = [...tabs.map((x) => (x.id === current.id ? current : x)), t];
+      loadTab(t);
+    } else tabs = [...tabs, t];
+    return t.id;
+  }
+
+  /** Ligne d'envoi GitHub déjà écrite dans le fil de chaque amélioration. */
+  const pushShown = new Map<string, string>();
+  /** Améliorations abandonnées à la fermeture de leur onglet : `improve_dismiss` à leur état final. */
+  const dismissWhenFinal = new Set<string>();
+
+  /**
+   * Nouvel état d'une amélioration (événement global, `get_ui_info`, ou
+   * réponse de `improve_start`) : badge de son onglet, magasin de sa
+   * session, ligne d'envoi dans son fil, fermeture différée.
+   */
+  function noteImprove(st: ImproveStatus): void {
+    if (!isNewer(st, improveById[st.id] ?? null)) return;
+    improveById = { ...improveById, [st.id]: st };
+    if (isNewer(st, improveLive)) improveLive = st;
+    const tab = improveTabOf(st.id);
+    if (tab) {
+      // La session apparaît après l'onglet : son magasin (déjà créé par le
+      // routeur si des événements sont arrivés avant l'état) devient celui de l'onglet.
+      const rs = st.session !== null ? router?.get(st.session) : undefined;
+      if (rs && rs !== tab.store) {
+        if (tab.id === activeTab) store = rs;
+        else tabs = tabs.map((x) => (x.id === tab.id ? { ...x, store: rs } : x));
+      }
+      if (tab.id === activeTab) session = st.session;
+      else tabs = tabs.map((x) => (x.id === tab.id ? { ...x, session: st.session } : x));
+      const line = pushLine(st, pushShown.get(st.id) ?? null);
+      if (line) {
+        pushShown.set(st.id, line);
+        (rs ?? tab.store).addPlain(line);
+      }
+    } else if (booted && !isFinal(st.step) && st.id !== improveDismissed) {
+      // Cycle lancé ailleurs, ou rechargé avant sa session : son onglet, sans le rendre actif.
+      openImproveTab(st, false);
+    }
+    if (isFinal(st.step) && dismissWhenFinal.delete(st.id)) void selfUpdate?.improveDismiss(st.id).catch(() => {});
+  }
+
+  function onImproveStatus(st: ImproveStatus): void {
+    noteImprove(st);
+    if (isFinal(st.step)) void refreshUiInfo();
+  }
+
+  /** Clone du dépôt (texte « relance requise » de la barre de l'onglet d'amélioration). */
+  const repoPath = $derived(
+    uiInfo && uiInfo.repo.state !== "disabled" && uiInfo.repo.state !== "unknown" ? uiInfo.repo.path : null,
+  );
+
+  // --- Fermeture d'un onglet d'amélioration ------------------------------------
+
+  /** Confirmation de fermeture affichée dans l'onglet d'amélioration actif. */
+  let closeConfirm = $state(false);
+  // Le cycle s'est terminé pendant la confirmation : plus rien à abandonner.
+  $effect(() => {
+    if (closeConfirm && activeImprove && isFinal(activeImprove.step)) closeConfirm = false;
+  });
+
+  /** Croix d'un onglet : directe pour une conversation ; selon l'état du cycle pour une amélioration. */
+  function requestClose(id: number): void {
+    const t = id === activeTab ? captureTab() : tabs.find((x) => x.id === id);
+    if (!t) return;
+    if (t.kind !== "improve") {
+      closeTab(id);
+      return;
+    }
+    switch (closeAction(statusOf(t.improveId))) {
+      case "refuse":
+        selectTab(id);
+        showNotice(CLOSE_REFUSED_TEXT);
+        return;
+      case "confirm":
+        selectTab(id);
+        closeConfirm = true;
+        return;
+      case "dismiss":
+        closeImproveTab(id, t.improveId, true);
+        return;
+    }
+  }
+
+  /** Ferme l'onglet d'amélioration ; `dismissNow` : le cœur libère sa conversation tout de suite. */
+  function closeImproveTab(tab: number, id: string | null, dismissNow: boolean): void {
+    closeTab(tab);
+    if (id === null) return;
+    improveDismissed = id;
+    if (dismissNow) void selfUpdate?.improveDismiss(id).catch(() => {});
+    else dismissWhenFinal.add(id);
+  }
+
+  /** « Abandonner » : annulation du cycle, puis fermeture (`improve_dismiss` à l'état `cancelled`). */
+  async function abandonImprove(): Promise<void> {
+    const id = improveId;
+    const su = selfUpdate;
+    if (tabKind !== "improve" || id === null || !su) return;
+    const tab = activeTab;
+    await su.improveCancel(id);
+    closeConfirm = false;
+    const st = statusOf(id);
+    closeImproveTab(tab, id, st !== null && isFinal(st.step));
   }
 
   async function rollbackUi(): Promise<void> {
@@ -802,17 +1052,6 @@
     } catch (err) {
       store.addBanner("Error", "ui_rollback", `Retour arrière : ${describeError(err)}`);
     }
-  }
-
-  function onImproveStatus(st: ImproveStatus): void {
-    improveLive = st;
-    if (FINAL_STEPS.includes(st.step)) void refreshUiInfo();
-  }
-
-  /** Abonnement du bandeau à l'avancement (`IMPROVE_EVENT`, ou le cœur simulé). */
-  function subscribeImprove(cb: (st: ImproveStatus) => void): Promise<() => void> {
-    const su = selfUpdate;
-    return su ? su.onImproveStatus(cb) : Promise.resolve(() => {});
   }
 
   /** Clé de la session principale affichée (mode simulé : `mock-1`). */
@@ -832,6 +1071,8 @@
       agentsRunningOpen,
       verbose,
       improveDismissed,
+      // J16 : la bascule recharge la page ; l'utilisateur reste sur l'onglet d'amélioration.
+      ...(tabKind === "improve" ? { improveTab: true } : {}),
     };
   }
 
@@ -877,18 +1118,24 @@
     }, SAVE_DELAY_MS);
   }
   $effect(() => {
-    void [draft, agentsOpen, agentsDoneOpen, agentsWaitingOpen, agentsRunningOpen, verbose, improveDismissed, session, mockReady];
+    void [draft, agentsOpen, agentsDoneOpen, agentsWaitingOpen, agentsRunningOpen, verbose, improveDismissed, session, mockReady, tabKind];
     if (booted) scheduleSave();
   });
 
   /**
    * Magasin d'une session rattachée : la principale a les crochets de l'app
-   * (palette, latence). La session d'amélioration n'est jamais affichée (le
-   * bandeau suit `ImproveStatus`) : pas de magasin, le routeur n'en garde que
-   * les derniers événements.
+   * (palette, latence). La conversation d'une amélioration (J16) a un magasin
+   * complet, sans limite, affiché dans son onglet : celui de l'onglet qui
+   * l'attend s'il est encore vide, sinon un neuf (adopté par l'onglet quand
+   * l'état de l'amélioration nomme la session).
    */
-  function routedStore(_key: SessionKey, role: "main" | "improve"): SessionStore | null {
-    return role === "main" ? newStore() : null;
+  function routedStore(key: SessionKey, role: "main" | "improve"): SessionStore | null {
+    if (role === "main") return newStore();
+    const waiting = [
+      ...(tabKind === "improve" ? [{ improveId, store }] : []),
+      ...tabs.filter((t) => t.kind === "improve" && t.id !== activeTab),
+    ].find((t) => statusOf(t.improveId)?.session === key && t.store.lastSeq < 0 && t.store.rows.length === 0);
+    return waiting?.store ?? improveStore();
   }
 
   /** La session principale rattachée devient la session affichée (aucune session relancée). */
@@ -1022,8 +1269,34 @@
         startError = mockMode ? String(err) : describeError(err);
       }
     }
+    // 4. J16 : conversation d'amélioration encore vivante (cycle en cours, ou
+    //    fini mais onglet pas fermé) : son onglet est rouvert, actif s'il
+    //    l'était (la bascule recharge la page pendant le cycle).
+    reopenImprove(r, live, saved);
     booted = true;
     saveUi();
+  }
+
+  /** Rouvre l'onglet d'amélioration au montage (voir `improveToReopen`). */
+  function reopenImprove(r: SessionRouter, live: SessionResync[], saved: UiSnapshot | null): void {
+    try {
+      const known = improveLive ?? uiInfo?.improve ?? null;
+      const re = improveToReopen(live, known, improveDismissed);
+      // Cycle en cours sans conversation encore (rechargé pendant la préparation) : onglet aussi.
+      const st = re?.status ?? (known && !isFinal(known.step) && known.id !== improveDismissed ? known : null);
+      if (!st) return;
+      noteImprove(st);
+      const activate = saved?.improveTab === true;
+      openImproveTab(st, activate);
+      const s = st.session !== null ? r.get(st.session) : undefined;
+      if (activate && s && store === s && saved?.session === st.session) {
+        draft = saved.draft;
+        sent.length = 0;
+        sent.push(...saved.sent);
+      }
+    } catch (err) {
+      console.warn("onglet d'amélioration non rouvert", describeError(err));
+    }
   }
 
   async function retryMount(): Promise<void> {
@@ -1049,6 +1322,8 @@
     };
     window.addEventListener("pagehide", onHide);
     window.addEventListener("beforeunload", onHide);
+    let unImprove: (() => void) | null = null;
+    let unmounted = false;
     (async () => {
       let su: SelfUpdateApi = tauriSelfUpdate;
       if (mockMode) {
@@ -1063,9 +1338,18 @@
         (window as unknown as Record<string, unknown>).__orchSelfUpdate = ms;
       }
       selfUpdate = su;
+      // Avancement des améliorations (`IMPROVE_EVENT`, ou le cœur simulé) : badge et barre de l'onglet.
+      su.onImproveStatus(onImproveStatus)
+        .then((u) => {
+          if (unmounted) u();
+          else unImprove = u;
+        })
+        .catch((err) => console.warn("avancement des améliorations indisponible", describeError(err)));
       await boot(su, saved);
     })();
     return () => {
+      unmounted = true;
+      unImprove?.();
       window.removeEventListener("pagehide", onHide);
       window.removeEventListener("beforeunload", onHide);
       if (saveTimer !== null) clearTimeout(saveTimer);
@@ -1148,12 +1432,26 @@
     initNames: string[];
     agentsOpen: string[];
     verbose: boolean;
+    /** J16 : onglet d'amélioration, et l'id de son amélioration. */
+    kind: TabKind;
+    improveId: string | null;
   };
 
   let nextTabId = 1;
   let activeTab = $state(0);
   /** Onglets dans l'ordre de la barre ; l'entrée de l'onglet actif n'est relue qu'en le quittant. */
   let tabs: Tab[] = $state.raw([blankTab(0, { store: firstStore })]);
+
+  /** Onglet d'amélioration qui tient un cycle en cours, ou `null`. */
+  const runningTab = $derived(
+    runningImproveTab(
+      tabs.map((t) =>
+        t.id === activeTab
+          ? { id: t.id, kind: tabKind, improve: statusOf(improveId) }
+          : { id: t.id, kind: t.kind, improve: statusOf(t.improveId) },
+      ),
+    ),
+  );
 
   function blankTab(id: number, over: Partial<Tab> = {}): Tab {
     return {
@@ -1172,6 +1470,8 @@
       initNames: [],
       agentsOpen: [],
       verbose: false,
+      kind: "conversation",
+      improveId: null,
       ...over,
     };
   }
@@ -1194,6 +1494,8 @@
       initNames,
       agentsOpen,
       verbose,
+      kind: tabKind,
+      improveId,
     };
   }
 
@@ -1214,6 +1516,9 @@
     initNames = t.initNames;
     agentsOpen = t.agentsOpen;
     verbose = t.verbose;
+    tabKind = t.kind;
+    improveId = t.improveId;
+    closeConfirm = false;
     // Palette, sélecteur de modèle et Échap armé appartiennent à l'onglet quitté.
     ctrlK = null;
     slashDismissed = null;
@@ -1259,9 +1564,18 @@
     loadTab(t);
   }
 
-  /** Ferme l'onglet et arrête sa session (le dernier onglet reste). */
+  /**
+   * Ferme l'onglet et arrête sa session (le dernier onglet reste). La
+   * session d'un onglet d'amélioration n'est jamais arrêtée ici : son cycle
+   * passe par `improve_cancel` / `improve_dismiss` (`requestClose`).
+   * Onglet d'amélioration seul : un onglet neuf le remplace.
+   */
   function closeTab(id: number): void {
-    if (tabs.length <= 1) return;
+    if (tabs.length <= 1) {
+      const only = id === activeTab ? tabKind : tabs.find((t) => t.id === id)?.kind;
+      if (only !== "improve") return;
+      newTab();
+    }
     const next = afterClose(
       tabs.map((t) => t.id),
       activeTab,
@@ -1274,7 +1588,7 @@
       if (target) loadTab(target);
     }
     tabs = tabs.filter((t) => t.id !== id);
-    if (closing?.session && !mockMode) void stopSession(closing.session).catch(() => {});
+    if (closing?.session && closing.kind !== "improve" && !mockMode) void stopSession(closing.session).catch(() => {});
   }
 
   /** Onglets tels que la barre les affiche (l'actif d'après les variables de l'app). */
@@ -1283,11 +1597,23 @@
       const live = t.id === activeTab;
       const naming = live ? { phase, cwd, projectPath } : t;
       const s = live ? store : t.store;
+      const busy = s.status === "Requesting" || s.status === "Streaming" || s.status === "Interrupting";
+      if ((live ? tabKind : t.kind) === "improve") {
+        const st = statusOf(live ? improveId : t.improveId);
+        return {
+          id: t.id,
+          label: improveTabLabel(st?.request ?? null),
+          title: improveTabTitle(st),
+          busy,
+          waiting: false,
+          improve: { badge: st ? improveBadge(st) : null, step: st?.step ?? null },
+        };
+      }
       return {
         id: t.id,
         label: tabLabel(naming),
         title: tabTitle(naming),
-        busy: s.status === "Requesting" || s.status === "Streaming" || s.status === "Interrupting",
+        busy,
         waiting: s.question !== null,
       };
     }),
@@ -1315,7 +1641,7 @@
 
 <main>
   <TitleBar version={store.meta.version} />
-  <TabBar tabs={tabViews} active={activeTab} onselect={selectTab} onnew={newTab} onclose={closeTab} />
+  <TabBar tabs={tabViews} active={activeTab} onselect={selectTab} onnew={newTab} onclose={requestClose} />
   {#each store.banners as b (b.id)}
     {#if b.code === VERSION_NOTICE_CODE}
       <VersionNotice
@@ -1339,22 +1665,6 @@
   {/if}
   {#if launchError}
     <div class="banner" data-testid="launch-error">{launchError}</div>
-  {/if}
-  {#if selfUpdate}
-    <!-- J14 : avancement de `/ameliorer` (session dédiée, tests, bascule, échec). -->
-    <ImproveBanner
-      initial={uiInfo?.improve ?? null}
-      subscribe={subscribeImprove}
-      repoPath={uiInfo && uiInfo.repo.state !== "disabled" && uiInfo.repo.state !== "unknown" ? uiInfo.repo.path : null}
-      dismissed={improveDismissed}
-      oncancel={(id) => selfUpdate!.improveCancel(id)}
-      onrollback={() => void rollbackUi()}
-      ondismiss={(id) => {
-        improveDismissed = id;
-        prompt?.focus();
-      }}
-      onstatus={onImproveStatus}
-    />
   {/if}
   <div class="split">
     <div class="left">
@@ -1384,7 +1694,7 @@
         <Conversation {store} {verbose} bind:this={conversation} />
         <!-- Vue détaillée (Ctrl+O) : la barre « Showing detailed transcript » de la
              conversation remplace la saisie et la ligne d'état, comme le TUI (03b). -->
-        {#if store.question}
+        {#if store.question && tabKind !== "improve"}
           <!-- La carte prend la place de la saisie et de la ligne d'état (`07`). -->
           <QuestionCard
             bind:this={card}
@@ -1394,15 +1704,30 @@
             onchat={chatAboutQuestion}
           />
         {:else if !verbose}
+          {#if tabKind === "improve"}
+            <!-- J16 : état du cycle, « Valider », « Annuler l'amélioration », confirmation de fermeture. -->
+            <ImproveControls
+              status={activeImprove}
+              {repoPath}
+              confirming={closeConfirm}
+              onvalidate={() => (improveId && selfUpdate ? selfUpdate.improveValidate(improveId) : Promise.resolve())}
+              oncancel={() => (improveId && selfUpdate ? selfUpdate.improveCancel(improveId) : Promise.resolve())}
+              onabandon={abandonImprove}
+              oncontinue={() => {
+                closeConfirm = false;
+                prompt?.focus();
+              }}
+            />
+          {/if}
           <Prompt
             bind:this={prompt}
             bind:draft
             bind:pickerOpen
-            disabled={!ready || store.status === "Exited"}
+            disabled={tabKind === "improve" ? improveBlocked !== null : !ready || store.status === "Exited"}
             {placeholder}
             hint={keys.hint ?? notice}
             {history}
-            models={store.meta.models}
+            models={tabKind === "improve" ? [] : store.meta.models}
             currentModel={store.meta.model}
             onsubmit={submit}
             onslash={() => openPalette("slash")}
@@ -1429,7 +1754,7 @@
         >ui {UI_HASH.slice(0, 7)}{uiInfo ? (uiInfo.source === "disk" ? " (disque)" : " (embarquée)") : ""}</span
       >
     {/if}
-    <span class="seg surface path" class:alone={!UI_HASH}>{cwd}</span>
+    <span class="seg surface path" class:alone={!UI_HASH}>{tabKind === "improve" ? (store.meta.cwd ?? cwd) : cwd}</span>
     <!-- data-* : mesures de la recette sur l'exe (J14 : lignes, trous de seq). -->
     <span
       class="mid"

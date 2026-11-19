@@ -25,6 +25,7 @@ import type { QuestionItem } from "../core/bindings/QuestionItem";
 import type { ResultPart } from "../core/bindings/ResultPart";
 import type { SessionState } from "../core/bindings/SessionState";
 import type { UserOrigin } from "../core/bindings/UserOrigin";
+import { isImproveNotice } from "./improve";
 
 /** `at` : horodatage `t` de l'événement source (ms epoch), pour le rendu (heure, durée). */
 export type UserRow = { kind: "user"; id: string; text: string; origin: UserOrigin; at: number };
@@ -109,6 +110,14 @@ export type SessionMeta = {
 
 /** Planificateur d'image ; remplaçable en test. */
 export type FrameScheduler = (cb: () => void) => void;
+
+/**
+ * Rôle du magasin : `improve` pour la conversation d'une amélioration (J16,
+ * onglet d'amélioration) : les `notice` `improve.*` (étapes du pipeline) sont
+ * des lignes du fil, et la sortie du processus entre deux tours est attendue
+ * (pas de bandeau `exited`).
+ */
+export type StoreRole = "main" | "improve";
 
 const defaultScheduler: FrameScheduler = (cb) =>
   typeof requestAnimationFrame === "function" ? requestAnimationFrame(() => cb()) : setTimeout(cb, 16);
@@ -212,8 +221,12 @@ export class SessionStore {
   #thinkStart: number | null = null;
   #noticeId = 0;
 
-  constructor(schedule: FrameScheduler = defaultScheduler) {
+  /** `improve` : conversation d'une amélioration (voir `StoreRole`). */
+  readonly role: StoreRole;
+
+  constructor(schedule: FrameScheduler = defaultScheduler, role: StoreRole = "main") {
     this.#schedule = schedule;
+    this.role = role;
   }
 
   /** Reçoit un lot du canal ; il sera appliqué à la prochaine image. */
@@ -534,6 +547,12 @@ export class SessionStore {
         });
         break;
       case "notice": {
+        // J16 : étapes du pipeline, lignes d'état grises dans l'ordre du fil
+        // (conservées au rechargement) ; le message porte son glyphe (✻, ✗).
+        if (this.role === "improve" && isImproveNotice(ev.code)) {
+          this.#append({ kind: "plain", id: this.#id("p", ev.seq), text: ev.message });
+          break;
+        }
         if (ev.level === "Info") {
           this.infos.push({ id: this.#noticeId++, level: ev.level, code: ev.code, message: ev.message, seq: ev.seq });
         } else this.addBanner(ev.level, ev.code, ev.message, ev.seq, ev.detail);
@@ -545,6 +564,18 @@ export class SessionStore {
       case "exited":
         this.#closeLive();
         this.status = "Exited";
+        if (this.role === "improve") {
+          // Un processus par tour : sa sortie entre deux tours est attendue.
+          // Arrêt en plein tour : une ligne du fil, pas de bandeau (le cycle
+          // passe en attente de l'utilisateur, `session_stopped`).
+          if (ev.during_turn)
+            this.#append({
+              kind: "plain",
+              id: this.#id("p", ev.seq),
+              text: `session arrêtée pendant le tour (code ${ev.code ?? "?"})`,
+            });
+          break;
+        }
         this.addBanner("Error", "exited", `claude.exe s'est arrêté (code ${ev.code ?? "?"})`, ev.seq);
         break;
     }

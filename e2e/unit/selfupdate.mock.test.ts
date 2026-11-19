@@ -92,15 +92,15 @@ describe("MockSelfUpdate", () => {
   });
 });
 
-describe("bandeau d'amélioration", () => {
+describe("textes de l'amélioration (state/improve.ts, ex-bandeau)", () => {
   it("demande sur plusieurs lignes : une seule ligne, tronquée", async () => {
-    const { oneLine } = await import("../../src/lib/components/ImproveBanner.svelte");
+    const { oneLine } = await import("../../src/lib/state/improve");
     expect(oneLine("Bandeau\n  plus\r\ndiscret\t")).toBe("Bandeau plus discret");
     expect(oneLine("x".repeat(300), 10)).toBe(`${"x".repeat(9)}…`);
   });
 
   it("envoi : rien pour les autres utilisateurs ; « poussé » ou « envoi échoué » pour le propriétaire", async () => {
-    const { pushText, bannerText } = await import("../../src/lib/components/ImproveBanner.svelte");
+    const { pushText, bannerText } = await import("../../src/lib/state/improve");
     const base: ImproveStatus = {
       id: "i",
       branch: "auto/20261117-1200-x",
