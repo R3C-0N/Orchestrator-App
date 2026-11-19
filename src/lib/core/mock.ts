@@ -605,7 +605,10 @@ export const MOCK_IMPROVE_STEPS: ImproveStep[] = [
  *   retour à la session ;
  * - `session_stopped` : le processus du premier tour s'arrête seul, sans
  *   `improve.turn_end` avant `exited` (vraie erreur : bandeau), puis
- *   `awaiting_user` (`session_stopped`).
+ *   `awaiting_user` (`session_stopped`) ;
+ * - `resume_fallback` : comme `fix`, mais le tour de correction ne trouve
+ *   pas le transcript de la session : notice `warn` `improve.resume_fallback`,
+ *   relance par `--session-id` avec la consigne redonnée.
  */
 export type MockImproveOutcome =
   | "merged"
@@ -615,7 +618,8 @@ export type MockImproveOutcome =
   | "exhausted"
   | "no_commit"
   | "violation"
-  | "session_stopped";
+  | "session_stopped"
+  | "resume_fallback";
 
 /**
  * Étapes simulées pour chaque issue, sans intervention de l'utilisateur
@@ -631,6 +635,7 @@ export function mockImproveSteps(outcome: MockImproveOutcome): ImproveStep[] {
     case "failed":
       return ["preparing", "working", ...checks, outcome];
     case "fix":
+    case "resume_fallback":
       return ["preparing", "working", ...fix, ...MOCK_IMPROVE_STEPS.slice(2)];
     case "exhausted":
       return ["preparing", "working", ...fix, ...fix, ...fix, ...checks, "awaiting_user"];
@@ -812,7 +817,7 @@ export function mockLiveSessions(rows: number, historyRows = 0, seed = 15): Sess
 
 /**
  * Paramètres J14 et J16 du mode simulé lus dans l'URL :
- * `improve=merged|restart|failed|fix|exhausted|nocommit|violation` (issue du
+ * `improve=merged|restart|failed|fix|exhausted|nocommit|violation|crash|resumefallback` (issue du
  * cycle, voir `MockImproveOutcome`), `push=pushed|failed` (envoi de la branche
  * après la fusion, propriétaire), `repo=disabled|cloning`, `attach=<lignes>`
  * (sessions vivantes au montage), `attachFail=<n>` (les n premiers
@@ -831,6 +836,7 @@ export function mockSelfUpdateFromUrl(search: string): MockSelfUpdateOptions & {
   else if (imp === "nocommit" || imp === "no_commit" || imp === "no_new_commit") out.outcome = "no_commit";
   else if (imp === "violation" || imp === "guard") out.outcome = "violation";
   else if (imp === "crash" || imp === "session_stopped") out.outcome = "session_stopped";
+  else if (imp === "resumefallback" || imp === "resume_fallback") out.outcome = "resume_fallback";
   const unmerged = Number(p.get("unmerged"));
   if (Number.isInteger(unmerged) && unmerged > 0)
     out.unmerged = Array.from({ length: unmerged }, (_, i) => `auto/20261116-0900-essai-${i + 1}`);
@@ -894,6 +900,8 @@ export type MockCycle = {
   cancelling?: boolean;
   /** Le processus du premier tour s'arrête seul (issue `session_stopped`). */
   crash?: boolean;
+  /** Le prochain tour en reprise ne trouve pas de transcript (issue `resume_fallback`). */
+  noTranscript?: boolean;
 };
 
 /** Clé du `sessionStorage` où le cœur simulé garde son état à travers un rechargement. */
@@ -1063,7 +1071,8 @@ export class MockSelfUpdate {
       queued: [],
       inTurn: false,
       turnCommits: false,
-      failsLeft: o === "fix" ? 1 : o === "exhausted" ? MOCK_MAX_ATTEMPTS + 1 : 0,
+      noTranscript: o === "resume_fallback",
+      failsLeft: o === "fix" || o === "resume_fallback" ? 1 : o === "exhausted" ? MOCK_MAX_ATTEMPTS + 1 : 0,
       noCommitLeft: o === "no_commit" ? 1 : 0,
       violation: o === "violation",
       crash: o === "session_stopped",
@@ -1313,15 +1322,26 @@ export class MockSelfUpdate {
     c.inTurn = true;
     c.turnCommits = commits;
     const msg = `msg_improve_${c.n}_${c.turn}`;
+    // Reprise sans transcript (`improve.resume_fallback`, cœur `3fed92c`) : nouvelle session, consigne redonnée.
+    const fallback = c.turn > 0 && c.noTranscript === true;
     this.#set({ step: kind, waiting: null, detail: null, ...(kind === "working" ? { attempt: 0 } : {}) });
     if (kind === "fixing")
       this.#note("Info", "improve.fixing", `✻ Correction automatique (tentative ${c.attempt}/${MOCK_MAX_ATTEMPTS})`);
+    if (fallback) {
+      c.noTranscript = false;
+      this.#note(
+        "Warn",
+        "improve.resume_fallback",
+        "historique de la session introuvable : nouvelle session, consigne redonnée",
+      );
+      message = `${mockImprovePrompt(c.request)}\n\n${message}`;
+    }
     this.#events([
       {
         kind: "starting",
         pid: this.#pid(),
         cwd: this.#cwd(),
-        args: c.turn === 0 ? ["--session-id", c.id] : ["--resume", c.id],
+        args: c.turn === 0 || fallback ? ["--session-id", c.id] : ["--resume", c.id],
       },
       { kind: "user_message", thread: "main", uuid: null, text: message, origin: "Typed" },
       { kind: "status", state: "Streaming" },
