@@ -317,8 +317,10 @@ impl AppState {
         }
     }
 
-    /// Ferme les sessions principales démarrées avant `keep` (J14, étape 5) :
-    /// le cœur garde au plus une session `Main`. L'interface n'en affiche
+    /// Ferme les sessions principales démarrées avant `keep` (J14, étape 5).
+    /// Plus appelé par `start_session` depuis les onglets (une session `Main`
+    /// par onglet) ; gardé pour les outils et les tests. Avant les onglets,
+    /// le cœur gardait au plus une session `Main` : l'interface n'en affichait
     /// qu'une (`mainOf` au rattachement) ; une deuxième (nouvelle session
     /// lancée à côté de la courante) continuerait sinon invisible jusqu'à la
     /// fermeture de l'app. Une session plus récente que `keep` n'est jamais
@@ -548,7 +550,7 @@ pub async fn start_session(
     let exe = locate_claude().map_err(|tried| CoreError::ClaudeNotFound(tried.join(" ; ")))?;
     let cwd = PathBuf::from(cwd);
     let page = channel_sink(events, state.page_gen.clone(), state.reaper());
-    // Un démarrage à la fois (lancement puis fermeture des anciennes).
+    // Un démarrage à la fois.
     let _one = state.main_start.lock().await;
     let session = state
         .spawn_session(
@@ -565,8 +567,9 @@ pub async fn start_session(
             SessionConfig::default(),
         )
         .await?;
-    // Au plus une session principale (J14, étape 5).
-    state.close_other_mains(&session.key).await;
+    // Onglets de l'interface : plusieurs sessions principales vivent côte à
+    // côte (une par onglet) ; `close_other_mains` n'est plus appelé ici.
+    // L'interface ferme la session d'un onglet fermé (`stop_session`).
     Ok(SessionStarted {
         session: session.key.clone(),
         pid: session.pid,

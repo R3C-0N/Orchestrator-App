@@ -14,6 +14,11 @@
   // J11 (décision 11) : lancée sans dossier en argument, l'app montre le
   // sélecteur des projets, puis celui des sessions du projet choisi
   // (nouvelle session ou reprise avec tout l'historique).
+  // Onglets (`TabBar`, sous la barre de titre) : une conversation par onglet,
+  // chacune avec sa session `claude.exe` et son magasin ; « + » ouvre un
+  // onglet sur le sélecteur des projets. Les variables de la session affichée
+  // (magasin, session, saisie…) sont celles de l'onglet actif ; celles des
+  // autres onglets sont rangées dans `tabs` et rétablies au changement.
   // J14 (décisions 15 à 19) : au montage, rattachement aux sessions vivantes
   // du cœur (`attach_sessions`, rejeu de l'historique et du journal) avant
   // tout démarrage, puis signal « prêt » (`ui_ready`) ; saisie, historique ↑↓,
@@ -34,6 +39,7 @@
   import UiNotice from "./lib/components/UiNotice.svelte";
   import VersionNotice from "./lib/components/VersionNotice.svelte";
   import TitleBar from "./lib/components/TitleBar.svelte";
+  import TabBar from "./lib/components/TabBar.svelte";
   import ThemeToggle from "./lib/components/ThemeToggle.svelte";
   // Applique le thème mémorisé dès le démarrage.
   import "./lib/state/theme.svelte";
@@ -70,6 +76,7 @@
     type UiSnapshot,
   } from "./lib/state/sessions.svelte";
   import { VERSION_NOTICE_CODE, noticeVersion } from "./lib/state/versionNotice";
+  import { afterClose, tabLabel, tabTitle, type TabView } from "./lib/state/tabs";
 
   // Mode simulé : `?mock=…`, ou d'office hors de Tauri. `mock.ts` n'est
   // chargé qu'à ce moment (import dynamique, hors du bundle principal).
@@ -80,7 +87,8 @@
    * Magasin de la session affichée. Une reprise en crée un neuf (plan 1.5) :
    * `$state.raw`, la réaffectation est suivie, le magasin n'est pas proxifié.
    */
-  let store: SessionStore = $state.raw(newStore());
+  const firstStore = newStore();
+  let store: SessionStore = $state.raw(firstStore);
 
   /**
    * Magasin neuf : ses lots passent d'abord par `noteInit` (noms de `init`
@@ -951,6 +959,8 @@
    */
   async function boot(su: SelfUpdateApi, saved: UiSnapshot | null): Promise<void> {
     mountError = null;
+    // « Réessayer » : les onglets ajoutés par un essai précédent repartent.
+    tabs = tabs.filter((t) => t.id === activeTab);
     router?.dispose();
     const r = new SessionRouter(routedStore);
     router = r;
@@ -968,10 +978,22 @@
     let main: SessionResync | null;
     try {
       r.resync(live);
-      main = mainOf(live);
+      // Onglets : la session affichée avant le rechargement si elle vit
+      // encore, sinon `mainOf` ; les autres sessions principales en cours
+      // reprennent chacune leur onglet, à côté.
+      main = live.find((x) => x.role === "main" && x.running && x.session === saved?.session) ?? mainOf(live);
       if (main) {
         await adoptMain(r, main);
         restoreUi(saved);
+        if (!mockMode) {
+          const shown = main.session;
+          const others = live.filter((x) => x.role === "main" && x.running && x.session !== shown);
+          const extra = others.flatMap((x) => {
+            const s = r.get(x.session);
+            return s ? [blankTab(nextTabId++, { store: s, session: x.session, phase: "start", cwd: x.cwd })] : [];
+          });
+          if (extra.length > 0) tabs = [...tabs, ...extra];
+        }
       }
     } catch (err) {
       r.dispose();
@@ -1082,11 +1104,9 @@
     try {
       const started = await startSession(path, s.push);
       // Un `exited` arrivé pendant le démarrage ne doit pas être écrasé.
-      if (s === store && s.status !== "Exited") session = started.session;
+      if (s.status !== "Exited") updateTabOf(s, { session: started.session });
     } catch (err) {
-      if (s !== store) return;
-      startError = describeError(err);
-      startFailed = { path, resumeId: null };
+      updateTabOf(s, { startError: describeError(err), startFailed: { path, resumeId: null } });
     }
   }
 
@@ -1103,14 +1123,175 @@
     session = null;
     try {
       const { started } = await resumeSession({ startSession, stopSession }, { current, cwd: path, sessionId: id, store: s });
-      if (s !== store) return;
-      if (s.status !== "Exited") session = started.session;
+      if (s.status !== "Exited") updateTabOf(s, { session: started.session });
     } catch (err) {
-      if (s !== store) return;
-      startError = describeError(err);
-      startFailed = { path, resumeId: id };
+      updateTabOf(s, { startError: describeError(err), startFailed: { path, resumeId: id } });
     }
   }
+
+  // --- Onglets ---------------------------------------------------------------
+
+  /** État d'un onglet rangé (les variables de l'onglet actif sont celles de l'app). */
+  type Tab = {
+    id: number;
+    store: SessionStore;
+    session: SessionKey | null;
+    mockReady: boolean;
+    backend: Backend;
+    phase: "start" | "projects" | "sessions";
+    projectPath: string | null;
+    cwd: string;
+    startError: string | null;
+    startFailed: { path: string; resumeId: string | null } | null;
+    draft: string;
+    sent: string[];
+    initNames: string[];
+    agentsOpen: string[];
+    verbose: boolean;
+  };
+
+  let nextTabId = 1;
+  let activeTab = $state(0);
+  /** Onglets dans l'ordre de la barre ; l'entrée de l'onglet actif n'est relue qu'en le quittant. */
+  let tabs: Tab[] = $state.raw([blankTab(0, { store: firstStore })]);
+
+  function blankTab(id: number, over: Partial<Tab> = {}): Tab {
+    return {
+      id,
+      store: over.store ?? newStore(),
+      session: null,
+      mockReady: false,
+      backend: tauriBackend,
+      phase: "projects",
+      projectPath: null,
+      cwd: "",
+      startError: null,
+      startFailed: null,
+      draft: "",
+      sent: [],
+      initNames: [],
+      agentsOpen: [],
+      verbose: false,
+      ...over,
+    };
+  }
+
+  /** L'onglet actif, tel qu'il est maintenant. */
+  function captureTab(): Tab {
+    return {
+      id: activeTab,
+      store,
+      session,
+      mockReady,
+      backend,
+      phase,
+      projectPath,
+      cwd,
+      startError,
+      startFailed,
+      draft,
+      sent: [...sent],
+      initNames,
+      agentsOpen,
+      verbose,
+    };
+  }
+
+  function loadTab(t: Tab): void {
+    activeTab = t.id;
+    store = t.store;
+    session = t.session;
+    mockReady = t.mockReady;
+    backend = t.backend;
+    phase = t.phase;
+    projectPath = t.projectPath;
+    cwd = t.cwd;
+    startError = t.startError;
+    startFailed = t.startFailed;
+    draft = t.draft;
+    sent.length = 0;
+    sent.push(...t.sent);
+    initNames = t.initNames;
+    agentsOpen = t.agentsOpen;
+    verbose = t.verbose;
+    // Palette, sélecteur de modèle et Échap armé appartiennent à l'onglet quitté.
+    ctrlK = null;
+    slashDismissed = null;
+    pickerOpen = false;
+    interruptAsked = false;
+    keys.disarm();
+    void tick().then(() => prompt?.focus());
+  }
+
+  /**
+   * Résultat d'un démarrage pour le magasin `s` : appliqué à l'onglet actif
+   * s'il l'affiche, sinon à l'onglet rangé qui le porte (l'utilisateur a
+   * changé d'onglet pendant le démarrage). Un magasin remplacé entre-temps
+   * (nouvel essai) n'appartient plus à aucun onglet : rien n'est fait.
+   */
+  function updateTabOf(s: SessionStore, patch: Partial<Pick<Tab, "session" | "startError" | "startFailed">>): void {
+    if (s === store) {
+      if (patch.session !== undefined) session = patch.session;
+      if (patch.startError !== undefined) startError = patch.startError;
+      if (patch.startFailed !== undefined) startFailed = patch.startFailed;
+      return;
+    }
+    tabs = tabs.map((t) => (t.store === s ? { ...t, ...patch } : t));
+  }
+
+  function selectTab(id: number): void {
+    if (id === activeTab) {
+      prompt?.focus();
+      return;
+    }
+    const target = tabs.find((t) => t.id === id);
+    if (!target) return;
+    const current = captureTab();
+    tabs = tabs.map((t) => (t.id === current.id ? current : t));
+    loadTab(target);
+  }
+
+  /** « + » : nouvel onglet sur le sélecteur des projets. */
+  function newTab(): void {
+    const current = captureTab();
+    const t = blankTab(nextTabId++);
+    tabs = [...tabs.map((x) => (x.id === current.id ? current : x)), t];
+    loadTab(t);
+  }
+
+  /** Ferme l'onglet et arrête sa session (le dernier onglet reste). */
+  function closeTab(id: number): void {
+    if (tabs.length <= 1) return;
+    const next = afterClose(
+      tabs.map((t) => t.id),
+      activeTab,
+      id,
+    );
+    if (next === null) return;
+    const closing = id === activeTab ? captureTab() : tabs.find((t) => t.id === id);
+    if (id === activeTab) {
+      const target = tabs.find((t) => t.id === next);
+      if (target) loadTab(target);
+    }
+    tabs = tabs.filter((t) => t.id !== id);
+    if (closing?.session && !mockMode) void stopSession(closing.session).catch(() => {});
+  }
+
+  /** Onglets tels que la barre les affiche (l'actif d'après les variables de l'app). */
+  const tabViews: TabView[] = $derived(
+    tabs.map((t) => {
+      const live = t.id === activeTab;
+      const naming = live ? { phase, cwd, projectPath } : t;
+      const s = live ? store : t.store;
+      return {
+        id: t.id,
+        label: tabLabel(naming),
+        title: tabTitle(naming),
+        busy: s.status === "Requesting" || s.status === "Streaming" || s.status === "Interrupting",
+        waiting: s.question !== null,
+      };
+    }),
+  );
 
   /** Après un échec de démarrage : même demande, magasin neuf. */
   function retryStart(): void {
@@ -1134,6 +1315,7 @@
 
 <main>
   <TitleBar version={store.meta.version} />
+  <TabBar tabs={tabViews} active={activeTab} onselect={selectTab} onnew={newTab} onclose={closeTab} />
   {#each store.banners as b (b.id)}
     {#if b.code === VERSION_NOTICE_CODE}
       <VersionNotice
