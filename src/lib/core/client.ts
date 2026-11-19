@@ -10,6 +10,7 @@ import type { Diagnostics } from "./bindings/Diagnostics";
 import type { ExitInfo } from "./bindings/ExitInfo";
 import type { HistoryLoaded } from "./bindings/HistoryLoaded";
 import type { ImproveStatus } from "./bindings/ImproveStatus";
+import type { ImproveWaiting } from "./bindings/ImproveWaiting";
 import type { InterruptAck } from "./bindings/InterruptAck";
 import type { LaunchInfo } from "./bindings/LaunchInfo";
 import type { SessionKey } from "./bindings/SessionKey";
@@ -27,6 +28,7 @@ export type {
   ExitInfo,
   HistoryLoaded,
   ImproveStatus,
+  ImproveWaiting,
   InterruptAck,
   LaunchInfo,
   SessionKey,
@@ -116,6 +118,18 @@ export const improveStart = (request: string) => invoke<ImproveStatus>("improve_
 
 export const improveCancel = (id: string) => invoke<void>("improve_cancel", { id });
 
+/** J16 : message de l'utilisateur à la session de l'amélioration `id` (onglet d'amélioration). */
+export const improveSend = (id: string, text: string) => invoke<void>("improve_send", { id, text });
+
+/** J16 : « Valider » : contrôles et tests relancés pour l'amélioration `id` en attente. */
+export const improveValidate = (id: string) => invoke<void>("improve_validate", { id });
+
+/** J16 : interrompt le tour en cours de la session de l'amélioration `id` (Échap). */
+export const improveInterrupt = (id: string) => invoke<void>("improve_interrupt", { id });
+
+/** J16 : onglet de l'amélioration `id` (terminée) fermé : le cœur libère son journal. */
+export const improveDismiss = (id: string) => invoke<void>("improve_dismiss", { id });
+
 /** Revient à la version précédente de l'interface. */
 export const uiRollback = () => invoke<UiInfo>("ui_rollback");
 
@@ -133,6 +147,10 @@ export type SelfUpdateApi = {
   getUiInfo(): Promise<UiInfo>;
   improveStart(request: string): Promise<ImproveStatus>;
   improveCancel(id: string): Promise<void>;
+  improveSend(id: string, text: string): Promise<void>;
+  improveValidate(id: string): Promise<void>;
+  improveInterrupt(id: string): Promise<void>;
+  improveDismiss(id: string): Promise<void>;
   uiRollback(): Promise<UiInfo>;
   onImproveStatus(cb: (s: ImproveStatus) => void): Promise<() => void>;
 };
@@ -143,6 +161,10 @@ export const tauriSelfUpdate: SelfUpdateApi = {
   getUiInfo,
   improveStart,
   improveCancel,
+  improveSend,
+  improveValidate,
+  improveInterrupt,
+  improveDismiss,
   uiRollback,
   async onImproveStatus(cb) {
     const { listen } = await import("@tauri-apps/api/event");

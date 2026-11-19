@@ -17,6 +17,10 @@
   export const STEP_LABEL: Record<ImproveStep, string> = {
     preparing: "préparation du worktree",
     working: "Claude modifie le code (session dédiée)",
+    // J16, étape 0 : étapes du cycle itératif, pas encore émises par le cœur
+    // (hors `RUNNING_STEPS` : le bandeau est remplacé par l'onglet à l'étape C).
+    fixing: "correction automatique (erreur renvoyée à la session)",
+    awaiting_user: "en attente de l'utilisateur",
     checking: "contrôle de la branche",
     testing: "tests (check, unitaires, e2e)",
     building: "build de l'interface",

@@ -87,6 +87,10 @@ pub fn run() {
             self_update::improve_start,
             self_update::improve_cancel,
             self_update::ui_rollback,
+            self_update::improve_send,
+            self_update::improve_validate,
+            self_update::improve_interrupt,
+            self_update::improve_dismiss,
         ])
         .build(context)
         .expect("échec de la construction de l'app Tauri");

@@ -617,6 +617,9 @@ export type MockSelfUpdateOptions = {
 /** Détail d'un échec simulé (étape `testing`). */
 export const MOCK_FAIL_DETAIL = "npm test : 2 tests en échec (e2e/unit/resync.test.ts)";
 
+/** Plafond des tours de correction automatique (`MAX_AUTO_ATTEMPTS` côté Rust, J16). */
+export const MOCK_MAX_ATTEMPTS = 3;
+
 /**
  * Sessions vivantes simulées pour `attachSessions` : la session principale
  * (`mock-1`, historique repris de `historyRows` lignes puis journal d'environ
@@ -838,6 +841,10 @@ export class MockSelfUpdate {
       detail: step === "failed" ? MOCK_FAIL_DETAIL : null,
       push: null,
       t: Date.now(),
+      attempt: 0,
+      max_attempts: MOCK_MAX_ATTEMPTS,
+      turn: 0,
+      waiting: null,
     });
     mockImproveSteps(this.outcome).forEach((step, i) => {
       if (i === 0) return;
@@ -901,6 +908,31 @@ export class MockSelfUpdate {
     this.#timers.forEach(clearTimeout);
     this.#timers = [];
     this.#emit({ ...cur, step: "cancelled", t: Date.now() });
+    return Promise.resolve();
+  }
+
+  // J16 (onglet d'amélioration), étape 0 : ébauches. Comme le cœur
+  // provisoire, `improve_send`, `improve_validate` et `improve_interrupt`
+  // répondent `not_implemented` ; `improve_dismiss` est neutre. Le mode
+  // simulé de la conversation est écrit à l'étape D.
+
+  improveSend(id: string, text: string): Promise<void> {
+    this.calls.push({ cmd: "improve_send", args: { id, text } });
+    return Promise.reject({ kind: "not_implemented", message: "improve_send (simulé, étape 0)" });
+  }
+
+  improveValidate(id: string): Promise<void> {
+    this.calls.push({ cmd: "improve_validate", args: { id } });
+    return Promise.reject({ kind: "not_implemented", message: "improve_validate (simulé, étape 0)" });
+  }
+
+  improveInterrupt(id: string): Promise<void> {
+    this.calls.push({ cmd: "improve_interrupt", args: { id } });
+    return Promise.reject({ kind: "not_implemented", message: "improve_interrupt (simulé, étape 0)" });
+  }
+
+  improveDismiss(id: string): Promise<void> {
+    this.calls.push({ cmd: "improve_dismiss", args: { id } });
     return Promise.resolve();
   }
 

@@ -923,6 +923,10 @@ impl Pipeline {
                 detail: None,
                 push: None,
                 t: now_ms(),
+                attempt: 0,
+                max_attempts: super::MAX_AUTO_ATTEMPTS,
+                turn: 0,
+                waiting: None,
             },
             sink,
         };
@@ -1453,6 +1457,30 @@ impl Pipeline {
                 "aucune amélioration en cours d'identifiant {id}"
             ))),
         }
+    }
+
+    /// Jalon J16, étape A : message de l'utilisateur pour le cycle `id`
+    /// ([`Pipeline::send`]). Provisoire (étape 0) : non pris en charge.
+    pub(super) fn send_active(&self, _id: &str, _text: &str) -> Result<(), CoreError> {
+        Err(CoreError::NotImplemented(
+            "message à la session d'amélioration (improve_send)".into(),
+        ))
+    }
+
+    /// Jalon J16, étape A : « Valider » ([`Pipeline::validate`]). Provisoire
+    /// (étape 0) : non pris en charge.
+    pub(super) fn validate_active(&self, _id: &str) -> Result<(), CoreError> {
+        Err(CoreError::NotImplemented(
+            "validation de l'amélioration (improve_validate)".into(),
+        ))
+    }
+
+    /// Jalon J16, étape A : interruption du tour ([`Pipeline::interrupt`]).
+    /// Provisoire (étape 0) : non pris en charge.
+    pub(super) async fn interrupt_active(&self, _id: &str) -> Result<(), CoreError> {
+        Err(CoreError::NotImplemented(
+            "interruption de la session d'amélioration (improve_interrupt)".into(),
+        ))
     }
 
     pub(super) async fn revert_request(

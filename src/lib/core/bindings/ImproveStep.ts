@@ -3,4 +3,4 @@
 /**
  * Étape d'une amélioration (décision 17).
  */
-export type ImproveStep = "preparing" | "working" | "checking" | "testing" | "building" | "waiting_idle" | "switching" | "merged" | "restart_required" | "failed" | "cancelled" | "rolled_back";
+export type ImproveStep = "preparing" | "working" | "fixing" | "awaiting_user" | "checking" | "testing" | "building" | "waiting_idle" | "switching" | "merged" | "restart_required" | "failed" | "cancelled" | "rolled_back";

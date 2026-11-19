@@ -111,6 +111,10 @@ describe("bandeau d'amélioration", () => {
       detail: null,
       push: null,
       t: 1,
+      attempt: 0,
+      max_attempts: 3,
+      turn: 0,
+      waiting: null,
     };
     expect(pushText(base)).toBeNull();
     expect(pushText({ ...base, push: { state: "pushing", branch: base.branch } })).toContain("envoi sur GitHub");

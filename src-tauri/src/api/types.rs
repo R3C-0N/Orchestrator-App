@@ -344,8 +344,14 @@ pub enum PushResult {
 pub enum ImproveStep {
     /// Création du worktree et de la branche.
     Preparing,
-    /// Session `claude.exe` dédiée au travail.
+    /// Session `claude.exe` dédiée au travail (tour demandé par l'utilisateur).
     Working,
+    /// Tour de correction automatique : un contrôle ou un test a échoué et
+    /// l'erreur a été renvoyée à la session (`ImproveStatus::attempt`).
+    Fixing,
+    /// En attente de l'utilisateur (message ou « Valider ») ; raison dans
+    /// `ImproveStatus::waiting`.
+    AwaitingUser,
     /// Contrôles : arbre propre, commits sur la branche, fichiers permis.
     Checking,
     Testing,
@@ -390,6 +396,34 @@ pub struct ImproveStatus {
     /// Heure de la dernière transition (ms depuis l'epoch).
     #[ts(type = "number")]
     pub t: u64,
+    /// Tours de correction automatique faits depuis le dernier message de
+    /// l'utilisateur (0 à `max_attempts`).
+    pub attempt: u32,
+    /// Plafond des tours de correction automatique
+    /// (`selfupdate::MAX_AUTO_ATTEMPTS`).
+    pub max_attempts: u32,
+    /// Tours de session terminés depuis le début du cycle (0 avant le
+    /// premier).
+    pub turn: u32,
+    /// Raison de l'attente quand `step` vaut `AwaitingUser`, sinon `None`.
+    pub waiting: Option<ImproveWaiting>,
+}
+
+/// Pourquoi un cycle attend l'utilisateur (`ImproveStep::AwaitingUser`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ImproveWaiting {
+    /// Tour terminé sans nouveau commit (question posée en texte, demande
+    /// impossible…) : rien à tester.
+    NoNewCommit,
+    /// Tour interrompu par l'utilisateur (Échap).
+    Interrupted,
+    /// Les tours de correction automatique sont épuisés.
+    AttemptsExhausted,
+    /// La session s'est arrêtée avant la fin de son tour, ou a dépassé son
+    /// délai.
+    SessionStopped,
 }
 
 /// Nom de l'événement global Tauri qui porte un [`ImproveStatus`].

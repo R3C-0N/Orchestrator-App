@@ -32,7 +32,7 @@ use crate::process::supervisor::{Session, TurnWait};
 use crate::selfupdate::pipeline::{self, NpmToolchain, Toolchain};
 use crate::selfupdate::{
     BoxFut, ImproveOutcome, ImproveRequest, Pipeline, PipelineHost, RepoConfig, SelfUpdate,
-    StatusSink,
+    StatusSink, MAX_AUTO_ATTEMPTS,
 };
 use crate::ui::{UiHost, READY_TIMEOUT};
 
@@ -770,6 +770,10 @@ pub async fn improve_start(
         detail: None,
         push: None,
         t: pipeline::now_ms(),
+        attempt: 0,
+        max_attempts: MAX_AUTO_ATTEMPTS,
+        turn: 0,
+        waiting: None,
     };
     *su.current.lock().unwrap() = Some(status.clone());
     let pipeline = improver.pipeline.clone();
@@ -782,6 +786,40 @@ pub async fn improve_start(
 #[tauri::command(rename_all = "snake_case")]
 pub async fn improve_cancel(improver: State<'_, Improver>, id: String) -> Result<(), CoreError> {
     improver.pipeline.cancel(&id).await
+}
+
+/// Jalon J16 : message de l'utilisateur à la session de l'amélioration `id`
+/// (onglet d'amélioration). Provisoire (étape 0) : `NotImplemented`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn improve_send(
+    improver: State<'_, Improver>,
+    id: String,
+    text: String,
+) -> Result<(), CoreError> {
+    improver.pipeline.send(&id, &text).await
+}
+
+/// Jalon J16 : « Valider » : contrôles et tests relancés pour l'amélioration
+/// `id` en attente de l'utilisateur. Provisoire (étape 0) : `NotImplemented`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn improve_validate(improver: State<'_, Improver>, id: String) -> Result<(), CoreError> {
+    improver.pipeline.validate(&id).await
+}
+
+/// Jalon J16 : interrompt le tour en cours de la session de l'amélioration
+/// `id` (Échap). Provisoire (étape 0) : `NotImplemented`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn improve_interrupt(improver: State<'_, Improver>, id: String) -> Result<(), CoreError> {
+    improver.pipeline.interrupt(&id).await
+}
+
+/// Jalon J16 : l'onglet de l'amélioration `id`, terminée, est fermé : le
+/// cœur libère le journal de sa conversation. Provisoire (étape 0) : rien à
+/// libérer, réponse neutre.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn improve_dismiss(id: String) -> Result<(), CoreError> {
+    tracing::debug!(id, "improve_dismiss (provisoire)");
+    Ok(())
 }
 
 /// Revient à la version précédente de l'interface, puis, si une version
@@ -831,6 +869,10 @@ pub fn ui_rollback(
                                     "interface précédente réactivée ; pas de git revert : {e}"
                                 )),
                                 t: pipeline::now_ms(),
+                                attempt: 0,
+                                max_attempts: MAX_AUTO_ATTEMPTS,
+                                turn: 0,
+                                waiting: None,
                             },
                         );
                         Err(e)

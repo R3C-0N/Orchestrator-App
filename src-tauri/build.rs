@@ -32,6 +32,11 @@ const COMMANDS: &[&str] = &[
     "improve_start",
     "improve_cancel",
     "ui_rollback",
+    // J16 : onglet d'amélioration (conversation avec la session dédiée).
+    "improve_send",
+    "improve_validate",
+    "improve_interrupt",
+    "improve_dismiss",
 ];
 
 /// Fichiers du contrat, relatifs à la racine du dépôt. Un dossier compte pour

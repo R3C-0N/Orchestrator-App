@@ -25,6 +25,10 @@
     "allow-get-ui-info",
     "allow-improve-start",
     "allow-improve-cancel",
-    "allow-ui-rollback"
+    "allow-ui-rollback",
+    "allow-improve-send",
+    "allow-improve-validate",
+    "allow-improve-interrupt",
+    "allow-improve-dismiss"
   ]
 }

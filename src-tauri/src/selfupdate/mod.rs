@@ -10,6 +10,7 @@
 //! implémenté à l'étape 5 (intégration) ; npm, node, Playwright et cargo
 //! passent par [`pipeline::Toolchain`] ([`pipeline::NpmToolchain`] en vrai).
 
+pub mod feedback;
 pub mod git;
 pub mod pipeline;
 pub mod push;
@@ -22,7 +23,14 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::api::events::NoticeLevel;
 use crate::api::types::{CoreError, ImproveStatus, ImproveStep, PushStatus, RepoStatus};
+
+/// Plafond des tours de correction automatique d'un cycle (onglet
+/// d'amélioration, jalon J16) : au-delà, le cycle attend l'utilisateur
+/// (`ImproveWaiting::AttemptsExhausted`). Le compte repart à 0 à chaque
+/// message de l'utilisateur.
+pub const MAX_AUTO_ATTEMPTS: u32 = 3;
 
 /// Dépôt distant cloné au premier lancement (remplaçable dans `config.json`).
 pub const DEFAULT_ORIGIN: &str = "git@github.com:R3C-0N/Orchestrator-App.git";
@@ -161,6 +169,62 @@ pub trait PipelineHost: Send + Sync {
     fn session_stopped(&self) -> BoxFut<'_, ()> {
         Box::pin(async {})
     }
+
+    /// Jalon J16 : un tour de la session dédiée. `message` est envoyé à la
+    /// session (prompt complet au premier tour ; message de l'utilisateur ou
+    /// retour d'erreur ensuite) ; attend la fin du tour. `resume` faux :
+    /// premier lancement, `--session-id <request.id>` ; vrai : nouveau
+    /// processus `--resume <request.id>`, mêmes options d'isolement. Les
+    /// événements de tous les tours vont au même journal (clé stable, une
+    /// conversation par cycle). Comme [`PipelineHost::run_session`] : si le
+    /// futur est abandonné, l'hôte arrête la session ; l'arrêt effectif est
+    /// attendu par [`PipelineHost::session_stopped`].
+    ///
+    /// Par défaut : premier tour par `run_session`, reprise non prise en
+    /// charge.
+    fn run_turn<'a>(
+        &'a self,
+        request: &'a ImproveRequest,
+        cwd: &'a Path,
+        message: &'a str,
+        resume: bool,
+    ) -> BoxFut<'a, Result<TurnEnd, CoreError>> {
+        Box::pin(async move {
+            if resume {
+                return Err(CoreError::NotImplemented(
+                    "reprise de la session d'amélioration (run_turn)".into(),
+                ));
+            }
+            self.run_session(request, cwd, message)
+                .await
+                .map(|()| TurnEnd::Done)
+        })
+    }
+
+    /// Jalon J16 : interrompt le tour en cours de la session dédiée (Échap
+    /// dans l'onglet d'amélioration) ; le tour finit alors par
+    /// [`TurnEnd::Interrupted`]. Par défaut : non pris en charge.
+    fn interrupt_turn(&self) -> BoxFut<'_, Result<(), CoreError>> {
+        Box::pin(async {
+            Err(CoreError::NotImplemented(
+                "interruption de la session d'amélioration".into(),
+            ))
+        })
+    }
+
+    /// Jalon J16 : ligne d'état dans la conversation de l'onglet
+    /// d'amélioration (événement `notice` de code `improve.*`, émis dans le
+    /// journal de la conversation du cycle). Par défaut : rien.
+    fn note(&self, _level: NoticeLevel, _code: &str, _message: &str) {}
+}
+
+/// Fin d'un tour de la session dédiée ([`PipelineHost::run_turn`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEnd {
+    /// Tour terminé normalement.
+    Done,
+    /// Tour interrompu par l'utilisateur.
+    Interrupted,
 }
 
 /// Cycle d'amélioration sur un clone. Un seul cycle à la fois.
@@ -361,6 +425,27 @@ impl Pipeline {
     /// laissée non fusionnée). Sans effet une fois la bascule commencée.
     pub async fn cancel(&self, id: &str) -> Result<(), CoreError> {
         self.cancel_active(id)
+    }
+
+    /// Jalon J16 : message de l'utilisateur pour la session du cycle `id`
+    /// (onglet d'amélioration). Pendant un tour : mis en file, livré au
+    /// tour suivant ; pendant les contrôles ou les tests : ceux-ci sont
+    /// abandonnés et un nouveau tour part ; en attente : nouveau tour. Remet
+    /// le compte des tentatives automatiques à 0.
+    pub async fn send(&self, id: &str, text: &str) -> Result<(), CoreError> {
+        self.send_active(id, text)
+    }
+
+    /// Jalon J16 : « Valider » dans l'onglet d'amélioration : relance les
+    /// contrôles et les tests du cycle `id` en attente de l'utilisateur.
+    pub async fn validate(&self, id: &str) -> Result<(), CoreError> {
+        self.validate_active(id)
+    }
+
+    /// Jalon J16 : interrompt le tour en cours du cycle `id` (Échap) ; le
+    /// cycle passe ensuite en attente de l'utilisateur.
+    pub async fn interrupt(&self, id: &str) -> Result<(), CoreError> {
+        self.interrupt_active(id).await
     }
 
     /// `git revert` du commit `commit` par le même cycle (worktree
